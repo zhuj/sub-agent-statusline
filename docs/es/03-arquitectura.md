@@ -291,13 +291,13 @@ Límite actual: la UI visual completa de `src/tui.tsx` no tiene E2E profundo con
 
 | Archivo                         | Rol                                                             |
 | ------------------------------- | --------------------------------------------------------------- |
-| `package.json`                  | Nombre del paquete, exports, scripts, peers y semantic-release. |
+| `package.json`                  | Nombre del paquete, exports, scripts, peers y metadatos de release. |
 | `tsup.config.ts`                | Build dual: runtime y TUI.                                      |
 | `tsconfig.json`                 | TypeScript base para source.                                    |
 | `tsconfig.test.json`            | TypeScript para tests.                                          |
 | `vitest.config.ts`              | Vitest, coverage y setup.                                       |
-| `.github/workflows/ci.yml`      | CI de PR: typecheck y tests.                                    |
-| `.github/workflows/release.yml` | Release desde `main` con semantic-release.                      |
+| `.github/workflows/ci.yml`      | CI de PR y push a `main`: typecheck, tests, audit y paquete.    |
+| `.github/workflows/release.yml` | Publicación por tag estable y notas de GitHub Release.          |
 
 ## Decisiones de diseño importantes
 

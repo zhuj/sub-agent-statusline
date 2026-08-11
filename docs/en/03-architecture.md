@@ -236,13 +236,13 @@ Current boundary: the full visual UI in `src/tui.tsx` does not have deep E2E cov
 
 | File | Role |
 | --- | --- |
-| `package.json` | Package name, exports, scripts, peers, and semantic-release config. |
+| `package.json` | Package name, exports, scripts, peers, and release metadata. |
 | `tsup.config.ts` | Dual build: runtime and TUI. |
 | `tsconfig.json` | Base TypeScript config for source. |
 | `tsconfig.test.json` | TypeScript config for tests. |
 | `vitest.config.ts` | Vitest, coverage, and setup. |
-| `.github/workflows/ci.yml` | PR CI: typecheck and tests. |
-| `.github/workflows/release.yml` | Release from `main` with semantic-release. |
+| `.github/workflows/ci.yml` | PR and `main` push CI: typecheck, tests, audit, and package checks. |
+| `.github/workflows/release.yml` | Stable tag-gated npm publication and GitHub Release notes. |
 
 ## Important design decisions
 

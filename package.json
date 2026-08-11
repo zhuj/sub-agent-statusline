@@ -39,7 +39,6 @@
   "scripts": {
     "build": "tsup",
     "prepack": "pnpm run build",
-    "release": "semantic-release",
     "audit:prod": "pnpm audit --prod --audit-level moderate",
     "pack:dry-run": "pnpm pack --dry-run",
     "test": "vitest run",
@@ -65,27 +64,11 @@
     "@opencode-ai/plugin": "^1.15.11",
     "@opentui/core": "^0.4.0",
     "@opentui/solid": "^0.4.0",
-    "@semantic-release/commit-analyzer": "^13.0.1",
-    "@semantic-release/github": "^11.0.6",
-    "@semantic-release/npm": "^12.0.2",
-    "@semantic-release/release-notes-generator": "^14.1.1",
     "@types/node": "^22.19.19",
     "@vitest/coverage-v8": "^4.1.7",
     "esbuild-plugin-solid": "^0.6.0",
-    "semantic-release": "^24.2.9",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.7"
-  },
-  "release": {
-    "branches": [
-      "main"
-    ],
-    "plugins": [
-      "@semantic-release/commit-analyzer",
-      "@semantic-release/release-notes-generator",
-      "@semantic-release/npm",
-      "@semantic-release/github"
-    ]
   }
 }

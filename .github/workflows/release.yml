@@ -2,25 +2,27 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
-  contents: write
-  issues: write
-  pull-requests: write
-  id-token: write
+  contents: read
+  actions: read
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  release:
+  publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
 
     steps:
-      - name: Checkout
+      - name: Checkout tagged candidate
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -40,22 +42,153 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
 
-      - name: Audit production dependencies
-        run: pnpm audit --prod --audit-level moderate
-
-      - name: Typecheck
-        run: pnpm typecheck
-
-      - name: Test
-        run: pnpm test
-
-      - name: Verify package contents
-        run: pnpm pack --dry-run
-
-      - name: Release
+      - name: Run release preflight
+        id: preflight
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="$GITHUB_REF_NAME"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            printf 'Refusing non-stable tag: %s\n' "$tag" >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          manifest_version="$(node -p "require('./package.json').version")"
+          package_name="$(node -p "require('./package.json').name")"
+          if [[ "$manifest_version" != "$version" ]]; then
+            printf 'Tag %s does not match package.json version %s. Reconcile the manifest in a reviewed PR first.\n' \
+              "$tag" "$manifest_version" >&2
+            exit 1
+          fi
+
+          git fetch origin main --tags
+          if [[ "$(git cat-file -t "refs/tags/$tag")" != tag ]]; then
+            printf 'Refusing lightweight tag %s. Release tags must be annotated.\n' "$tag" >&2
+            exit 1
+          fi
+
+          tag_sha="$(git rev-parse "refs/tags/$tag^{commit}")"
+          main_sha="$(git rev-parse origin/main)"
+          if [[ "$tag_sha" != "$main_sha" ]]; then
+            printf 'Refusing stale tag %s at %s: current origin/main is %s.\n' \
+              "$tag" "$tag_sha" "$main_sha" >&2
+            printf 'Policy: a stable tag must target the current origin/main SHA when this workflow starts.\n' >&2
+            exit 1
+          fi
+
+          release_json="$RUNNER_TEMP/github-release.json"
+          release_error="$RUNNER_TEMP/github-release.error"
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >"$release_json" 2>"$release_error"; then
+            github_release_state="$(node -e 'const fs = require("node:fs"); const release = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); const tag = process.argv[2]; const sha = process.argv[3]; if (release.tag_name !== tag || release.target_commitish !== sha || release.draft !== false || release.prerelease !== false) { console.error(`GitHub Release state conflicts with ${tag} at ${sha}.`); process.exit(1); } process.stdout.write("compatible");' "$release_json" "$tag" "$tag_sha")"
+            github_release_url="$(node -e 'const fs = require("node:fs"); const release = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(release.html_url ?? "");' "$release_json")"
+          else
+            release_error_text="$(<"$release_error")"
+            if [[ "$release_error_text" == *'HTTP 404'* ]]; then
+              github_release_state=absent
+              github_release_url=
+            else
+              printf '%s\n' "$release_error_text" >&2
+              printf 'Could not determine GitHub Release state safely; refusing publication.\n' >&2
+              exit 1
+            fi
+          fi
+
+          ci_runs="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$tag_sha&event=push&status=completed&per_page=100" \
+            --jq "[.workflow_runs[] | select(.head_sha == \"$tag_sha\") | select(.event == \"push\") | select(.head_branch == \"main\") | select(.status == \"completed\") | select(.conclusion == \"success\")] | sort_by(.run_started_at)")"
+          ci_run_id="$(node -e 'const runs = JSON.parse(process.argv[1]); process.stdout.write(String(runs.at(-1)?.id ?? ""));' "$ci_runs")"
+          ci_run_url="$(node -e 'const runs = JSON.parse(process.argv[1]); process.stdout.write(runs.at(-1)?.html_url ?? "");' "$ci_runs")"
+          if [[ -z "$ci_run_id" ]]; then
+            printf 'No successful push CI run exists for exact candidate SHA %s.\n' "$tag_sha" >&2
+            exit 1
+          fi
+
+          package_dir="$RUNNER_TEMP/release-package"
+          mkdir -p "$package_dir"
+          pnpm pack --pack-destination "$package_dir"
+          shopt -s nullglob
+          package_files=("$package_dir"/*.tgz)
+          if (( ${#package_files[@]} != 1 )); then
+            printf 'Expected exactly one release tarball, found %s.\n' "${#package_files[@]}" >&2
+            exit 1
+          fi
+          tarball="${package_files[0]}"
+          local_integrity="sha512-$(openssl dgst -sha512 -binary "$tarball" | base64 -w0)"
+
+          npm_metadata="$RUNNER_TEMP/npm-metadata.json"
+          npm_error="$RUNNER_TEMP/npm-metadata.error"
+          if npm view "$package_name@$version" --json >"$npm_metadata" 2>"$npm_error"; then
+            registry_integrity="$(node -e 'const fs = require("node:fs"); const metadata = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(metadata.dist?.integrity ?? "");' "$npm_metadata")"
+            if [[ -z "$registry_integrity" ]]; then
+              printf 'npm already has %s@%s but exposes no integrity metadata; refusing recovery.\n' "$package_name" "$version" >&2
+              exit 1
+            fi
+            if [[ "$registry_integrity" != "$local_integrity" ]]; then
+              printf 'npm %s@%s does not match the exact tagged package tarball; refusing republish.\n' "$package_name" "$version" >&2
+              exit 1
+            fi
+            npm_state=published
+          else
+            npm_error_text="$(<"$npm_error")"
+            if [[ "$npm_error_text" == *E404* ]]; then
+              npm_state=absent
+            else
+              printf '%s\n' "$npm_error_text" >&2
+              printf 'Could not determine npm state safely; refusing publication.\n' >&2
+              exit 1
+            fi
+          fi
+
+          {
+            printf 'tag=%s\n' "$tag"
+            printf 'version=%s\n' "$version"
+            printf 'package_name=%s\n' "$package_name"
+            printf 'tag_sha=%s\n' "$tag_sha"
+            printf 'ci_run_id=%s\n' "$ci_run_id"
+            printf 'ci_run_url=%s\n' "$ci_run_url"
+            printf 'tarball=%s\n' "$tarball"
+            printf 'npm_state=%s\n' "$npm_state"
+            printf 'github_release_state=%s\n' "$github_release_state"
+            printf 'github_release_url=%s\n' "$github_release_url"
+          } >>"$GITHUB_OUTPUT"
+
+          printf 'Preflight passed: %s %s (SHA %s, CI %s, npm %s, GitHub Release %s).\n' \
+            "$tag" "$package_name" "$tag_sha" "$ci_run_id" "$npm_state" "$github_release_state"
+
+      - name: Publish exact tagged package
+        if: steps.preflight.outputs.npm_state == 'absent'
+        env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_PROVENANCE: "true"
-        run: pnpm exec semantic-release
+          NPM_CONFIG_PROVENANCE: 'true'
+        run: npm publish "${{ steps.preflight.outputs.tarball }}" --access public --provenance
+
+      - name: Create GitHub Release after npm publication
+        if: steps.preflight.outputs.github_release_state == 'absent'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="${{ steps.preflight.outputs.tag }}"
+          tag_sha="${{ steps.preflight.outputs.tag_sha }}"
+          gh release create "$tag" --verify-tag --target "$tag_sha" --title "$tag" --generate-notes
+          printf 'Created GitHub Release notes for %s.\n' "$tag"
+
+      - name: Verify GitHub Release after publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="${{ steps.preflight.outputs.tag }}"
+          tag_sha="${{ steps.preflight.outputs.tag_sha }}"
+          release_json="$RUNNER_TEMP/github-release-after-publication.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >"$release_json"
+          node -e 'const fs = require("node:fs"); const release = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); const tag = process.argv[2]; const sha = process.argv[3]; if (release.tag_name !== tag || release.target_commitish !== sha || release.draft !== false || release.prerelease !== false) { console.error(`GitHub Release verification failed for ${tag} at ${sha}.`); process.exit(1); } console.log(`Verified GitHub Release ${release.html_url} for ${tag}.`);' "$release_json" "$tag" "$tag_sha"
+
+          printf 'Published candidate: %s\n' "$tag"
+          printf 'Candidate SHA: %s\n' "$tag_sha"
+          printf 'CI evidence: ${{ steps.preflight.outputs.ci_run_url }}\n'

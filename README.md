@@ -216,7 +216,7 @@ Recommended local npm/pnpm hygiene, following guidance from Gentle AI and Liran 
 
 These are maintainer/developer controls, not runtime enforcement by this plugin.
 
-Release maintainers should also keep npm trusted publishing/OIDC enabled for this package, require npm 2FA on maintainer accounts, restrict and revoke legacy npm tokens once OIDC publishing is active, and protect the release branch in GitHub.
+Release maintainers should keep the repository `NPM_TOKEN` secret restricted, retain npm provenance, require npm 2FA on maintainer accounts, and protect the release branch in GitHub. See the [release process](docs/releasing.md) for the tag and recovery gates.
 
 </details>
 
