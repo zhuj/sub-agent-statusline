@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  awaitCurrentRunningReconcileResult,
   canSafelyCloseNoTargetPersistedCandidate,
   capCandidates,
   defaultStaleRunningThresholdMs,
@@ -12,9 +13,22 @@ import {
   resolveSessionStatusWithMessageSummary,
   shouldApplyStaleRunningFallback,
   shouldSkipCandidateForBackoff,
+  sweepRunningReconcileBackoff,
   summarizeSessionMessages,
   type RunningReconcileEvidence,
+  type RunningReconcileVersion,
 } from "./reconcile.js";
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolvePromise: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
+}
 
 describe("OpenCode session status normalization", () => {
   it.each([
@@ -253,6 +267,73 @@ describe("candidate cap and backoff", () => {
       maxBackoffMs: 300_000,
     });
     expect(doubled.backoffMs).toBe(30_000);
+  });
+
+  it("sweeps backoff entries without retained running candidates", () => {
+    const backoff = new Map([
+      ["ses_running", { backoffMs: 15_000, nextAllowedAtMs: 20_000 }],
+      ["ses_terminal", { backoffMs: 30_000, nextAllowedAtMs: 40_000 }],
+      ["ses_pruned", { backoffMs: 60_000, nextAllowedAtMs: 80_000 }],
+    ]);
+
+    expect(sweepRunningReconcileBackoff(backoff, new Set(["ses_running"]))).toBe(2);
+    expect([...backoff.keys()]).toEqual(["ses_running"]);
+  });
+});
+
+describe("stale running reconciliation results", () => {
+  const version = {
+    childID: "ses_child",
+    targetSessionID: "ses_target",
+    parentID: "ses_parent",
+    messageID: "msg_child",
+    status: "running" as const,
+    updatedAt: "2026-07-17T09:00:00.000Z",
+  };
+
+  it.each([
+    ["newer status", { status: "done" as const }],
+    ["newer updatedAt", { updatedAt: "2026-07-17T09:01:00.000Z" }],
+    ["changed target", { targetSessionID: "ses_other" }],
+    ["changed message", { messageID: "msg_other" }],
+  ])("ignores a probe after %s changes", async (_label, change) => {
+    const probe = deferred<{ readonly status: "done" }>();
+    let current: RunningReconcileVersion = version;
+    const persist = vi.fn();
+    const pending = awaitCurrentRunningReconcileResult({
+      version,
+      probe: () => probe.promise,
+      isLifecycleValid: () => true,
+      currentVersion: () => current,
+    });
+    current = { ...version, ...change };
+    probe.resolve({ status: "done" });
+
+    const result = await pending;
+    if (result) persist(result);
+
+    expect(result).toBeUndefined();
+    expect(persist).not.toHaveBeenCalled();
+  });
+
+  it("ignores a probe after route or lifecycle invalidation", async () => {
+    const probe = deferred<{ readonly status: "done" }>();
+    let valid = true;
+    const persist = vi.fn();
+    const pending = awaitCurrentRunningReconcileResult({
+      version,
+      probe: () => probe.promise,
+      isLifecycleValid: () => valid,
+      currentVersion: () => version,
+    });
+    valid = false;
+    probe.resolve({ status: "done" });
+
+    const result = await pending;
+    if (result) persist(result);
+
+    expect(result).toBeUndefined();
+    expect(persist).not.toHaveBeenCalled();
   });
 });
 

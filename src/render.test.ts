@@ -405,6 +405,31 @@ describe("render", () => {
     ).toEqual(["done_old"]);
   });
 
+  it("characterizes completed history toggle preserves all retained terminal rows", () => {
+    const now = Date.parse("2026-04-30T10:20:00.000Z");
+    const staleDone = child({
+      id: "done_old",
+      parentID: "done_old_parent",
+      messageID: "msg_done_old",
+      targetSessionID: undefined,
+      status: "done",
+      color: "green",
+      endedAt: "2026-04-30T10:00:00.000Z",
+    });
+    const staleError = child({
+      id: "error_old",
+      parentID: "error_old_parent",
+      messageID: "msg_error_old",
+      targetSessionID: undefined,
+      status: "error",
+      color: "red",
+      endedAt: "2026-04-30T10:00:00.000Z",
+    });
+
+    expect(visibleSubagentWorkItems([staleDone, staleError], now)).toEqual([]);
+    expect(visibleSubagentWorkItems([staleDone, staleError], now, { showCompletedHistory: true }).map((i) => i.id)).toEqual(["done_old", "error_old"]);
+  });
+
   it("shows retained stale done and error rows only when completed history is enabled", () => {
     const now = Date.parse("2026-04-30T10:20:00.000Z");
     const staleDone = child({
@@ -629,7 +654,7 @@ describe("render", () => {
     const statusLine = renderStatusLine(state);
 
     expect(statusLine).toContain(
-      "↳ 1 running · 6 done · 7 error · Σ 13 total",
+      "↳ 1 running · 6 done · 7 error · Σ 14 total",
     );
     expect(statusLine).toContain("Active work 01:01");
     expect(statusLine).not.toContain("Retained done 0");

@@ -93,7 +93,10 @@ function createToggleSelectionTitle(sectionEnabled: boolean): string {
     : "Subagents: Enable sidebar section";
 }
 
-function createCompositeDispose(disposers: TuiCommandDispose[]): TuiCommandDispose {
+export function createBestEffortDisposer(
+  disposers: readonly TuiCommandDispose[],
+  onError: (error: Error) => void = () => undefined,
+): TuiCommandDispose {
   let disposed = false;
   return () => {
     if (disposed) return;
@@ -102,8 +105,14 @@ function createCompositeDispose(disposers: TuiCommandDispose[]): TuiCommandDispo
     for (const dispose of disposers) {
       try {
         dispose();
-      } catch {
-        // Cleanup should be best-effort across mixed runtime APIs.
+      } catch (error) {
+        onError(
+          error instanceof Error
+            ? error
+            : new Error("TUI cleanup failed with a non-Error cause", {
+                cause: error,
+              }),
+        );
       }
     }
   };
@@ -184,5 +193,5 @@ export function registerSubagentCommands({
     );
   }
 
-  return createCompositeDispose(disposers);
+  return createBestEffortDisposer(disposers);
 }

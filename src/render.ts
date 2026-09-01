@@ -1,9 +1,19 @@
-import { countRetainedSubagentStatuses } from "./state.js";
+import { buildSubagentProjectionFromChildren, filterVisibleFromCanonical } from "./projection.js";
 import type { ChildSessionState, StatuslineState } from "./state.js";
 import {
   correlateSubagentWorkItems,
   mergeProxyMetadataWithRealExecution,
 } from "./subagent-classification.js";
+import {
+  formatCompactPercentUsed,
+  formatCompactTokenCount,
+  formatDuration,
+  formatNumber,
+  formatPercentUsed,
+  formatTokenCount,
+} from "./format.js";
+
+export { formatDuration } from "./format.js";
 
 const ansi = {
   reset: "\u001B[0m",
@@ -25,23 +35,6 @@ function paint(text: string, color: string, enabled: boolean): string {
   return `${color}${text}${ansi.reset}`;
 }
 
-export function formatDuration(elapsedMs: number | undefined): string {
-  const totalSeconds = Math.max(0, Math.floor((elapsedMs ?? 0) / 1000));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  if (hours > 0) {
-    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
-  }
-
-  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
-}
-
-function formatNumber(value: number): string {
-  return Math.max(0, Math.round(value)).toLocaleString("en-US");
-}
-
 function resolveTokenTotal(child: ChildSessionState): number | undefined {
   const total = child.tokens?.total;
   if (typeof total === "number" && Number.isFinite(total)) {
@@ -55,35 +48,6 @@ function resolveTokenTotal(child: ChildSessionState): number | undefined {
   }
 
   return undefined;
-}
-
-function formatPercentUsed(percent: number): string {
-  const rounded = Math.round(percent * 10) / 10;
-  if (Math.abs(rounded - Math.round(rounded)) < 0.05) {
-    return `${Math.round(rounded)}% used`;
-  }
-  return `${rounded.toFixed(1)}% used`;
-}
-
-function formatTokenCount(total: number): string {
-  const label = total === 1 ? "token" : "tokens";
-  return `${formatNumber(total)} ${label}`;
-}
-
-function formatCompactTokenCount(total: number): string {
-  const value = Math.max(0, total);
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(1)}M ctx`;
-  }
-  if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(1)}k ctx`;
-  }
-  return `${Math.round(value)} ctx`;
-}
-
-function formatCompactPercentUsed(percent: number): string {
-  const rounded = Math.round(percent);
-  return `${Math.max(0, rounded)}%`;
 }
 
 export function formatContextDetails(
@@ -188,7 +152,8 @@ export function visibleSubagentWorkItems(
   nowMs = Date.now(),
   options: VisibleSubagentWorkItemsOptions = {},
 ): ChildSessionState[] {
-  const collapsed = collapseSubagentWorkItems(children);
+  const projection = buildSubagentProjectionFromChildren(children);
+  const collapsed = projection.canonicalRows;
   if (options.showCompletedHistory) return collapsed;
 
   const visible = collapsed.filter((child) => isVisibleWorkItem(child, nowMs));
@@ -209,11 +174,14 @@ export function visibleSubagentWorkItems(
 }
 
 export function renderStatusLine(state: StatuslineState): string {
-  const children = visibleSubagentWorkItems(Object.values(state.children)).sort(
+  const projection = buildSubagentProjectionFromChildren(
+    Object.values(state.children),
+  );
+  const children = filterVisibleFromCanonical(projection.canonicalRows).sort(
     byPriority,
   );
-  const counts = countRetainedSubagentStatuses({ children: state.children });
-  const totalExecuted = formatNumber(state.totalExecuted ?? 0);
+  const counts = projection.retainedCounts;
+  const totalExecuted = formatNumber(projection.totalExecuted ?? 0);
   const colorOn = colorsEnabled();
 
   const aggregate = `↳ ${counts.running} running · ${counts.done} done · ${counts.error} error · Σ ${totalExecuted} total`;

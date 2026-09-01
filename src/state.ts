@@ -1,18 +1,36 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import os from "node:os";
 import {
   classifySubagentWorkItem,
   correlateSubagentWorkItems,
 } from "./subagent-classification.js";
+import { buildSubagentProjection, buildSubagentProjectionFromChildren } from "./projection.js";
 
 export type ChildStatus = "running" | "done" | "error";
 
+/**
+ * Per-child token usage snapshot. Every field is optional; a fully-undefined
+ * snapshot represents "no token evidence available" and is intentionally
+ * distinct from `{ total: 0 }`.
+ *
+ * Merging rules (see {@link mergeTokens}): an incoming field replaces the
+ * existing field only when defined. Empty/wholly-undefined merges should
+ * collapse to `undefined` so callers can skip no-op state writes.
+ *
+ * Equality rules (see {@link sameTokens}): structural equality via JSON
+ * serialization; suitable for sparse field sets but NOT for big-integer
+ * precision loss — keep token totals within `Number.MAX_SAFE_INTEGER`.
+ */
 export interface ChildTokenState {
+  /** Prompt/input tokens consumed by the child so far. */
   input?: number;
+  /** Completion/output tokens consumed by the child so far. */
   output?: number;
+  /** Combined total (input + output). Some upstream sources only emit `total`. */
   total?: number;
+  /** Context-window usage percent (0–100) when reported. */
   contextPercent?: number;
 }
 
@@ -64,8 +82,36 @@ function statusColor(status: ChildStatus): ChildSessionState["color"] {
   return "yellow";
 }
 
+/**
+ * Parses a string-or-number timestamp into an ISO 8601 string. Strings are
+ * parsed via `Date.parse` (accepts ISO 8601 and the formats Node's `Date`
+ * understands). Numbers are interpreted as seconds when below 10_000_000_000
+ * (the epoch-ms-vs-seconds ambiguity cutoff) and as milliseconds otherwise.
+ *
+ * Returns `undefined` when the input is empty, non-finite, or unparseable.
+ * Exported so events.ts and any future caller share the same parsing rules.
+ */
+export function parseTimestamp(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    if (value.trim().length === 0) return undefined;
+    const parsed = Date.parse(value);
+    if (Number.isNaN(parsed)) return undefined;
+    return new Date(parsed).toISOString();
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value <= 0) return undefined;
+    const millis = value < 10_000_000_000 ? value * 1000 : value;
+    const parsed = new Date(millis);
+    return Number.isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
+  }
+
+  return undefined;
+}
+
 function safeTimestamp(input: unknown, fallback: string): string {
   if (typeof input !== "string") return fallback;
+  if (input.length === 0) return fallback;
   return Number.isNaN(Date.parse(input)) ? fallback : input;
 }
 
@@ -133,14 +179,17 @@ export function countHistoricalSubagentExecutions(input: {
   children: Record<string, ChildSessionState> | ChildSessionState[];
   parentSessionID?: string;
 }): number {
-  const children = Array.isArray(input.children)
-    ? input.children
-    : Object.values(input.children);
-  const scopedChildren = input.parentSessionID
-    ? children.filter((child) => child.parentID === input.parentSessionID)
-    : children;
-
-  return correlateSubagentWorkItems(scopedChildren).length;
+  const projection = buildSubagentProjectionFromChildren(
+    Array.isArray(input.children)
+      ? input.children
+      : Object.values(input.children),
+  );
+  const scopedIDs = input.parentSessionID
+    ? projection.canonicalRows
+        .filter((row) => row.parentID === input.parentSessionID)
+        .map((row) => row.targetSessionID ?? row.id)
+    : projection.orderedExecutionIDs;
+  return new Set(scopedIDs).size;
 }
 
 export function countCountedSubagentExecutions(input: {
@@ -148,15 +197,18 @@ export function countCountedSubagentExecutions(input: {
   countedChildIDs: Record<string, true>;
   parentSessionID?: string;
 }): number {
-  const children = Array.isArray(input.children)
-    ? input.children
-    : Object.values(input.children);
-  const scopedChildren = input.parentSessionID
-    ? children.filter((child) => child.parentID === input.parentSessionID)
-    : children;
-
-  return correlateSubagentWorkItems(scopedChildren).filter(
-    (execution) => input.countedChildIDs[execution.executionID],
+  const projection = buildSubagentProjectionFromChildren(
+    Array.isArray(input.children)
+      ? input.children
+      : Object.values(input.children),
+  );
+  const scopedExecutionIDs = input.parentSessionID
+    ? projection.canonicalRows
+        .filter((row) => row.parentID === input.parentSessionID)
+        .map((row) => row.targetSessionID ?? row.id)
+    : projection.orderedExecutionIDs;
+  return scopedExecutionIDs.filter(
+    (id) => input.countedChildIDs[id],
   ).length;
 }
 
@@ -164,30 +216,40 @@ export function countRetainedSubagentStatuses(input: {
   children: Record<string, ChildSessionState> | ChildSessionState[];
   parentSessionID?: string;
 }): StatusCounts {
-  const children = Array.isArray(input.children)
-    ? input.children
-    : Object.values(input.children);
-  const scopedChildren = input.parentSessionID
-    ? children.filter((child) => child.parentID === input.parentSessionID)
-    : children;
+  const projection = buildSubagentProjectionFromChildren(
+    Array.isArray(input.children)
+      ? input.children
+      : Object.values(input.children),
+  );
+  const scopedRows = input.parentSessionID
+    ? projection.canonicalRows.filter(
+        (row) => row.parentID === input.parentSessionID,
+      )
+    : projection.canonicalRows;
   const counts: StatusCounts = { running: 0, done: 0, error: 0 };
-
-  for (const { real } of correlateSubagentWorkItems(scopedChildren)) {
-    counts[real.status] += 1;
+  for (const row of scopedRows) {
+    if (row.status === "running") counts.running += 1;
+    else if (row.status === "done") counts.done += 1;
+    else if (row.status === "error") counts.error += 1;
   }
-
   return counts;
 }
 
+// Per-state fingerprint of the last execution-identity reconcile, used to
+// skip rebuilds when nothing has changed since the previous call. Keyed by
+// the state object so each loaded state has its own cache.
+const reconcileFingerprints = new WeakMap<StatuslineState, string>();
+
 function reconcileCountedExecutionsWithChildren(state: StatuslineState): void {
-  const executionIDs = correlateSubagentWorkItems(
-    Object.values(state.children),
-  ).map((execution) => execution.executionID);
+  const projection = buildSubagentProjection(state);
+  const fingerprint = projection.orderedExecutionIDs.join("|");
+  if (reconcileFingerprints.get(state) === fingerprint) return;
+  reconcileFingerprints.set(state, fingerprint);
 
   state.countedChildIDs = Object.fromEntries(
-    executionIDs.map((id) => [id, true]),
+    projection.orderedExecutionIDs.map((id) => [id, true]),
   ) as Record<string, true>;
-  state.totalExecuted = executionIDs.length;
+  state.totalExecuted = projection.totalExecuted;
 }
 
 function countChildExecution(
@@ -254,7 +316,12 @@ function sanitizeTargetSessionID(
   return undefined;
 }
 
-function mergeTokens(
+/**
+ * Merges two token snapshots, preferring `incoming` fields when defined.
+ * Used by both state.ts mutators and downstream callers (tui.tsx) so the
+ * merge policy lives in a single place.
+ */
+export function mergeTokens(
   existing: ChildTokenState | undefined,
   incoming: ChildTokenState | undefined,
 ): ChildTokenState | undefined {
@@ -267,7 +334,11 @@ function mergeTokens(
   };
 }
 
-function sameTokens(
+/**
+ * Returns true when both token snapshots are deeply equal. Defined in
+ * state.ts so all consumers (state.ts, tui.tsx) compare identically.
+ */
+export function sameTokens(
   left: ChildTokenState | undefined,
   right: ChildTokenState | undefined,
 ): boolean {
@@ -350,9 +421,29 @@ export function pruneTerminalChildren(
   return pruned;
 }
 
+export function isTerminalPruningDue(
+  state: StatuslineState,
+  now = new Date(),
+): boolean {
+  const nowMs = now.getTime();
+  let retainedTerminalChildren = 0;
+
+  for (const child of Object.values(state.children)) {
+    if (child.status === "running") continue;
+    if (nowMs - terminalReferenceMs(child) > TERMINAL_CHILD_TTL_MS) {
+      return true;
+    }
+    retainedTerminalChildren += 1;
+    if (retainedTerminalChildren > MAX_TERMINAL_CHILDREN) return true;
+  }
+
+  return false;
+}
+
 export function refreshDerivedFields(
   state: StatuslineState,
   now = new Date(),
+  onPrune?: (prunedCount: number, nowISO: string) => void,
 ): void {
   const nowISO = now.toISOString();
   const nowMs = now.getTime();
@@ -403,9 +494,11 @@ export function refreshDerivedFields(
 
   reconcileCountedExecutionsWithChildren(state);
   state.updatedAt = safeTimestamp(state.updatedAt, nowISO);
-  if (pruneTerminalChildren(state, now) > 0) {
+  const pruned = pruneTerminalChildren(state, now);
+  if (pruned > 0) {
     reconcileCountedExecutionsWithChildren(state);
     state.updatedAt = nowISO;
+    onPrune?.(pruned, nowISO);
   }
 }
 
@@ -456,6 +549,53 @@ export function resolveStatePath(): string {
 
 export function resolveTextPath(statePath: string): string {
   return join(dirname(statePath), "status.txt");
+}
+
+const STALE_INSTANCE_DIR_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/**
+ * Removes stale `pid-*` instance directories under the runtime base dir whose
+ * last-modified time is older than `STALE_INSTANCE_DIR_TTL_MS`. Best-effort:
+ * any per-entry error is swallowed because directory cleanup must never
+ * crash the plugin. Only runs when no `OPENCODE_SUBAGENT_STATUSLINE_STATE`
+ * override is set, since overrides point outside the directory tree we own.
+ *
+ * Returns the number of directories successfully removed (0 when no GC was
+ * needed or attempted).
+ */
+export async function gcStaleInstanceDirs(
+  ttlMs: number = STALE_INSTANCE_DIR_TTL_MS,
+): Promise<number> {
+  if (
+    typeof process.env.OPENCODE_SUBAGENT_STATUSLINE_STATE === "string" &&
+    process.env.OPENCODE_SUBAGENT_STATUSLINE_STATE.trim().length > 0
+  ) {
+    return 0;
+  }
+  const runtimeDir = process.env.XDG_RUNTIME_DIR ?? os.tmpdir();
+  const base = join(runtimeDir, STATUS_DIRNAME);
+  let entries;
+  try {
+    entries = await readdir(base, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  const cutoffMs = Date.now() - ttlMs;
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (!entry.name.startsWith("pid-")) continue;
+    const dir = join(base, entry.name);
+    try {
+      const dirStat = await stat(dir);
+      if (dirStat.mtimeMs >= cutoffMs) continue;
+      await rm(dir, { force: true, recursive: true });
+      removed += 1;
+    } catch {
+      // Defensive: never let cleanup errors escape.
+    }
+  }
+  return removed;
 }
 
 export async function loadState(statePath: string): Promise<StatuslineState> {
@@ -647,12 +787,18 @@ export function markChildStatus(
   childID: string,
   status: Exclude<ChildStatus, "running">,
   endedAt?: string,
+  candidateIDs?: readonly string[],
 ): boolean {
   const now = new Date().toISOString();
   let changed = false;
   let stateUpdatedAt = state.updatedAt;
 
-  for (const child of Object.values(state.children)) {
+  const candidates = candidateIDs
+    ? candidateIDs
+        .map((id) => state.children[id])
+        .filter((child): child is ChildSessionState => child !== undefined)
+    : Object.values(state.children);
+  for (const child of candidates) {
     if (child.id !== childID && child.targetSessionID !== childID) continue;
 
     const observedEndedAt = endedAt
@@ -749,8 +895,14 @@ export function setChildModel(
   sessionID: string,
   model: ChildModelState | undefined,
   updatedAt?: string,
+  candidateIDs?: readonly string[],
 ): boolean {
-  const matches = Object.values(state.children).filter(
+  const source = candidateIDs
+    ? candidateIDs
+        .map((id) => state.children[id])
+        .filter((child): child is ChildSessionState => child !== undefined)
+    : Object.values(state.children);
+  const matches = source.filter(
     (child) => child.id === sessionID || child.targetSessionID === sessionID,
   );
   if (matches.length === 0) return false;

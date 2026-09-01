@@ -56,3 +56,15 @@ Created documents:
 Not part of the current numbered set:
 
 - publication and release documentation, which remains intentionally pending for a future pass if needed.
+
+## Related companion documents
+
+These live at the repo root (not under `docs/en/`/`docs/es/`) and complement the
+numbered guides above:
+
+| Document                                  | Purpose                                                                                |
+| ----------------------------------------- | -------------------------------------------------------------------------------------- |
+| [`../releasing.md`](../releasing.md)      | Tag-gated release process, recovery gates, and publish commands.                       |
+| [`../testing.md`](../testing.md)          | Testing strategy, file map, and current TUI / e2e coverage boundaries.                 |
+| [`../openspec/specs/`](../openspec/specs) | Authored change proposals and per-change specs (the source of truth for change flow).  |
+| [`../openspec/changes/`](../openspec/changes) | Active and archived openspec changes — start here when proposing a behavioural change. |

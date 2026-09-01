@@ -9,7 +9,8 @@
   },
   "packageManager": "pnpm@11.2.2",
   "engines": {
-    "node": ">=22.13"
+    "node": ">=22.13",
+    "pnpm": ">=11.2.2"
   },
   "main": "./dist/tui.js",
   "types": "./dist/tui.d.ts",

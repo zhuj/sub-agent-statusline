@@ -3,6 +3,15 @@ export interface RunningReconcileCacheEntry {
   backoffMs: number;
 }
 
+export type RunningReconcileVersion = {
+  readonly childID: string;
+  readonly targetSessionID?: string;
+  readonly parentID?: string;
+  readonly messageID?: string;
+  readonly status: "running" | "done" | "error";
+  readonly updatedAt: string;
+};
+
 export type RunningReconcileEvidence = {
   status?: "running" | "done" | "error";
   endedAt?: string;
@@ -297,6 +306,49 @@ export function shouldSkipCandidateForBackoff(
   nowMs: number,
 ): boolean {
   return cache !== undefined && nowMs < cache.nextAllowedAtMs;
+}
+
+export function matchesRunningReconcileVersion(
+  expected: RunningReconcileVersion,
+  current: RunningReconcileVersion | undefined,
+): boolean {
+  return (
+    current?.childID === expected.childID &&
+    current.targetSessionID === expected.targetSessionID &&
+    current.parentID === expected.parentID &&
+    current.messageID === expected.messageID &&
+    current.status === expected.status &&
+    current.updatedAt === expected.updatedAt
+  );
+}
+
+export async function awaitCurrentRunningReconcileResult<Result>(input: {
+  readonly version: RunningReconcileVersion;
+  readonly probe: () => Promise<Result>;
+  readonly isLifecycleValid: () => boolean;
+  readonly currentVersion: () => RunningReconcileVersion | undefined;
+}): Promise<Result | undefined> {
+  const result = await input.probe();
+  if (!input.isLifecycleValid()) return undefined;
+  return matchesRunningReconcileVersion(
+    input.version,
+    input.currentVersion(),
+  )
+    ? result
+    : undefined;
+}
+
+export function sweepRunningReconcileBackoff(
+  backoff: Map<string, RunningReconcileCacheEntry>,
+  retainedRunningKeys: ReadonlySet<string>,
+): number {
+  let removed = 0;
+  for (const key of backoff.keys()) {
+    if (retainedRunningKeys.has(key)) continue;
+    backoff.delete(key);
+    removed += 1;
+  }
+  return removed;
 }
 
 export function nextBackoffState(input: {

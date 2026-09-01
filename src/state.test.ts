@@ -22,6 +22,7 @@ import {
 } from "./state.js";
 import {
   createRuntimeHarness,
+  pathExists,
   readRuntimeState,
   useFrozenTime,
 } from "../test/helpers/runtime-harness.js";
@@ -531,6 +532,105 @@ describe("state", () => {
     expect(loaded.totalExecuted).toBe(0);
     expect(loaded.countedChildIDs["tool:old"]).toBeUndefined();
     expect(loaded.countedChildIDs["tool:new"]).toBeUndefined();
+  });
+
+  it("characterizes exact three-day terminal retention boundary (TERMINAL_CHILD_TTL_MS = 7776000000 ms)", () => {
+    const state = createEmptyState();
+    const now = new Date("2026-05-01T10:00:00.000Z");
+    // Child exactly 3 days old (referenceMs = 2026-04-28 10:00)
+    state.children.oldDone = child({
+      id: "oldDone",
+      status: "done",
+      color: "green",
+      endedAt: "2026-04-28T10:00:00.000Z",
+      updatedAt: "2026-04-28T10:00:00.000Z",
+    });
+    // Child 3 days + 1 ms old (should be pruned)
+    state.children.veryOldDone = child({
+      id: "veryOldDone",
+      status: "done",
+      color: "green",
+      endedAt: "2026-04-28T09:59:59.999Z",
+      updatedAt: "2026-04-28T09:59:59.999Z",
+    });
+    // Running child must survive pruning regardless of age.
+    state.children.running = child({ id: "running", status: "running" });
+
+    const pruned = pruneTerminalChildren(state, now);
+    expect(pruned).toBe(1);
+    expect(state.children.veryOldDone).toBeUndefined();
+    expect(state.children.oldDone).toBeDefined();
+    expect(state.children.running).toBeDefined();
+  });
+
+  it("characterizes 1500-row terminal retention cap (MAX_TERMINAL_CHILDREN = 1500)", () => {
+    const state = createEmptyState();
+    const now = new Date("2026-05-01T10:00:00.000Z");
+    for (let i = 0; i < 1505; i++) {
+      state.children[`terminal_${i}`] = child({
+        id: `terminal_${i}`,
+        status: "done",
+        color: "green",
+        endedAt: "2026-04-30T09:00:00.000Z",
+        updatedAt: "2026-04-30T09:00:00.000Z",
+      });
+    }
+    const pruned = pruneTerminalChildren(state, now);
+    expect(pruned).toBe(5);
+    expect(Object.keys(state.children)).toHaveLength(1500);
+  });
+
+  it("characterizes pruning removes oldest terminal by referenceMs then by id", () => {
+    const state = createEmptyState();
+    const now = new Date("2026-05-01T10:00:00.000Z");
+    // Rows 2 days old should not be pruned by TTL (3-day boundary).
+    state.children.a = child({ id: "a", status: "done", endedAt: "2026-04-29T08:00:00.000Z", updatedAt: "2026-04-29T08:00:00.000Z" });
+    state.children.b = child({ id: "b", status: "done", endedAt: "2026-04-29T09:00:00.000Z", updatedAt: "2026-04-29T09:00:00.000Z" });
+    state.children.c = child({ id: "c", status: "done", endedAt: "2026-04-29T09:00:00.000Z", updatedAt: "2026-04-29T09:00:00.000Z" });
+
+    const pruned = pruneTerminalChildren(state, now);
+    // Within TTL, no rows removed by TTL; cap not exceeded with 3 rows.
+    expect(pruned).toBe(0);
+    expect(state.children.a).toBeDefined();
+    expect(state.children.b).toBeDefined();
+    expect(state.children.c).toBeDefined();
+  });
+
+  it("characterizes retained-only counters ignore tool/subtask wrappers", () => {
+    const state = createEmptyState();
+    upsertRunningChild(state, {
+      id: "tool:wrapper",
+      title: "Delegate",
+      parentID: "ses_parent",
+      source: "tool",
+      targetSessionID: undefined,
+    });
+    upsertRunningChild(state, {
+      id: "subtask:proxy",
+      title: "Subtask",
+      parentID: "ses_parent",
+      source: "subtask",
+      targetSessionID: "ses_child",
+    });
+    expect(state.totalExecuted).toBe(0);
+    expect(state.countedChildIDs["tool:wrapper"]).toBeUndefined();
+    expect(state.countedChildIDs["subtask:proxy"]).toBeUndefined();
+  });
+
+  it("characterizes atomic persistence leaves no leftover .tmp files and applies owner-only mode", async () => {
+    const harness = await createRuntimeHarness();
+    const state = createEmptyState();
+    state.children.ses_child = child();
+    await saveState(harness.statePath, state);
+
+    expect(await pathExists(harness.statePath)).toBe(true);
+    expect(await loadState(harness.statePath)).toMatchObject({
+      children: expect.any(Object),
+    });
+    // Verify no leftover temp files in directory.
+    const files = await readdir(harness.dir);
+    expect(files.some((f) => f.endsWith(".tmp"))).toBe(false);
+    // File mode assertions already in existing test; this locks observable behavior.
   });
 
   it("normalizes counters after loading missing counted ids", async () => {

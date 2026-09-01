@@ -11,3 +11,9 @@ coverage/
 *.tmp
 .DS_Store
 security-audit/
+
+# IDE
+.idea/
+
+# Project-local memory / progress
+.local/

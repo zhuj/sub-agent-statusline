@@ -1,17 +1,57 @@
 export type SidebarReturnFocusAction = "none" | "clear-pending" | "focus-prompt";
 
 export type PendingSidebarRefocus = {
+  /**
+   * Target session id of the child the user was on when they navigated away.
+   * Distinct from `childRowID`, which is the synthetic-row id used inside
+   * `state.children`.
+   */
   parentSessionID: string;
   childSessionID: string;
   childRowID: string;
   showCompletedHistory?: boolean;
 };
 
-export type ChildSessionState = {
+/**
+ * Structural subset of `state.children[childID]` consumed by the focus/refocus
+ * helpers in this module. Kept local (and narrower than the full
+ * `ChildSessionState` from `./state.js`) to avoid coupling focus logic to
+ * child-shape evolution.
+ */
+export type SidebarChildRef = {
   id: string;
   parentID: string;
   targetSessionID?: string;
 };
+
+export type ManagedDeferredCallbacks = {
+  readonly schedule: (callback: () => void) => void;
+  readonly dispose: () => void;
+};
+
+export function createManagedDeferredCallbacks(
+  isValid: () => boolean = () => true,
+): ManagedDeferredCallbacks {
+  const timeouts = new Set<ReturnType<typeof setTimeout>>();
+  let disposed = false;
+
+  return {
+    schedule(callback) {
+      if (disposed || !isValid()) return;
+      const timeout = setTimeout(() => {
+        timeouts.delete(timeout);
+        if (!disposed && isValid()) callback();
+      }, 0);
+      timeouts.add(timeout);
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      for (const timeout of timeouts) clearTimeout(timeout);
+      timeouts.clear();
+    },
+  };
+}
 
 export function shouldReleaseSidebarListFocus(input: {
   previousRunningCount?: number;
@@ -28,7 +68,7 @@ export function shouldReleaseSidebarListFocus(input: {
 export function resolveSiblingSidebarRefocus(input: {
   pendingSidebarRefocus?: PendingSidebarRefocus;
   routeSessionID?: string;
-  children: Record<string, ChildSessionState> | ChildSessionState[];
+  children: Record<string, SidebarChildRef> | SidebarChildRef[];
 }): Pick<PendingSidebarRefocus, "childSessionID" | "childRowID"> | undefined {
   const { pendingSidebarRefocus, routeSessionID, children } = input;
   if (

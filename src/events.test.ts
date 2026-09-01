@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
   applySubagentEvent,
+  applySubagentEventDetailed,
+  createChildLookup,
   extractLatestAssistantModel,
   extractChildDetails,
   extractSessionID,
   extractTaskToolEvidence,
+  resolveSyntheticTargetSessionID,
   type EventLike,
 } from "./events.js";
-import { createEmptyState } from "./state.js";
+import { createEmptyState, upsertRunningChild } from "./state.js";
 import { readJsonFixture } from "../test/helpers/runtime-harness.js";
 
 function upsertSubtask(
@@ -35,6 +38,98 @@ function upsertSubtask(
 }
 
 describe("events", () => {
+  it("does not treat a non-session-id source session as a synthetic target", () => {
+    const state = createEmptyState();
+    upsertRunningChild(state, {
+      id: "child_without_session_prefix",
+      title: "Real child",
+      parentID: "ses_parent",
+      source: "session",
+    });
+    upsertSubtask(state, {
+      partID: "targetless_for_non_session_id",
+      parentID: "ses_parent",
+      messageID: "msg_targetless",
+      description: "Synthetic child",
+    });
+
+    expect(
+      resolveSyntheticTargetSessionID(
+        state,
+        {
+          id: "subtask:targetless_for_non_session_id",
+          parentID: "ses_parent",
+          messageID: "msg_targetless",
+        },
+        [],
+        createChildLookup(state),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("does not parent-only backfill beside a non-session-id source session sibling", () => {
+    const state = createEmptyState();
+    applySubagentEvent(state, {
+      type: "session.created",
+      properties: {
+        info: {
+          id: "child_without_session_prefix",
+          parentID: "ses_parent",
+          title: "Existing real child",
+        },
+      },
+    });
+    applySubagentEvent(state, {
+      type: "message.part.updated",
+      properties: {
+        sessionID: "ses_parent",
+        part: {
+          type: "tool",
+          tool: "task",
+          id: "tool_targetless_sibling",
+          sessionID: "ses_parent",
+          messageID: "msg_targetless_sibling",
+          state: { status: "running", input: { description: "Run task" } },
+        },
+      },
+    });
+
+    applySubagentEvent(state, {
+      type: "session.created",
+      properties: {
+        info: {
+          id: "ses_new_child",
+          parentID: "ses_parent",
+          title: "New real child",
+        },
+      },
+    });
+
+    expect(state.children["tool:tool_targetless_sibling"]?.targetSessionID).toBe(
+      undefined,
+    );
+  });
+
+  it("returns changed child ids and mutation categories from the synchronous transaction", () => {
+    const state = createEmptyState();
+
+    const result = applySubagentEventDetailed(state, {
+      type: "session.created",
+      properties: {
+        info: {
+          id: "ses_transaction_child",
+          parentID: "ses_parent",
+          title: "Transaction child",
+        },
+      },
+    });
+
+    expect(result.changed).toBe(true);
+    expect(result.changedChildIDs).toEqual(["ses_transaction_child"]);
+    expect(result.mutationCategories).toEqual(["insert"]);
+    expect(state.children.ses_transaction_child?.status).toBe("running");
+  });
+
   it("extracts session identifiers from supported event locations", () => {
     expect(extractSessionID({ properties: { sessionID: "ses_props" } })).toBe(
       "ses_props",
@@ -184,6 +279,46 @@ describe("events", () => {
         contextPercent: 42,
       },
     });
+  });
+
+  it("characterizes malformed payload best-effort: no throw, false result, preserved empty state", async () => {
+    const malformed = await readJsonFixture("malformed");
+    const state = createEmptyState();
+
+    // No-op for malformed payload; no exception thrown.
+    expect(() => applySubagentEvent(state, malformed)).not.toThrow();
+    expect(applySubagentEvent(state, malformed)).toBe(false);
+    expect(applySubagentEvent(state, null)).toBe(false);
+    expect(applySubagentEvent(state, undefined)).toBe(false);
+    expect(applySubagentEvent(state, { type: "unknown" })).toBe(false);
+    expect(applySubagentEvent(state, { type: "session.created", properties: {} })).toBe(false);
+    expect(state.children).toEqual({});
+  });
+
+  it("characterizes event ordering preserved through sequential mutations", () => {
+    const state = createEmptyState();
+
+    applySubagentEvent(state, {
+      type: "session.created",
+      properties: {
+        info: { id: "ses_order", parentID: "ses_parent", title: "Ordered" },
+      },
+    });
+    expect(state.children.ses_order?.status).toBe("running");
+
+    applySubagentEvent(state, {
+      type: "message.part.updated",
+      properties: {
+        sessionID: "ses_parent",
+        part: {
+          type: "subtask",
+          id: "sub_order",
+          sessionID: "ses_parent",
+          messageID: "msg_order",
+        },
+      },
+    });
+    expect(state.children["subtask:sub_order"]?.parentID).toBe("ses_parent");
   });
 
   it("is deterministic and safe for malformed input", async () => {
@@ -709,6 +844,41 @@ describe("extractTaskToolEvidence", () => {
 });
 
 describe("task tool to subtask mapping", () => {
+  it("returns every running subtask closed by a completed assistant message", () => {
+    const state = createEmptyState();
+    upsertSubtask(state, {
+      partID: "sub_close_a",
+      parentID: "ses_parent",
+      messageID: "msg_close",
+      description: "First",
+    });
+    upsertSubtask(state, {
+      partID: "sub_close_b",
+      parentID: "ses_parent",
+      messageID: "msg_close",
+      description: "Second",
+    });
+
+    const result = applySubagentEventDetailed(state, {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg_close",
+          sessionID: "ses_parent",
+          role: "assistant",
+          time: { completed: 1_777_000_000_000 },
+        },
+      },
+    });
+
+    expect(result.changedChildIDs).toEqual([
+      "subtask:sub_close_a",
+      "subtask:sub_close_b",
+    ]);
+    expect(state.children["subtask:sub_close_a"]?.status).toBe("done");
+    expect(state.children["subtask:sub_close_b"]?.status).toBe("done");
+  });
+
   it("backfills a synchronous task tool wrapper when its session appears later", () => {
     const state = createEmptyState();
 

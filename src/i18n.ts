@@ -22,6 +22,14 @@ export type TranslationKey = keyof (typeof translations)["en"];
 let _cachedLocale: Locale | null = null;
 
 /**
+ * Resets the cached locale so the next `getLocale()`/`t()` call re-detects the
+ * system locale. Intended for test isolation only.
+ */
+export function __resetLocaleForTests(): void {
+  _cachedLocale = null;
+}
+
+/**
  * Detects the system locale using Intl.DateTimeFormat.
  * Falls back to English if the system locale is not supported.
  */

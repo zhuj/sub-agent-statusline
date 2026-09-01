@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChildSessionState, StatuslineState } from "./state.js";
 import {
   createTuiMaintenanceTimers,
+  resolveTuiMaintenanceDemand,
   runTuiStateMaintenance,
 } from "./tui.js";
 
@@ -133,6 +134,67 @@ describe("TUI maintenance timers", () => {
 });
 
 describe("TUI state maintenance", () => {
+  it("avoids cloning or normalizing terminal-only state when no work is due", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-17T09:02:00.000Z"));
+    const { api } = apiWithReadSpies();
+    const titleRead = vi.fn(() => "Child");
+    const terminal = child({ tokens: { total: 42 } });
+    Object.defineProperty(terminal, "title", {
+      configurable: true,
+      enumerable: true,
+      get: titleRead,
+    });
+    const current = state([terminal]);
+    titleRead.mockClear();
+
+    const next = runTuiStateMaintenance(api, current);
+
+    expect(next).toBe(current);
+    expect(titleRead).not.toHaveBeenCalled();
+  });
+
+  it("reports no maintenance demand for retained terminal state with complete tokens", () => {
+    const nowMs = Date.parse("2026-07-17T09:02:00.000Z");
+    const current = state([child({ tokens: { total: 42 } })]);
+
+    expect(
+      resolveTuiMaintenanceDemand({
+        state: current,
+        nowMs,
+        lastRunningReconcileAtMs: nowMs,
+      }),
+    ).toEqual({
+      prune: false,
+      reconcile: false,
+      hydrateTokens: false,
+    });
+  });
+
+  it("retains running token retries and due reconciliation demand", () => {
+    const nowMs = Date.parse("2026-07-17T09:20:00.000Z");
+    const current = state([
+      child({
+        status: "running",
+        color: "yellow",
+        endedAt: undefined,
+        tokens: { total: 42 },
+      }),
+    ]);
+
+    expect(
+      resolveTuiMaintenanceDemand({
+        state: current,
+        nowMs,
+        lastRunningReconcileAtMs: nowMs - 10 * 60_000,
+      }),
+    ).toEqual({
+      prune: false,
+      reconcile: true,
+      hydrateTokens: true,
+    });
+  });
+
   it("performs zero history reads for terminal children with complete tokens", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-17T09:02:00.000Z"));
@@ -145,17 +207,17 @@ describe("TUI state maintenance", () => {
     expect(part).not.toHaveBeenCalled();
   });
 
-  it("preserves terminal token fallback reads while idle", () => {
+  it("defers terminal token fallback reads outside synchronous maintenance", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-17T09:02:00.000Z"));
     const { api, status, messages, part } = apiWithReadSpies();
     const current = state([child({ id: "ses_fallback" })]);
 
-    runTuiStateMaintenance(api, current);
+    expect(runTuiStateMaintenance(api, current)).toBe(current);
 
-    expect(status).toHaveBeenCalledWith("ses_fallback");
-    expect(messages).toHaveBeenCalledWith("ses_fallback");
-    expect(part).toHaveBeenCalledWith("msg_child");
+    expect(status).not.toHaveBeenCalled();
+    expect(messages).not.toHaveBeenCalled();
+    expect(part).not.toHaveBeenCalled();
   });
 
   it("prunes expired terminal children while idle", () => {
@@ -175,5 +237,38 @@ describe("TUI state maintenance", () => {
 
     expect(next).not.toBe(current);
     expect(next.children).toEqual({});
+  });
+
+  it("keeps the exact three-day boundary and prunes immediately after it", () => {
+    vi.useFakeTimers();
+    const { api } = apiWithReadSpies();
+    const endedAt = "2026-07-14T09:02:00.000Z";
+    const current = state([child({ endedAt, updatedAt: endedAt, tokens: { total: 1 } })]);
+
+    vi.setSystemTime(new Date("2026-07-17T09:02:00.000Z"));
+    expect(runTuiStateMaintenance(api, current)).toBe(current);
+
+    vi.setSystemTime(new Date("2026-07-17T09:02:00.001Z"));
+    expect(runTuiStateMaintenance(api, current).children).toEqual({});
+  });
+
+  it("prunes terminal overflow to the existing 1,500-row cap", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-17T09:02:00.000Z"));
+    const { api } = apiWithReadSpies();
+    const terminalChildren = Array.from({ length: 1_501 }, (_, index) =>
+      child({
+        id: `ses_terminal_${index}`,
+        targetSessionID: `ses_terminal_${index}`,
+        tokens: { total: 1 },
+        endedAt: new Date(Date.parse("2026-07-17T09:00:00.000Z") + index).toISOString(),
+        updatedAt: new Date(Date.parse("2026-07-17T09:00:00.000Z") + index).toISOString(),
+      }),
+    );
+
+    const next = runTuiStateMaintenance(api, state(terminalChildren));
+
+    expect(Object.keys(next.children)).toHaveLength(1_500);
+    expect(next.children.ses_terminal_0).toBeUndefined();
   });
 });

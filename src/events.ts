@@ -1,5 +1,6 @@
 import type {
   ChildModelState,
+  ChildSessionState,
   ChildTokenState,
   StatuslineState,
 } from "./state.js";
@@ -9,6 +10,7 @@ import {
 } from "./reconcile.js";
 import {
   markChildStatus,
+  parseTimestamp,
   setChildModel,
   upsertChildDetails,
   upsertRunningChild,
@@ -82,6 +84,31 @@ type SyntheticTargetContext = {
   parentID: string;
   messageID?: string;
 };
+
+export type EventMutationCategory =
+  | "insert"
+  | "details"
+  | "status"
+  | "model"
+  | "target";
+
+export type SubagentEventTransaction = {
+  changed: boolean;
+  changedChildIDs: string[];
+  mutationCategories: EventMutationCategory[];
+};
+
+import {
+  childLookupKey as lookupKey,
+  createChildLookup,
+  lookupChildren,
+  refreshChildLookup,
+  setChildTarget,
+  type ChildLookup,
+} from "./events-lookup.js";
+
+export { createChildLookup, refreshChildLookup, setChildTarget } from "./events-lookup.js";
+export type { ChildLookup } from "./events-lookup.js";
 
 export function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
@@ -265,35 +292,70 @@ function collectSessionIDs(
   }
 }
 
-function resolveSyntheticTargetSessionID(
+/**
+ * Optional diagnostic sink used by `resolveSyntheticTargetSessionID` when it
+ * falls back to `undefined` because of ambiguity. Wired by the TUI plugin
+ * to its JSONL event log; tests can pass a capture function.
+ */
+export type SubagentDebugSink = (entry: Record<string, unknown>) => void;
+
+let _subagentDebugSink: SubagentDebugSink | undefined;
+
+export function __setSubagentDebugSink(sink: SubagentDebugSink | undefined): void {
+  _subagentDebugSink = sink;
+}
+
+function emitSubagentDebug(entry: Record<string, unknown>): void {
+  _subagentDebugSink?.(entry);
+}
+
+export function resolveSyntheticTargetSessionID(
   state: StatuslineState,
   synthetic: SyntheticTargetContext,
   explicitCandidates: readonly string[] = [],
+  lookup = createChildLookup(state),
 ): string | undefined {
   const candidates = new Set<string>(explicitCandidates.filter(isSessionID));
 
-  const byMessage = Object.values(state.children).filter(
-    (child) =>
-      child.id.startsWith("ses_") &&
-      child.parentID === synthetic.parentID &&
-      child.messageID &&
-      synthetic.messageID &&
-      child.messageID === synthetic.messageID,
+  const byMessage = lookupChildren(
+    state,
+    lookup,
+    lookup.sessionsByParentMessage,
+    synthetic.messageID
+      ? lookupKey(synthetic.parentID, synthetic.messageID)
+      : undefined,
   );
   if (byMessage.length === 1) {
     candidates.add(byMessage[0].id);
   }
 
-  const byParent = Object.values(state.children).filter(
-    (child) =>
-      child.id.startsWith("ses_") && child.parentID === synthetic.parentID,
+  const byParent = lookupChildren(
+    state,
+    lookup,
+    lookup.sessionsByParent,
+    synthetic.parentID,
   );
   if (byParent.length === 1) {
     candidates.add(byParent[0].id);
   }
 
-  if (candidates.size !== 1) return undefined;
-  return [...candidates][0];
+  if (candidates.size === 1) return [...candidates][0];
+
+  // Fail-closed: do not invent a relationship. Surface the ambiguity via the
+  // optional debug sink so maintainers can investigate "missing subagent in
+  // sidebar" reports without changing the merge result.
+  emitSubagentDebug({
+    kind: "subagent.target.ambiguous",
+    childID: synthetic.id,
+    parentID: synthetic.parentID,
+    messageID: synthetic.messageID,
+    candidateCount: candidates.size,
+    explicitCount: explicitCandidates.filter(isSessionID).length,
+    byMessageCount: byMessage.length,
+    byParentCount: byParent.length,
+  });
+
+  return undefined;
 }
 
 function extractPartTargetSessionCandidates(event: EventLike): string[] {
@@ -330,30 +392,31 @@ function backfillSyntheticTargetsForSession(
     messageID?: string;
     updatedAt?: string;
   },
-): boolean {
-  const targetlessSynthetic = Object.values(state.children).filter(
-    (child) =>
-      (child.source === "tool" || child.source === "subtask") &&
-      !child.targetSessionID &&
-      child.parentID === session.parentID,
-  );
+  lookup: ChildLookup,
+): { changed: boolean; childIDs: string[] } {
+  const targetlessSynthetic = lookupChildren(
+    state,
+    lookup,
+    lookup.syntheticByParent,
+    session.parentID,
+  ).filter((child) => !child.targetSessionID);
 
   const messageMatches = session.messageID
     ? targetlessSynthetic.filter(
         (child) => child.messageID === session.messageID,
       )
     : [];
-  const existingSessionSiblings = Object.values(state.children).filter(
-    (child) =>
-      child.id !== session.id &&
-      (child.source === "session" || child.id.startsWith("ses_")) &&
-      child.parentID === session.parentID,
-  );
+  const existingSessionSiblings = lookupChildren(
+    state,
+    lookup,
+    lookup.sessionLikeByParent,
+    session.parentID,
+  ).filter((child) => child.id !== session.id);
   const candidates =
     messageMatches.length > 0 ? messageMatches : targetlessSynthetic;
-  if (candidates.length !== 1) return false;
+  if (candidates.length !== 1) return { changed: false, childIDs: [] };
   if (messageMatches.length === 0 && existingSessionSiblings.length > 0) {
-    return false;
+    return { changed: false, childIDs: [] };
   }
 
   const synthetic = candidates[0];
@@ -365,13 +428,15 @@ function backfillSyntheticTargetsForSession(
       messageID: synthetic.messageID,
     },
     [session.id],
+    lookup,
   );
-  if (targetSessionID !== session.id) return false;
+  if (targetSessionID !== session.id) return { changed: false, childIDs: [] };
 
-  return upsertChildDetails(state, synthetic.id, {
+  const changed = upsertChildDetails(state, synthetic.id, {
     targetSessionID,
     updatedAt: session.updatedAt,
   });
+  return { changed, childIDs: changed ? [synthetic.id] : [] };
 }
 
 export function extractTaskToolEvidence(
@@ -428,19 +493,20 @@ function mapTaskToolToSubtaskID(
     agentName?: string;
     targetSessionID?: string;
   },
+  lookup: ChildLookup,
 ): string | undefined {
-  const runningSubtasks = Object.values(state.children).filter(
-    (child) =>
-      child.source === "subtask" &&
-      child.status === "running" &&
-      child.parentID === task.parentID,
-  );
-  const primaryCandidates = runningSubtasks.filter(
-    (child) => child.messageID === task.messageID,
+  const primaryCandidates = lookupChildren(
+    state,
+    lookup,
+    lookup.runningSubtasksByParentMessage,
+    lookupKey(task.parentID, task.messageID),
   );
   const legacyCandidates = task.parentMessageID
-    ? runningSubtasks.filter(
-        (child) => child.messageID === task.parentMessageID,
+    ? lookupChildren(
+        state,
+        lookup,
+        lookup.runningSubtasksByParentMessage,
+        lookupKey(task.parentID, task.parentMessageID),
       )
     : [];
   const candidates =
@@ -483,24 +549,6 @@ function extractParentMessageID(event: EventLike): string | undefined {
   );
 }
 
-function toIsoTimestamp(value: unknown): string | undefined {
-  if (typeof value === "string") {
-    if (value.trim().length === 0) return undefined;
-    const parsed = Date.parse(value);
-    if (Number.isNaN(parsed)) return undefined;
-    return new Date(parsed).toISOString();
-  }
-
-  if (typeof value === "number" && Number.isFinite(value)) {
-    if (value <= 0) return undefined;
-    const millis = value < 10_000_000_000 ? value * 1000 : value;
-    const parsed = new Date(millis);
-    return Number.isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
-  }
-
-  return undefined;
-}
-
 function extractEventTimestamp(
   event: EventLike,
   keys: string[],
@@ -524,7 +572,7 @@ function extractEventTimestamp(
   for (const source of sources) {
     if (!source) continue;
     for (const key of keys) {
-      const candidate = toIsoTimestamp(source[key]);
+      const candidate = parseTimestamp(source[key]);
       if (candidate) return candidate;
     }
   }
@@ -777,8 +825,18 @@ export function extractChildDetails(event: EventLike): {
   const tokenHints: ChildTokenState = {};
   const visited = new Set<object>();
 
+  const isTokenHintsComplete = (): boolean =>
+    tokenHints.input !== undefined &&
+    tokenHints.output !== undefined &&
+    tokenHints.total !== undefined &&
+    tokenHints.contextPercent !== undefined;
+
   const walk = (node: unknown, depth: number): void => {
     if (!isRecord(node) || depth > 6) return;
+    // Short-circuit once every token field is resolved; traversing further
+    // only yields redundant matches and increases event-loop pressure during
+    // message-bursty workloads.
+    if (isTokenHintsComplete()) return;
     if (visited.has(node)) return;
     visited.add(node);
 
@@ -833,30 +891,56 @@ export function extractChildDetails(event: EventLike): {
   return details;
 }
 
-export function applySubagentEvent(
+export function applySubagentEventDetailed(
   state: StatuslineState,
   event: unknown,
-): boolean {
+): SubagentEventTransaction {
+  const lookup = createChildLookup(state);
+  const result: SubagentEventTransaction = {
+    changed: false,
+    changedChildIDs: [],
+    mutationCategories: [],
+  };
+  const record = (
+    changed: boolean,
+    childIDs: readonly string[],
+    category: EventMutationCategory,
+  ): void => {
+    if (!changed) return;
+    result.changed = true;
+    for (const childID of childIDs) {
+      if (!result.changedChildIDs.includes(childID)) {
+        result.changedChildIDs.push(childID);
+      }
+      refreshChildLookup(lookup, state, childID);
+    }
+    if (!result.mutationCategories.includes(category)) {
+      result.mutationCategories.push(category);
+    }
+  };
   const e = (event ?? {}) as EventLike;
   const type = asString(e.type);
-  if (!type) return false;
+  if (!type) return result;
 
   if (type === "session.created" || type === "session.updated") {
     const child = extractCreatedChild(e);
     if (child) {
       const details = extractChildDetails(e);
-      let changed = upsertRunningChild(state, {
+      const inserted = upsertRunningChild(state, {
         ...child,
         source: "session",
         targetSessionID: child.id,
       });
-      changed = upsertChildDetails(state, child.id, details) || changed;
-      changed =
-        backfillSyntheticTargetsForSession(state, {
+      record(inserted, [child.id], "insert");
+      const detailsChanged = upsertChildDetails(state, child.id, details);
+      record(detailsChanged, [child.id], "details");
+      const targetMutation = backfillSyntheticTargetsForSession(state, {
           id: child.id,
           parentID: child.parentID,
           updatedAt: child.updatedAt,
-        }) || changed;
+        }, lookup);
+      record(targetMutation.changed, targetMutation.childIDs, "target");
+      let changed = inserted || detailsChanged || targetMutation.changed;
       const sessionStatusFromUpdate =
         type === "session.updated"
           ? hasStructuredErrorEvidence(e.properties ?? e)
@@ -879,18 +963,31 @@ export function applySubagentEvent(
           "ended",
           "updated",
         ]);
-        changed =
-          markChildStatus(state, child.id, sessionStatusFromUpdate, endedAt) ||
-          changed;
+        const statusCandidates = [
+          child.id,
+          ...lookupChildren(state, lookup, lookup.byTarget, child.id).map(
+            (candidate) => candidate.id,
+          ),
+        ];
+        const statusChanged = markChildStatus(
+          state,
+          child.id,
+          sessionStatusFromUpdate,
+          endedAt,
+          statusCandidates,
+        );
+        record(statusChanged, statusCandidates, "status");
+        changed = statusChanged || changed;
       }
-      return changed;
+      result.changed = result.changed || changed;
+      return result;
     }
-    return false;
+    return result;
   }
 
   if (type === "session.idle") {
     const childID = extractSessionID(e);
-    if (!childID) return false;
+    if (!childID) return result;
     const endedAt = extractEventTimestamp(e, [
       "completed",
       "end",
@@ -903,14 +1000,28 @@ export function applySubagentEvent(
       hasStructuredErrorEvidence(e.properties ?? e)
         ? "error"
         : "done";
-    let changed = markChildStatus(state, childID, status, endedAt);
-    changed = upsertChildDetails(state, childID, details) || changed;
-    return changed;
+    const candidates = [
+      childID,
+      ...lookupChildren(state, lookup, lookup.byTarget, childID).map(
+        (candidate) => candidate.id,
+      ),
+    ];
+    const statusChanged = markChildStatus(
+      state,
+      childID,
+      status,
+      endedAt,
+      candidates,
+    );
+    record(statusChanged, candidates, "status");
+    const detailsChanged = upsertChildDetails(state, childID, details);
+    record(detailsChanged, [childID], "details");
+    return result;
   }
 
   if (type === "session.error") {
     const childID = extractSessionID(e);
-    if (!childID) return false;
+    if (!childID) return result;
     const endedAt = extractEventTimestamp(e, [
       "completed",
       "end",
@@ -918,14 +1029,28 @@ export function applySubagentEvent(
       "updated",
     ]);
     const details = extractChildDetails(e);
-    let changed = markChildStatus(state, childID, "error", endedAt);
-    changed = upsertChildDetails(state, childID, details) || changed;
-    return changed;
+    const candidates = [
+      childID,
+      ...lookupChildren(state, lookup, lookup.byTarget, childID).map(
+        (candidate) => candidate.id,
+      ),
+    ];
+    const statusChanged = markChildStatus(
+      state,
+      childID,
+      "error",
+      endedAt,
+      candidates,
+    );
+    record(statusChanged, candidates, "status");
+    const detailsChanged = upsertChildDetails(state, childID, details);
+    record(detailsChanged, [childID], "details");
+    return result;
   }
 
   if (type === "session.status") {
     const childID = extractSessionID(e);
-    if (!childID) return false;
+    if (!childID) return result;
     const status = hasStructuredErrorEvidence(e.properties ?? e)
       ? "error"
       : deriveOpenCodeSessionStatus(
@@ -936,19 +1061,27 @@ export function applySubagentEvent(
             e.state ??
             e.properties,
         );
-    if (!status) return false;
+    if (!status) return result;
 
     const endedAt =
       status === "done" || status === "error"
         ? extractEventTimestamp(e, ["completed", "end", "ended", "updated"])
         : undefined;
     const details = extractChildDetails(e);
-    let changed =
+    const candidates = [
+      childID,
+      ...lookupChildren(state, lookup, lookup.byTarget, childID).map(
+        (candidate) => candidate.id,
+      ),
+    ];
+    const statusChanged =
       status === "running"
         ? false
-        : markChildStatus(state, childID, status, endedAt);
-    changed = upsertChildDetails(state, childID, details) || changed;
-    return changed;
+        : markChildStatus(state, childID, status, endedAt, candidates);
+    record(statusChanged, candidates, "status");
+    const detailsChanged = upsertChildDetails(state, childID, details);
+    record(detailsChanged, [childID], "details");
+    return result;
   }
 
   let changed = false;
@@ -964,15 +1097,17 @@ export function applySubagentEvent(
           messageID: subtask.messageID,
         },
         subtask.targetSessionID ? [subtask.targetSessionID] : [],
+        lookup,
       );
-      changed =
-        upsertRunningChild(state, {
+      const subtaskChanged = upsertRunningChild(state, {
           ...subtask,
           source: "subtask",
           targetSessionID,
           startedAt: subtask.startedAt,
           updatedAt: subtask.updatedAt,
-        }) || changed;
+        });
+      record(subtaskChanged, [subtask.id], "insert");
+      changed = subtaskChanged || changed;
     }
 
     const tool = extractToolChild(e);
@@ -985,6 +1120,7 @@ export function applySubagentEvent(
           messageID: tool.messageID,
         },
         tool.targetSessionID ? [tool.targetSessionID] : [],
+        lookup,
       );
       const childChanged = upsertRunningChild(state, {
         ...tool,
@@ -993,15 +1129,23 @@ export function applySubagentEvent(
         startedAt: tool.startedAt,
         updatedAt: tool.updatedAt,
       });
+      record(childChanged, [tool.id], "insert");
       changed = childChanged || changed;
       if (tool.status === "done" || tool.status === "error") {
-        changed =
-          markChildStatus(
+        const toolStatusChanged = markChildStatus(
             state,
             tool.id,
             tool.status,
             tool.endedAt ?? tool.updatedAt,
-          ) || changed;
+            [
+              tool.id,
+              ...lookupChildren(state, lookup, lookup.byTarget, tool.id).map(
+                (candidate) => candidate.id,
+              ),
+            ],
+          );
+        record(toolStatusChanged, [tool.id], "status");
+        changed = toolStatusChanged || changed;
 
         if (
           asString(
@@ -1016,22 +1160,25 @@ export function applySubagentEvent(
             summary: tool.summary,
             agentName: tool.agentName,
             targetSessionID: targetSessionID,
-          });
+          }, lookup);
           if (subtaskID) {
             if (targetSessionID) {
-              changed =
-                upsertChildDetails(state, subtaskID, {
+              const targetChanged = upsertChildDetails(state, subtaskID, {
                   targetSessionID,
                   updatedAt: tool.updatedAt,
-                }) || changed;
+                });
+              record(targetChanged, [subtaskID], "target");
+              changed = targetChanged || changed;
             }
-            changed =
-              markChildStatus(
+            const subtaskStatusChanged = markChildStatus(
                 state,
                 subtaskID,
                 tool.status,
                 tool.endedAt ?? tool.updatedAt,
-              ) || changed;
+                [subtaskID],
+              );
+            record(subtaskStatusChanged, [subtaskID], "status");
+            changed = subtaskStatusChanged || changed;
           }
         }
       }
@@ -1041,25 +1188,39 @@ export function applySubagentEvent(
   if (type === "message.updated") {
     const assistantModel = extractLatestAssistantModel(e.properties?.info ?? e);
     if (assistantModel) {
-      changed =
-        setChildModel(
+      const modelCandidates = [
+        assistantModel.sessionID,
+        ...lookupChildren(
+          state,
+          lookup,
+          lookup.byTarget,
+          assistantModel.sessionID,
+        ).map((candidate) => candidate.id),
+      ];
+      const modelChanged = setChildModel(
           state,
           assistantModel.sessionID,
           assistantModel.model,
           assistantModel.updatedAt,
-        ) || changed;
+          modelCandidates,
+        );
+      record(modelChanged, modelCandidates, "model");
+      changed = modelChanged || changed;
     }
     const completed = extractCompletedAssistantMessage(e);
     if (completed) {
-      for (const child of Object.values(state.children)) {
-        if (
-          child.source === "subtask" &&
-          child.status === "running" &&
-          child.parentID === completed.sessionID &&
-          child.messageID === completed.messageID
-        ) {
-          changed = markChildStatus(state, child.id, "done") || changed;
-        }
+      const matchingIDs = lookupChildren(
+        state,
+        lookup,
+        lookup.runningSubtasksByParentMessage,
+        lookupKey(completed.sessionID, completed.messageID),
+      ).map((child) => child.id);
+      for (const childID of matchingIDs) {
+        const closed = markChildStatus(state, childID, "done", undefined, [
+          childID,
+        ]);
+        record(closed, [childID], "status");
+        changed = closed || changed;
       }
     }
   }
@@ -1068,10 +1229,20 @@ export function applySubagentEvent(
     const details = extractChildDetails(e);
     for (const childID of extractDetailTargetIDs(e)) {
       if (state.children[childID]) {
-        changed = upsertChildDetails(state, childID, details) || changed;
+        const detailsChanged = upsertChildDetails(state, childID, details);
+        record(detailsChanged, [childID], "details");
+        changed = detailsChanged || changed;
       }
     }
   }
 
-  return changed;
+  result.changed = result.changed || changed;
+  return result;
+}
+
+export function applySubagentEvent(
+  state: StatuslineState,
+  event: unknown,
+): boolean {
+  return applySubagentEventDetailed(state, event).changed;
 }

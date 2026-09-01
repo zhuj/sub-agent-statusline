@@ -229,6 +229,7 @@ Release maintainers should keep the repository `NPM_TOKEN` secret restricted, re
 - [Contributing](CONTRIBUTING.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Security policy](SECURITY.md)
+- [Propose a change](openspec/changes/) — behavioural changes go through openspec proposals.
 
 ## License
 

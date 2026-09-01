@@ -80,6 +80,76 @@ export function classifySubagentWorkItem(
   return { kind: "invocation-wrapper" };
 }
 
+// Internal one-pass immutable correlation index (ephemeral, not persisted).
+// Built once per operation; replaces repeated per-proxy filtering over real items.
+interface SubagentCorrelationIndex<T extends SubagentClassifiableWorkItem> {
+  // All real execution items in first-occurrence input order.
+  realItemsOrdered: T[];
+  // First real item per execution ID (first insertion wins; preserves order).
+  firstRealByExecutionID: Map<string, T>;
+  // Complete set of unique real execution IDs for trusted-target lookup.
+  executionIDSet: Set<string>;
+  // Parent/message composite -> matching real items in input order.
+  parentMessageRealItems: Map<string, T[]>;
+  // Parent -> matching real items in input order.
+  parentRealItems: Map<string, T[]>;
+  // Uniqueness/ambiguity tracking derived from the buckets above.
+  parentMessageExecutionSets: Map<string, Set<string>>;
+  parentExecutionSets: Map<string, Set<string>>;
+}
+
+function buildSubagentCorrelationIndex<T extends SubagentClassifiableWorkItem>(
+  items: readonly T[],
+): SubagentCorrelationIndex<T> {
+  const realItemsOrdered: T[] = [];
+  const firstRealByExecutionID = new Map<string, T>();
+  const executionIDSet = new Set<string>();
+  const parentMessageRealItems = new Map<string, T[]>();
+  const parentRealItems = new Map<string, T[]>();
+  const parentMessageExecutionSets = new Map<string, Set<string>>();
+  const parentExecutionSets = new Map<string, Set<string>>();
+
+  for (const item of items) {
+    if (!isRealExecution(item)) continue;
+    const executionID = realExecutionID(item);
+    realItemsOrdered.push(item);
+    executionIDSet.add(executionID);
+    if (!firstRealByExecutionID.has(executionID)) {
+      firstRealByExecutionID.set(executionID, item);
+    }
+
+    const pmKey = JSON.stringify({
+      parentID: item.parentID,
+      messageID: item.messageID,
+    });
+    const pmBucket = parentMessageRealItems.get(pmKey) ?? [];
+    pmBucket.push(item);
+    parentMessageRealItems.set(pmKey, pmBucket);
+
+    const pmSet = parentMessageExecutionSets.get(pmKey) ?? new Set<string>();
+    pmSet.add(executionID);
+    parentMessageExecutionSets.set(pmKey, pmSet);
+
+    const pBucket = parentRealItems.get(item.parentID) ?? [];
+    pBucket.push(item);
+    parentRealItems.set(item.parentID, pBucket);
+
+    const pSet = parentExecutionSets.get(item.parentID) ?? new Set<string>();
+    pSet.add(executionID);
+    parentExecutionSets.set(item.parentID, pSet);
+  }
+
+  return {
+    realItemsOrdered,
+    firstRealByExecutionID,
+    executionIDSet,
+    parentMessageRealItems,
+    parentRealItems,
+    parentMessageExecutionSets,
+    parentExecutionSets,
+  };
+}
+
 function uniqueExecutionID<T extends SubagentClassifiableWorkItem>(
   candidates: readonly T[],
 ): string | undefined {
@@ -130,6 +200,33 @@ export function resolveUniqueSameParentExecutionID<
   );
 }
 
+function resolveCorrelatedExecutionIDWithIndex<
+  T extends SubagentClassifiableWorkItem,
+>(item: SubagentClassifiableWorkItem, index: SubagentCorrelationIndex<T>): string | undefined {
+  const targetSessionID = trustedTargetSessionID(item);
+  if (targetSessionID) {
+    return index.executionIDSet.has(targetSessionID) ? targetSessionID : undefined;
+  }
+
+  if (item.messageID) {
+    const pmKey = JSON.stringify({
+      parentID: item.parentID,
+      messageID: item.messageID,
+    });
+    const pmSet = index.parentMessageExecutionSets.get(pmKey);
+    if (pmSet && pmSet.size === 1) {
+      return [...pmSet][0];
+    }
+  }
+
+  const pSet = index.parentExecutionSets.get(item.parentID);
+  if (pSet && pSet.size === 1) {
+    return [...pSet][0];
+  }
+
+  return undefined;
+}
+
 export function resolveCorrelatedExecutionID<
   T extends SubagentClassifiableWorkItem,
 >(item: SubagentClassifiableWorkItem, realItems: readonly T[]): string | undefined {
@@ -146,10 +243,10 @@ export function resolveCorrelatedExecutionID<
 export function correlateSubagentWorkItems<
   T extends SubagentClassifiableWorkItem,
 >(items: readonly T[]): CorrelatedSubagentExecution<T>[] {
-  const realItems = realExecutions(items);
+  const index = buildSubagentCorrelationIndex(items);
   const executions = new Map<string, CorrelatedSubagentExecution<T>>();
 
-  for (const item of realItems) {
+  for (const item of index.realItemsOrdered) {
     const executionID = realExecutionID(item);
     if (!executions.has(executionID)) {
       executions.set(executionID, { executionID, real: item, proxies: [] });
@@ -159,7 +256,7 @@ export function correlateSubagentWorkItems<
   for (const item of items) {
     if (classifySubagentWorkItem(item).kind === "real-execution") continue;
 
-    const executionID = resolveCorrelatedExecutionID(item, realItems);
+    const executionID = resolveCorrelatedExecutionIDWithIndex(item, index);
     if (!executionID) continue;
 
     executions.get(executionID)?.proxies.push(item);
