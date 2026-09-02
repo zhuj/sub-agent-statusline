@@ -1,9 +1,8 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import { describe, expect, it, vi } from "vitest";
-import { readOpenCodeLogFileIfSmall } from "./logs.js";
 import {
   backfillHydratedTargetSessionIDs,
   formatChildModelLine,
@@ -42,7 +41,6 @@ import {
   createBestEffortDisposer,
   registerSubagentCommands,
 } from "./tui-commands.js";
-import { escapeSqlStringForTesting } from "./tui.js";
 import type { ChildSessionState, StatuslineState } from "./state.js";
 import { createPersistenceCoordinator } from "./persistence.js";
 
@@ -2262,49 +2260,6 @@ describe("running reconciliation candidate selection", () => {
     expect(selected.map((candidate) => candidate.childID)).toEqual([
       "ses_current_child",
     ]);
-  });
-});
-
-describe("escapeSqlString (SQL safety contract)", () => {
-  it("returns benign sessionIDs unchanged", () => {
-    expect(escapeSqlStringForTesting("ses_abc123")).toBe("ses_abc123");
-  });
-
-  it("doubles embedded single quotes to keep single-quoted literals safe", () => {
-    expect(escapeSqlStringForTesting("ses_abc';DROP TABLE x;--"))
-      .toBe("ses_abc'';DROP TABLE x;--");
-  });
-
-  it("does not attempt to escape semicolons or backslashes (defensive only)", () => {
-    // The SQL escape handles single quotes only. By contract callers only
-    // pass `ses_[A-Za-z0-9_-]+` strings; this test documents the actual
-    // behaviour rather than overstating guarantees.
-    expect(escapeSqlStringForTesting("ses_a\\b")).toBe("ses_a\\b");
-  });
-});
-
-describe("readOpenCodeLogFileIfSmall", () => {
-  it("reads small logs asynchronously and skips oversized OpenCode logs", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "subagent-statusline-logs-"));
-    const smallLog = join(dir, "small.log");
-    const hugeLog = join(dir, "huge.log");
-
-    await writeFile(smallLog, "small log", "utf8");
-    await writeFile(hugeLog, `${"x".repeat(1024 * 1024)}x`, "utf8");
-
-    const smallRead = readOpenCodeLogFileIfSmall(smallLog);
-    expect(smallRead).toBeInstanceOf(Promise);
-    await expect(smallRead).resolves.toBe("small log");
-    await expect(readOpenCodeLogFileIfSmall(hugeLog)).resolves.toBeUndefined();
-  });
-
-  it("does not start a bounded log read after cancellation", async () => {
-    const controller = new AbortController();
-    controller.abort();
-
-    await expect(
-      readOpenCodeLogFileIfSmall("/untrusted/missing.log", controller.signal),
-    ).resolves.toBeUndefined();
   });
 });
 

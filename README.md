@@ -26,7 +26,7 @@ The configuration usually lives at:
 ~/.config/opencode/tui.json
 ```
 
-Restart OpenCode after saving the file. The package is published as `opencode-subagent-statusline` and requires Node `>=22.13`.
+Restart OpenCode after saving the file. The package is published as `opencode-subagent-statusline` and requires Node `>=24`.
 
 ## Why Subagent Monitor?
 
@@ -152,7 +152,7 @@ The plugin persists a local JSON state file and `status.txt` snapshot under `XDG
 
 `OPENCODE_SUBAGENT_STATUSLINE_STATE` overrides the state file path. Treat that environment variable as trusted local configuration because the plugin will write status data to the configured path.
 
-For token/context backfill, the TUI reads recent local OpenCode SQLite/log data only from the user's OpenCode data directory. Very large log files are skipped to avoid blocking the TUI.
+For token/context backfill, the TUI uses current OpenCode TUI state and the `session.messages` API. It does not inspect OpenCode's SQLite database or log files directly.
 
 <details>
 <summary>Development and testing</summary>

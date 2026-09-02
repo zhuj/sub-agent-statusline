@@ -54,7 +54,7 @@ La versión del package manager forma parte de la cadena de suministro. Si cada 
 
 ---
 
-## 3. `engines.node: >=22.13`
+## 3. `engines.node: >=24`
 
 **Qué se hizo**
 
@@ -62,13 +62,13 @@ En `package.json` se declaró:
 
 ```json
 "engines": {
-  "node": ">=22.13"
+  "node": ">=24"
 }
 ```
 
 **Por qué**
 
-`pnpm@11.1.2` requiere Node.js `>=22.13` y usa módulos runtime como `node:sqlite` que no existen en Node 20. Declararlo explícitamente mantiene desarrollo, CI y release en un runtime compatible y probado.
+El plugin se desarrolla, prueba y publica sobre Node.js `>=24`. Declararlo explícitamente mantiene desarrollo, CI y release en el runtime compatible y probado, sin depender de APIs SQLite de Node para hidratar tokens.
 
 **Qué protege**
 
@@ -411,27 +411,21 @@ Si `state.json` se escribía de forma segura pero `status.txt` seguía con `writ
 
 ---
 
-## 16. Límite de lectura para logs de OpenCode
+## 16. Sin inspección directa de SQLite ni logs de OpenCode
 
 **Qué se hizo**
 
-Se agregó `src/logs.ts` con un helper que revisa tamaño antes de leer:
-
-```ts
-readOpenCodeLogFileIfSmall(...)
-```
-
-Si el log supera 1 MiB, se saltea.
+Se eliminaron los fallbacks que consultaban directamente la base SQLite y los archivos de log de OpenCode. La hidratación de tokens usa únicamente el estado actual de la TUI y `api.client.session.messages`.
 
 **Por qué**
 
-La TUI leía logs locales de forma síncrona para reconstruir tokens/contexto. Un log enorme podía bloquear la UI o consumir memoria innecesaria.
+El acceso forense al almacenamiento interno de OpenCode acoplaba el plugin a rutas y formatos privados, además de ampliar la superficie de lectura local.
 
 **Qué protege**
 
-- Evita bloqueos por archivos muy grandes.
-- Reduce riesgo de degradación por logs locales anómalos.
-- Mantiene el backfill como best-effort: si el log es grande, se omite.
+- Evita acceso directo a datos internos fuera de las APIs soportadas.
+- Reduce el acoplamiento a formatos privados de SQLite y logs.
+- Mantiene la cancelación y el merge best-effort en las fuentes de hidratación soportadas.
 
 ---
 
@@ -513,7 +507,7 @@ Se agregaron/actualizaron tests para:
 - escritura de estado/status;
 - permisos esperados;
 - ausencia de temp files sobrantes;
-- skip de logs mayores a 1 MiB.
+- hidratación y merge de tokens desde las fuentes soportadas.
 
 **Por qué**
 
@@ -522,7 +516,7 @@ Las medidas de seguridad deben quedar protegidas contra regresiones.
 **Qué protege**
 
 - Evita volver accidentalmente a `writeFile` directo.
-- Verifica que el helper de logs no lea archivos enormes.
+- Verifica la hidratación sin depender de archivos internos de OpenCode.
 - Hace que los cambios sean mantenibles.
 
 ---
@@ -555,7 +549,7 @@ Las medidas tomadas apuntan a cuatro áreas:
 1. **Supply chain npm**: pnpm fijo, installs determinísticos, `--ignore-scripts`, audit bloqueante, provenance.
 2. **Publicación segura**: tarball verificado, `publishConfig`, package contents limitado.
 3. **Runtime local seguro**: escrituras atómicas, permisos restrictivos, menos riesgo de corrupción o lectura local.
-4. **Privacidad/resiliencia TUI**: disclosure de estado persistido y límite para logs grandes.
+4. **Privacidad/resiliencia TUI**: disclosure de estado persistido e hidratación sin inspección directa de SQLite ni logs.
 5. **Higiene de desarrollo local**: installs con scripts deshabilitados, cooldown de dependencias, bloqueo/revisión de dependencias exóticas y screening opcional.
 
 El audit productivo bloqueante queda activo y actualmente pasa sin vulnerabilidades conocidas después de actualizar las dependencias host/peer de desarrollo y refrescar transitivas parcheadas en el lockfile. Si vuelve a fallar en el futuro, la release debe detenerse hasta actualizar, justificar un override seguro o tomar una decisión explícita de riesgo.

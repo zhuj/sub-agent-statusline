@@ -167,18 +167,11 @@ El plugin muestra tokens/contexto solo si encuentra datos en alguna fuente:
 
 - eventos de OpenCode;
 - estado vivo de TUI;
-- SQLite de OpenCode;
-- logs recientes.
+- API `session.messages` de OpenCode.
 
 Si OpenCode no expone esa información o el formato cambió, la fila se muestra sin tokens.
 
-Podés probar una ruta custom a la DB:
-
-```sh
-OPENCODE_SUBAGENT_STATUSLINE_OPENCODE_DB=/path/to/opencode.db opencode
-```
-
-Pero la ausencia de tokens no significa necesariamente que el plugin esté roto.
+La ausencia de tokens no significa necesariamente que el plugin esté roto.
 
 ## `Alt+B` no enfoca la lista
 

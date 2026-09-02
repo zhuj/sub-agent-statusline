@@ -20,7 +20,7 @@ export interface SubagentProjection {
   totalExecuted: number;
 }
 
-function buildCanonicalRows(children: ChildSessionState[]): ChildSessionState[] {
+export function buildCanonicalRows(children: ChildSessionState[]): ChildSessionState[] {
   return correlateSubagentWorkItems(children).map(({ real, proxies }) =>
     proxies.reduce(
       (current, proxy) => mergeProxyMetadataWithRealExecution(current, proxy),
@@ -46,10 +46,12 @@ export function buildSubagentProjectionFromChildren(
 
   const rowByExecutionID = new Map<string, ChildSessionState>();
   const orderedExecutionIDs: string[] = [];
+  const seenExecutionIDs = new Set<string>();
   for (const row of canonicalRows) {
     const executionID = row.targetSessionID ?? row.id;
     rowByExecutionID.set(executionID, row);
-    if (!orderedExecutionIDs.includes(executionID)) {
+    if (!seenExecutionIDs.has(executionID)) {
+      seenExecutionIDs.add(executionID);
       orderedExecutionIDs.push(executionID);
     }
   }
@@ -103,15 +105,20 @@ export function filterVisibleFromCanonical(
 ): ChildSessionState[] {
   if (options.showCompletedHistory) return canonicalRows;
 
-  const visible = canonicalRows.filter((child) => isVisibleWorkItem(child, nowMs));
-  const hasRunning = visible.some((child) => child.status === "running");
-  const activeMessageIDs = new Set(
-    visible
-      .filter((child) => child.status === "running" && child.messageID)
-      .map((child) => child.messageID as string),
-  );
+  // Single pass: keep row if currently visible, collect active-message IDs from
+  // any currently-running rows (terminal rows that share a messageID with a
+  // running row are kept as "transitional" output alongside the active one).
+  const visible: ChildSessionState[] = [];
+  const activeMessageIDs = new Set<string>();
+  for (const child of canonicalRows) {
+    if (!isVisibleWorkItem(child, nowMs)) continue;
+    visible.push(child);
+    if (child.status === "running" && child.messageID) {
+      activeMessageIDs.add(child.messageID);
+    }
+  }
 
-  if (!hasRunning) return visible;
+  if (activeMessageIDs.size === 0) return visible;
 
   return visible.filter((child) => {
     if (child.status === "running") return true;

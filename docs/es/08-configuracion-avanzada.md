@@ -40,10 +40,8 @@ Para desarrollo local:
 | `OPENCODE_SUBAGENT_STATUSLINE_COLOR=0`          | Desactiva ANSI colors en render textual.            | Logs o terminales sin color.           |
 | `NO_COLOR=1`                                    | Desactiva color ANSI de forma estándar.             | Entornos CI/logs.                      |
 | `OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS`     | Activa log JSONL de eventos TUI.                    | Investigar payloads de OpenCode.       |
-| `OPENCODE_SUBAGENT_STATUSLINE_OPENCODE_DB`      | Sobrescribe ruta a la DB SQLite de OpenCode.        | Debug de tokens/contexto.              |
 | `OPENCODE_SUBAGENT_STATUSLINE_STALE_RUNNING_MS` | Cambia umbral para stale-running.                   | Diagnóstico de filas `running` viejas. |
 | `XDG_RUNTIME_DIR`                               | Base por defecto para estado runtime.               | Entornos Linux/custom.                 |
-| `XDG_DATA_HOME`                                 | Base para ubicar datos de OpenCode.                 | Entornos con rutas no estándar.        |
 
 ## Rutas de estado
 
@@ -139,29 +137,12 @@ O, si no hay `XDG_RUNTIME_DIR`, bajo el tempdir del sistema.
 
 Usalo con cuidado: los eventos pueden contener bastante información y crecer rápido.
 
-## DB de OpenCode para tokens/contexto
+## Hidratación de tokens/contexto
 
-La TUI intenta hidratar tokens/contexto desde varias fuentes. Una de ellas puede ser la base SQLite de OpenCode.
-
-Para sobrescribir la ruta:
-
-```sh
-OPENCODE_SUBAGENT_STATUSLINE_OPENCODE_DB=/path/to/opencode.db opencode
-```
-
-Si no se define, el plugin busca en el data dir estándar de OpenCode, normalmente basado en:
-
-```txt
-$XDG_DATA_HOME/opencode
-```
-
-O:
-
-```txt
-~/.local/share/opencode
-```
-
-Si la DB no existe, `sqlite3` no está disponible o el formato no contiene la información esperada, la hidratación de tokens falla silenciosamente y la UI sigue funcionando.
+La TUI hidrata tokens/contexto desde el estado actual de OpenCode TUI y la API
+`session.messages`. No inspecciona directamente la base SQLite ni los archivos
+de log de OpenCode. Si OpenCode no expone datos de tokens, la fila sigue visible
+sin esos detalles.
 
 ## Stale-running threshold
 

@@ -7,7 +7,7 @@ export default defineConfig([
       index: "src/index.ts",
     },
     format: ["esm"],
-    target: "node22",
+    target: "node24",
     dts: {
       entry: {
         index: "src/index.ts",
@@ -23,7 +23,7 @@ export default defineConfig([
       tui: "src/tui.tsx",
     },
     format: ["esm"],
-    target: "node22",
+    target: "node24",
     dts: {
       entry: {
         tui: "src/tui.tsx",

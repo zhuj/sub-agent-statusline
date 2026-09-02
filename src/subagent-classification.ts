@@ -1,4 +1,5 @@
 import type { ChildSessionState } from "./state.js";
+import { childLookupKey } from "./events-lookup.js";
 
 export type SubagentClassifiableWorkItem = Pick<
   ChildSessionState,
@@ -118,17 +119,18 @@ function buildSubagentCorrelationIndex<T extends SubagentClassifiableWorkItem>(
       firstRealByExecutionID.set(executionID, item);
     }
 
-    const pmKey = JSON.stringify({
-      parentID: item.parentID,
-      messageID: item.messageID,
-    });
-    const pmBucket = parentMessageRealItems.get(pmKey) ?? [];
-    pmBucket.push(item);
-    parentMessageRealItems.set(pmKey, pmBucket);
+    const pmKey = item.messageID
+      ? childLookupKey(item.parentID, item.messageID)
+      : undefined;
+    if (pmKey) {
+      const pmBucket = parentMessageRealItems.get(pmKey) ?? [];
+      pmBucket.push(item);
+      parentMessageRealItems.set(pmKey, pmBucket);
 
-    const pmSet = parentMessageExecutionSets.get(pmKey) ?? new Set<string>();
-    pmSet.add(executionID);
-    parentMessageExecutionSets.set(pmKey, pmSet);
+      const pmSet = parentMessageExecutionSets.get(pmKey) ?? new Set<string>();
+      pmSet.add(executionID);
+      parentMessageExecutionSets.set(pmKey, pmSet);
+    }
 
     const pBucket = parentRealItems.get(item.parentID) ?? [];
     pBucket.push(item);
@@ -209,10 +211,7 @@ function resolveCorrelatedExecutionIDWithIndex<
   }
 
   if (item.messageID) {
-    const pmKey = JSON.stringify({
-      parentID: item.parentID,
-      messageID: item.messageID,
-    });
+    const pmKey = childLookupKey(item.parentID, item.messageID);
     const pmSet = index.parentMessageExecutionSets.get(pmKey);
     if (pmSet && pmSet.size === 1) {
       return [...pmSet][0];

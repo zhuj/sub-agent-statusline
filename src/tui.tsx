@@ -13,13 +13,10 @@ import type {
   ScrollBoxRenderable,
 } from "@opentui/core";
 import { useKeyboard } from "@opentui/solid";
-import { execFile } from "node:child_process";
-import { appendFileSync, mkdirSync, statSync } from "node:fs";
-import { opendir } from "node:fs/promises";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import { dirname, join } from "node:path";
-import { promisify } from "node:util";
 import {
   For,
   Show,
@@ -34,15 +31,14 @@ import {
   applySubagentEvent,
   applySubagentEventDetailed,
   createChildLookup,
-  refreshChildLookup,
   resolveSyntheticTargetSessionID,
   setChildTarget,
+  type ChildLookup,
   extractChildDetails,
   extractLatestAssistantModel,
   extractTaskToolEvidence,
   __setSubagentDebugSink,
 } from "./events.js";
-import { readOpenCodeLogFileIfSmall } from "./logs.js";
 import {
   byPriority,
   formatDuration,
@@ -87,11 +83,10 @@ import {
 } from "./tui-row-window.js";
 import {
   createEmptyState,
-  countCountedSubagentExecutions,
-  countHistoricalSubagentExecutions,
-  countRetainedSubagentStatuses,
+  CHANGED_CHILD_IDS,
   markChildStatus,
   isTerminalPruningDue,
+  isTerminalPruningDueAt,
   gcStaleInstanceDirs,
   mergeTokens,
   refreshDerivedFields,
@@ -122,7 +117,6 @@ import {
   registerSubagentCommands,
 } from "./tui-commands.js";
 import {
-  DONE_TOKEN_CACHE_MAX_ENTRIES,
   HYDRATE_RETRY_MAX_ATTEMPTS,
   ROUTE_CHILD_MESSAGE_ADMISSION_LIMIT,
   ROUTE_CHILD_MESSAGE_CONCURRENCY,
@@ -132,6 +126,7 @@ import {
   scheduleHydrateRetry,
   type TokenHydrationJob,
 } from "./tui-hydration.js";
+import { createTuiEventOwnershipGate } from "./tui-event-ownership.js";
 import { t } from "./i18n.js";
 
 const TUI_PLUGIN_ID = "subagent-statusline.tui";
@@ -139,10 +134,6 @@ const ELAPSED_TICK_MS = 1000;
 const FALLBACK_SIDEBAR_WIDTH = 34;
 const MIN_ROW_WIDTH = 24;
 const MIN_LABEL_WIDTH = 8;
-const DONE_TOKEN_REHYDRATE_THROTTLE_MS = 30_000;
-const DONE_TOKEN_REHYDRATE_MAX_ATTEMPTS = 8;
-const OPEN_CODE_LOG_DIRECTORY_SCAN_LIMIT = 256;
-const OPEN_CODE_LOG_FILE_LIMIT = 8;
 const MAINTENANCE_TICK_MS = 2_000;
 const RUNNING_RECONCILE_MAINTENANCE_INTERVAL_MS = 10 * 60_000;
 const RUNNING_RECONCILE_MAX_CANDIDATES = 8;
@@ -375,12 +366,6 @@ type SessionPromptProps = {
   [key: string]: unknown;
 };
 
-interface RehydratedTokenCacheEntry {
-  attempts: number;
-  checkedAtMs: number;
-  tokens?: ChildTokenState;
-}
-
 export interface RunningReconcileCandidate extends RunningReconcileVersion {
   readonly source?: ChildSessionState["source"];
   readonly title?: string;
@@ -389,8 +374,6 @@ export interface RunningReconcileCandidate extends RunningReconcileVersion {
   readonly startedMs: number;
   readonly updatedMs: number;
 }
-
-const execFileAsync = promisify(execFile);
 
 function debugLog(input: Record<string, unknown>): void {
   if (!process.env.OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS) return;
@@ -452,204 +435,6 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object"
     ? (value as Record<string, unknown>)
     : undefined;
-}
-
-function tokenStateFromMessageData(data: string): ChildTokenState | undefined {
-  const parsed = safeRead(
-    () => JSON.parse(data) as { tokens?: ChildTokenState },
-  );
-  return parsed?.tokens;
-}
-
-function resolveOpenCodeDataDir(): string {
-  return join(
-    process.env.XDG_DATA_HOME ?? join(os.homedir(), ".local", "share"),
-    "opencode",
-  );
-}
-
-let cachedOpenCodeDbPath: string | undefined;
-let cachedOpenCodeDbExists: boolean | undefined;
-
-function resolveOpenCodeDbPath(): string {
-  if (cachedOpenCodeDbPath !== undefined) return cachedOpenCodeDbPath;
-  cachedOpenCodeDbPath =
-    process.env.OPENCODE_SUBAGENT_STATUSLINE_OPENCODE_DB ??
-    join(resolveOpenCodeDataDir(), "opencode.db");
-  return cachedOpenCodeDbPath;
-}
-
-function openCodeDbExists(): boolean {
-  if (cachedOpenCodeDbExists !== undefined) return cachedOpenCodeDbExists;
-  const path = resolveOpenCodeDbPath();
-  let exists = false;
-  try {
-    exists = statSync(path).isFile();
-  } catch {
-    exists = false;
-  }
-  cachedOpenCodeDbExists = exists;
-  return exists;
-}
-
-/** Test-only: clears the cached DB-path lookup so env-var overrides take
- * effect between tests. */
-export function __resetOpenCodeDbLookupForTests(): void {
-  cachedOpenCodeDbPath = undefined;
-  cachedOpenCodeDbExists = undefined;
-}
-
-/**
- * Escapes a string for safe interpolation inside a single-quoted SQL literal.
- * Doubles embedded single quotes per the SQL standard.
- *
- * **Input contract:** callers must only pass OpenCode session IDs, which by
- * host convention are formatted `ses_[A-Za-z0-9_-]+` and never contain quotes
- * or semicolons. The escaping here is defensive — it keeps the SQL injection
- * surface closed even if upstream IDs ever change shape. Do NOT pass raw user
- * input here.
- */
-function escapeSqlString(value: string): string {
-  return value.replace(/'/g, "''");
-}
-export { escapeSqlString as escapeSqlStringForTesting };
-
-async function readDoneTokensFromOpenCodeDb(
-  sessionID: string,
-  signal?: AbortSignal,
-): Promise<ChildTokenState | undefined> {
-  // Fast-fail: avoid spawning `sqlite3` when the DB file is absent. This is
-  // the dominant case on hosts that don't use the database backend, and on
-  // every startup before the user has run OpenCode once.
-  if (!openCodeDbExists()) return undefined;
-  const dbPath = resolveOpenCodeDbPath();
-
-  // Keep JSON parsing in TypeScript instead of relying on sqlite JSON functions.
-  // Some sqlite3 builds, especially on WSL/Linux distributions, are compiled
-  // without JSON support and fail with `no such function json_extract`.
-  const result = await safeReadAsync(() =>
-    execFileAsync(
-      "sqlite3",
-      [
-        dbPath,
-        `select data from message where session_id='${escapeSqlString(sessionID)}' order by time_created desc limit 50;`,
-      ],
-      {
-        encoding: "utf8",
-        timeout: 1000,
-        maxBuffer: 1024 * 1024,
-        signal,
-      },
-    ),
-  );
-  if (!result || signal?.aborted) return undefined;
-
-  let tokens: ChildTokenState | undefined;
-  for (const line of result.stdout.split("\n")) {
-    const hydrated = tokenStateFromMessageData(line.trim());
-    tokens = mergeTokens(tokens, hydrated);
-    if (hasTokenTotal(tokens)) break;
-  }
-  return tokens;
-}
-
-async function readDoneTokensFromOpenCodeLogs(
-  sessionID: string,
-  signal?: AbortSignal,
-): Promise<ChildTokenState | undefined> {
-  const logDir = join(resolveOpenCodeDataDir(), "log");
-  const directory = await safeReadAsync(() => opendir(logDir));
-  if (!directory) return undefined;
-  const files: string[] = [];
-  let scannedEntries = 0;
-  try {
-    for await (const entry of directory) {
-      if (signal?.aborted) return undefined;
-      scannedEntries += 1;
-      if (entry.name.endsWith(".log")) {
-        files.push(entry.name);
-        files.sort((left, right) => right.localeCompare(left));
-        if (files.length > OPEN_CODE_LOG_FILE_LIMIT) files.pop();
-      }
-      if (scannedEntries >= OPEN_CODE_LOG_DIRECTORY_SCAN_LIMIT) break;
-    }
-  } catch (error) {
-    if (error instanceof Error) return undefined;
-    throw error;
-  }
-
-  const tokenPattern = /"tokens"\s*:\s*(\{[^\n]*?\})/g;
-  let tokens: ChildTokenState | undefined;
-  for (const file of files) {
-    if (signal?.aborted) return undefined;
-    const contents = await readOpenCodeLogFileIfSmall(join(logDir, file), signal);
-    if (!contents || !contents.includes(sessionID)) continue;
-
-    for (const line of contents.split("\n")) {
-      if (!line.includes(sessionID) || !line.includes('"tokens"')) continue;
-      for (const match of line.matchAll(tokenPattern)) {
-        const hydrated = safeRead(
-          () => JSON.parse(match[1] ?? "{}") as ChildTokenState,
-        );
-        tokens = mergeTokens(tokens, hydrated);
-        if (hasTokenTotal(tokens)) return tokens;
-      }
-    }
-  }
-  return tokens;
-}
-
-function setBoundedDoneTokenCache(
-  cache: Map<string, RehydratedTokenCacheEntry>,
-  sessionID: string,
-  entry: RehydratedTokenCacheEntry,
-): void {
-  if (!cache.has(sessionID) && cache.size >= DONE_TOKEN_CACHE_MAX_ENTRIES) {
-    const oldestSessionID = cache.keys().next().value;
-    if (typeof oldestSessionID === "string") cache.delete(oldestSessionID);
-  }
-  cache.set(sessionID, entry);
-}
-
-async function rehydrateDoneChildTokens(
-  child: ChildSessionState,
-  cache: Map<string, RehydratedTokenCacheEntry>,
-  signal?: AbortSignal,
-): Promise<ChildTokenState | undefined> {
-  if (child.status !== "done") return undefined;
-  if (hasTokenTotal(child.tokens)) return undefined;
-  if (!child.id.startsWith("ses_")) return undefined;
-
-  const nowMs = Date.now();
-  const cached = cache.get(child.id);
-  if (cached?.tokens) return cached.tokens;
-  if (cached && cached.attempts >= DONE_TOKEN_REHYDRATE_MAX_ATTEMPTS) {
-    return undefined;
-  }
-  if (cached && nowMs - cached.checkedAtMs < DONE_TOKEN_REHYDRATE_THROTTLE_MS) {
-    return undefined;
-  }
-
-  const dbTokens = await readDoneTokensFromOpenCodeDb(child.id, signal);
-  const tokens =
-    dbTokens ?? (await readDoneTokensFromOpenCodeLogs(child.id, signal));
-  if (signal?.aborted) return undefined;
-  setBoundedDoneTokenCache(cache, child.id, {
-    attempts: (cached?.attempts ?? 0) + 1,
-    checkedAtMs: nowMs,
-    tokens,
-  });
-
-  if (tokens) {
-    debugLog({
-      kind: "state.tokens.rehydrated.done",
-      id: child.id,
-      title: child.title,
-      tokens,
-    });
-  }
-
-  return tokens;
 }
 
 function safeRead<Value>(read: () => Value): Value | undefined {
@@ -728,7 +513,6 @@ function hydrateChildTokensFromTuiState(
 async function hydrateChildTokensAsync(
   api: TuiPluginApi,
   child: ChildSessionState,
-  cache: Map<string, RehydratedTokenCacheEntry>,
   signal?: AbortSignal,
 ): Promise<ChildTokenState | undefined> {
   let tokens = hydrateChildTokensFromTuiState(api, child);
@@ -755,12 +539,6 @@ async function hydrateChildTokensAsync(
     }
   }
 
-  if (!hasTokenTotal(tokens)) {
-    tokens = mergeTokens(
-      tokens,
-      await rehydrateDoneChildTokens(child, cache, signal),
-    );
-  }
   return signal?.aborted ? undefined : tokens;
 }
 
@@ -768,11 +546,24 @@ export function persistStateSnapshot(
   persistence: PersistenceCoordinator<StatuslineState>,
   state: StatuslineState,
   flush = false,
+  changedChildIDs?: readonly string[],
 ): Promise<void> {
-  const snapshot = cloneState(state);
+  // No deep clone: all callers pass a freshly-produced state object (a `next`
+  // that was just built with `cloneState(current)` and then mutated). The
+  // writer's `JSON.stringify` consumes the structure into a string before any
+  // subsequent state churn could affect it. Skipping the clone saves N object
+  // spreads per persistence cycle (significant for the 1,500-child terminal cap).
+  //
+  // When the caller knows which children changed, attach them as a Symbol
+  // property on the snapshot. saveState reads it to do a differential refresh
+  // instead of re-deriving every child. JSON.stringify ignores Symbol keys.
+  if (changedChildIDs !== undefined) {
+    (state as unknown as Record<symbol, unknown>)[CHANGED_CHILD_IDS] =
+      changedChildIDs;
+  }
   return flush
-    ? persistence.flush(snapshot)
-    : persistence.request(snapshot);
+    ? persistence.flush(state)
+    : persistence.request(state);
 }
 
 function refreshLiveState(state: StatuslineState): boolean {
@@ -819,10 +610,15 @@ export function resolveTuiMaintenanceDemand(input: {
   const reconciliationDue =
     input.nowMs - input.lastRunningReconcileAtMs >=
     RUNNING_RECONCILE_MAINTENANCE_INTERVAL_MS;
+  const children = input.state.children;
   let reconcile = false;
   let hydrateTokens = false;
 
-  for (const child of Object.values(input.state.children)) {
+  // Iterate keys directly to avoid allocating an Object.values array on every
+  // 2-second maintenance tick.
+  for (const id in children) {
+    const child = children[id];
+    if (!child) continue;
     if (child.status === "running") {
       hydrateTokens = true;
       if (
@@ -837,8 +633,10 @@ export function resolveTuiMaintenanceDemand(input: {
     if (reconcile && hydrateTokens) break;
   }
 
+  // Pruning check is a separate dedicated scan (isTerminalPruningDueAt),
+  // but uses the millisecond timestamp directly to avoid a Date allocation.
   return {
-    prune: isTerminalPruningDue(input.state, new Date(input.nowMs)),
+    prune: isTerminalPruningDueAt(input.state, input.nowMs),
     reconcile,
     hydrateTokens,
   };
@@ -1276,25 +1074,29 @@ export function resolveTuiSubagentSnapshot(input: {
     nowMs,
     options,
   ).sort(byPriority);
-  const totalExecuted = input.sessionID
-    ? scopedCanonical
-        .map((row) => row.targetSessionID ?? row.id)
-        .filter((id) => input.state.countedChildIDs[id])
-        .filter(
-          (id, index, arr) => arr.indexOf(id) === index,
-        ).length
-    : projection.totalExecuted;
-  const visibleCounts = input.sessionID
-    ? (() => {
-        const counts: StatusCounts = { running: 0, done: 0, error: 0 };
-        for (const row of scopedCanonical) {
-          if (row.status === "running") counts.running += 1;
-          else if (row.status === "done") counts.done += 1;
-          else if (row.status === "error") counts.error += 1;
-        }
-        return counts;
-      })()
-    : projection.retainedCounts;
+
+  let visibleCounts: StatusCounts;
+  let totalExecuted: number;
+  if (input.sessionID) {
+    const counts: StatusCounts = { running: 0, done: 0, error: 0 };
+    const seenExecutionIDs = new Set<string>();
+    let counted = 0;
+    for (const row of scopedCanonical) {
+      if (row.status === "running") counts.running += 1;
+      else if (row.status === "done") counts.done += 1;
+      else if (row.status === "error") counts.error += 1;
+      const executionID = row.targetSessionID ?? row.id;
+      if (!seenExecutionIDs.has(executionID)) {
+        seenExecutionIDs.add(executionID);
+        if (input.state.countedChildIDs[executionID]) counted += 1;
+      }
+    }
+    visibleCounts = counts;
+    totalExecuted = counted;
+  } else {
+    visibleCounts = projection.retainedCounts;
+    totalExecuted = projection.totalExecuted;
+  }
 
   return {
     visibleChildren: ownVisibleChildren,
@@ -1370,26 +1172,22 @@ function SidebarSubagents(props: {
   const [listFocused, setListFocused] = createSignal(false);
   const [listFocusModeActive, setListFocusModeActive] = createSignal(false);
 
-  const visibleChildLayoutSignature = createMemo(() =>
-    visibleChildren()
-      .map((child) =>
-        JSON.stringify([
-          child.id,
-          child.status,
-          child.title,
-          child.summary ?? "",
-          child.agentName ?? "",
-          child.tokens?.input ?? "",
-          child.tokens?.output ?? "",
-          child.tokens?.total ?? "",
-          child.tokens?.contextPercent ?? "",
-          child.model?.providerID ?? "",
-          child.model?.modelID ?? "",
-          child.model?.variant ?? "",
-        ]),
-      )
-      .join("|"),
-  );
+  const visibleChildLayoutSignature = createMemo(() => {
+    // Cheap structural key — avoids JSON.stringify on every child per render.
+    let out = "";
+    for (const child of visibleChildren()) {
+      const tokens = child.tokens;
+      const model = child.model;
+      out +=
+        `${child.id}\u0001${child.status}\u0001${child.title}` +
+        `\u0001${child.summary ?? ""}\u0001${child.agentName ?? ""}` +
+        `\u0001${tokens?.input ?? ""}\u0001${tokens?.output ?? ""}` +
+        `\u0001${tokens?.total ?? ""}\u0001${tokens?.contextPercent ?? ""}` +
+        `\u0001${model?.providerID ?? ""}\u0001${model?.modelID ?? ""}` +
+        `\u0001${model?.variant ?? ""}|`;
+    }
+    return out;
+  });
 
   const rowLayoutIndex = createMemo(() => {
     const nowMs = props.nowMs();
@@ -2603,6 +2401,7 @@ export function selectRunningReconcileCandidates(input: {
   hydratingSessionIDs?: ReadonlySet<string>;
   nowMs: number;
   maxCandidates: number;
+  lookup?: ChildLookup;
 }): RunningReconcileCandidate[] {
   const runningChildren = Object.values(input.state.children).filter(
     (child) =>
@@ -2610,7 +2409,7 @@ export function selectRunningReconcileCandidates(input: {
       !input.hydratingSessionIDs?.has(child.parentID),
   );
   if (runningChildren.length === 0) return [];
-  const lookup = createChildLookup(input.state);
+  const lookup = input.lookup ?? createChildLookup(input.state);
 
   const prioritized = visibleSubagentWorkItems(
     runningChildren,
@@ -2620,29 +2419,38 @@ export function selectRunningReconcileCandidates(input: {
     input.currentSessionID ? child.parentID === input.currentSessionID : true,
   );
 
-  const veryOldIDs = new Set(
-    runningChildren
-      .filter((child) => {
-        const age = resolveRunningChildAgeMillis(child, input.nowMs);
-        return (
-          age.startedMs >= RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS ||
-          age.updatedMs >= RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS
-        );
-      })
-      .map((child) => child.id),
-  );
+  // Single pass to collect very-old IDs AND remember per-child age so we
+  // don't pay resolveRunningChildAgeMillis twice per child.
+  const veryOldIDs = new Set<string>();
+  const ageByID = new Map<string, ReturnType<typeof resolveRunningChildAgeMillis>>();
+  for (const child of runningChildren) {
+    const age = resolveRunningChildAgeMillis(child, input.nowMs);
+    ageByID.set(child.id, age);
+    if (
+      age.startedMs >= RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS ||
+      age.updatedMs >= RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS
+    ) {
+      veryOldIDs.add(child.id);
+    }
+  }
 
-  const ordered = [
-    ...prioritizedForSession,
-    ...runningChildren.filter((child) => veryOldIDs.has(child.id)),
-  ];
-
-  const selected: RunningReconcileCandidate[] = [];
+  // Build the final order inline to avoid spreading + filtering twice.
+const ordered: typeof runningChildren = [];
   const seen = new Set<string>();
-  for (const child of ordered) {
+  for (const child of prioritizedForSession) {
     if (seen.has(child.id)) continue;
     seen.add(child.id);
-    const age = resolveRunningChildAgeMillis(child, input.nowMs);
+    ordered.push(child);
+  }
+  for (const child of runningChildren) {
+    if (seen.has(child.id)) continue;
+    seen.add(child.id);
+    ordered.push(child);
+  }
+
+  const selected: RunningReconcileCandidate[] = [];
+  for (const child of ordered) {
+    const age = ageByID.get(child.id)!;
     const targetSessionID = resolveReconcileTargetSessionID(
       input.state,
       child,
@@ -2697,9 +2505,9 @@ function currentRunningReconcileVersion(
 function retainedRunningReconcileKeys(
   current: StatuslineState,
   nowMs: number,
+  lookup: ChildLookup = createChildLookup(current),
 ): ReadonlySet<string> {
   const keys = new Set<string>();
-  const lookup = createChildLookup(current);
   for (const child of Object.values(current.children)) {
     if (child.status !== "running") continue;
     const targetSessionID = resolveReconcileTargetSessionID(
@@ -2857,10 +2665,18 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
     .catch(() => undefined);
   const statePath = resolveStatePath();
   const textPath = resolveTextPath(statePath);
+  let lastStatusText = "";
   const persistence = createPersistenceCoordinator<StatuslineState>(
     async (snapshot) => {
       await saveState(statePath, snapshot);
-      await saveStatusText(textPath, renderStatusLine(snapshot));
+      const nextText = renderStatusLine(snapshot);
+      // Skip status.txt write when the rendered summary is unchanged — the
+      // aggregate text only changes on status/visibility transitions, which
+      // are rare relative to detail-only event bursts.
+      if (nextText !== lastStatusText) {
+        lastStatusText = nextText;
+        await saveStatusText(textPath, nextText);
+      }
     },
     { settleDelayMs: 150 },
   );
@@ -2902,7 +2718,6 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
   const deferredUiCallbacks = createManagedDeferredCallbacks(
     () => !disposed && !api.lifecycle.signal.aborted,
   );
-  const doneTokenCache = new Map<string, RehydratedTokenCacheEntry>();
   const isTokenJobValid = (job: TokenHydrationJob): boolean =>
     !disposed &&
     !api.lifecycle.signal.aborted &&
@@ -2924,12 +2739,7 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
       if (current.status !== "running" && hasTokenTotal(current.tokens)) {
         return undefined;
       }
-      return hydrateChildTokensAsync(
-        api,
-        current,
-        doneTokenCache,
-        job.signal,
-      );
+      return hydrateChildTokensAsync(api, current, job.signal);
     },
     commit: (job, hydrated) => {
       if (!isTokenJobValid(job)) return;
@@ -2955,9 +2765,9 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
         return next;
       });
       if (stateToPersist && isTokenJobValid(job)) {
-        void persistStateSnapshot(persistence, stateToPersist).catch(
-          () => undefined,
-        );
+        void persistStateSnapshot(persistence, stateToPersist, false, [
+          job.childID,
+        ]).catch(() => undefined);
       }
     },
   });
@@ -3297,9 +3107,10 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
       const nowMs = Date.now();
       const currentSessionID = resolveRouteSessionID(api);
       const directory = api.state.path.directory;
+      const reconcileLookup = createChildLookup(snapshot);
       sweepRunningReconcileBackoff(
         runningReconcileBackoff,
-        retainedRunningReconcileKeys(snapshot, nowMs),
+        retainedRunningReconcileKeys(snapshot, nowMs, reconcileLookup),
       );
 
       const selected = selectRunningReconcileCandidates({
@@ -3308,6 +3119,7 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
         hydratingSessionIDs: hydratingSessions(),
         nowMs,
         maxCandidates: RUNNING_RECONCILE_MAX_CANDIDATES,
+        lookup: reconcileLookup,
       });
 
       const mutations: Array<{
@@ -3599,7 +3411,20 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
     );
   });
 
+  const eventOwnershipGate = createTuiEventOwnershipGate();
   const applyEvent = async (event: unknown): Promise<void> => {
+    const routeSessionID = resolveRouteSessionID(api);
+    if (
+      !eventOwnershipGate.accepts(event, {
+        currentDirectory: api.state.path.directory,
+        ...(routeSessionID ? { routeSessionID } : {}),
+        children: state().children,
+        getSessionDirectory: (sessionID) =>
+          api.state.session.get(sessionID)?.directory,
+      })
+    ) {
+      return;
+    }
     debugEvent(event);
     snapshotSidebarScrollOffsets();
     let stateToPersist: StatuslineState | undefined;
@@ -3639,6 +3464,7 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
         persistence,
         stateToPersist,
         terminalTransition,
+        changedChildIDs,
       );
       if (terminalTransition) await completion.catch(() => undefined);
       else void completion.catch(() => undefined);
@@ -3675,7 +3501,6 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
       },
       tokenHydrationQueue.dispose,
       () => {
-        doneTokenCache.clear();
         runningReconcileBackoff.clear();
       },
       commandDispose,

@@ -165,16 +165,9 @@ The plugin shows tokens/context only if it finds data in:
 
 - OpenCode events;
 - live TUI state;
-- OpenCode SQLite;
-- recent logs.
+- the OpenCode `session.messages` API.
 
 If OpenCode does not expose that information or the format changed, the row is shown without tokens.
-
-Optional DB override:
-
-```sh
-OPENCODE_SUBAGENT_STATUSLINE_OPENCODE_DB=/path/to/opencode.db opencode
-```
 
 Missing token data does not necessarily mean the plugin is broken.
 

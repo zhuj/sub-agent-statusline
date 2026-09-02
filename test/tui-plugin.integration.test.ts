@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  __tuiPluginForTests,
-  escapeSqlStringForTesting,
-} from "../src/tui.js";
+import { __tuiPluginForTests } from "../src/tui.js";
 
 /**
  * Lightweight smoke tests for the TUI plugin's public surface and the
@@ -21,11 +18,5 @@ describe("TUI plugin exports", () => {
 
   it("exposes a callable plugin factory export for tests", () => {
     expect(typeof __tuiPluginForTests).toBe("function");
-  });
-});
-
-describe("escapeSqlStringForTesting", () => {
-  it("doubles single quotes for safe SQL literal embedding", () => {
-    expect(escapeSqlStringForTesting("a'b")).toBe("a''b");
   });
 });

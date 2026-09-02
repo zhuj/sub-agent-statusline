@@ -425,10 +425,23 @@ export function isTerminalPruningDue(
   state: StatuslineState,
   now = new Date(),
 ): boolean {
-  const nowMs = now.getTime();
+  return isTerminalPruningDueAt(state, now.getTime());
+}
+
+// Avoids allocating a `new Date(nowMs)` wrapper in the hot 2-second
+// maintenance tick path. Mirrors the semantics of `isTerminalPruningDue` but
+// takes a millisecond timestamp directly.
+export function isTerminalPruningDueAt(
+  state: StatuslineState,
+  nowMs: number,
+): boolean {
+  const children = state.children;
   let retainedTerminalChildren = 0;
 
-  for (const child of Object.values(state.children)) {
+  // Iterate keys directly to avoid allocating an Object.values array each call.
+  for (const id in children) {
+    const child = children[id];
+    if (!child) continue;
     if (child.status === "running") continue;
     if (nowMs - terminalReferenceMs(child) > TERMINAL_CHILD_TTL_MS) {
       return true;
@@ -438,6 +451,54 @@ export function isTerminalPruningDue(
   }
 
   return false;
+}
+
+function refreshChildFields(
+  state: StatuslineState,
+  id: string,
+  child: ChildSessionState,
+  nowISO: string,
+  nowMs: number,
+): void {
+  const startedAt = safeTimestamp(child.startedAt, nowISO);
+  const updatedAt = safeTimestamp(child.updatedAt, nowISO);
+  const endedAt = child.endedAt
+    ? safeTimestamp(child.endedAt, updatedAt)
+    : undefined;
+  const status =
+    child.status === "done" ||
+    child.status === "error" ||
+    child.status === "running"
+      ? child.status
+      : "running";
+
+  const targetSessionID = sanitizeTargetSessionID(
+    child.targetSessionID,
+    id.startsWith("ses_") ? id : undefined,
+  );
+
+  state.children[id] = {
+    ...child,
+    startedAt,
+    updatedAt,
+    endedAt,
+    status,
+    targetSessionID,
+    color: statusColor(status),
+    tokens: sanitizeTokens(child.tokens),
+    model: sanitizeModel(child.model),
+    elapsedMs: resolveElapsedMs(
+      {
+        ...child,
+        startedAt,
+        updatedAt,
+        endedAt,
+        status,
+        color: statusColor(status),
+      },
+      nowMs,
+    ),
+  };
 }
 
 export function refreshDerivedFields(
@@ -451,45 +512,7 @@ export function refreshDerivedFields(
   normalizeExecutionCounters(state);
 
   for (const [id, child] of Object.entries(state.children)) {
-    const startedAt = safeTimestamp(child.startedAt, nowISO);
-    const updatedAt = safeTimestamp(child.updatedAt, nowISO);
-    const endedAt = child.endedAt
-      ? safeTimestamp(child.endedAt, updatedAt)
-      : undefined;
-    const status =
-      child.status === "done" ||
-      child.status === "error" ||
-      child.status === "running"
-        ? child.status
-        : "running";
-
-    const targetSessionID = sanitizeTargetSessionID(
-      child.targetSessionID,
-      id.startsWith("ses_") ? id : undefined,
-    );
-
-    state.children[id] = {
-      ...child,
-      startedAt,
-      updatedAt,
-      endedAt,
-      status,
-      targetSessionID,
-      color: statusColor(status),
-      tokens: sanitizeTokens(child.tokens),
-      model: sanitizeModel(child.model),
-      elapsedMs: resolveElapsedMs(
-        {
-          ...child,
-          startedAt,
-          updatedAt,
-          endedAt,
-          status,
-          color: statusColor(status),
-        },
-        nowMs,
-      ),
-    };
+    refreshChildFields(state, id, child, nowISO, nowMs);
   }
 
   reconcileCountedExecutionsWithChildren(state);
@@ -682,6 +705,16 @@ async function writeLocalStatusFile(
   }
 }
 
+/**
+ * Non-enumerable symbol used by the runtime plugin to thread the list of
+ * child IDs that changed in this event round-trip through to `saveState`,
+ * so the differential refresh can skip re-deriving fields for the other
+ * children. Hidden from JSON.stringify because Symbol keys are skipped.
+ */
+export const CHANGED_CHILD_IDS = Symbol.for(
+  "opencode-subagent-statusline.changedChildIDs",
+);
+
 export async function saveStatusText(
   textPath: string,
   contents: string,
@@ -692,9 +725,59 @@ export async function saveStatusText(
 export async function saveState(
   statePath: string,
   state: StatuslineState,
+  options: { readonly changedChildIDs?: readonly string[] } = {},
 ): Promise<void> {
-  refreshDerivedFields(state);
-  await writeLocalStatusFile(statePath, JSON.stringify(state, null, 2));
+  // The caller may have attached CHANGED_CHILD_IDS via the persistence
+  // coordinator (Symbol property is invisible to JSON.stringify).
+  const changedChildIDs =
+    options.changedChildIDs ??
+    ((state as unknown as Record<symbol, unknown>)[CHANGED_CHILD_IDS] as
+      | readonly string[]
+      | undefined);
+  refreshStateForSnapshot(state, changedChildIDs);
+  // Compact JSON — the file is consumed by `loadState` (machine-only), so we
+  // skip the human-readable pretty-print to halve bytes and speed up both
+  // serialize and parse on every persistence round-trip.
+  await writeLocalStatusFile(statePath, JSON.stringify(state));
+}
+
+// Differential refresh: re-derive fields for `changedChildIDs` only (or every
+// child when the list is omitted), then run counter reconciliation + pruning
+// which always need the full state view. Skips the per-child rebuild loop for
+// unchanged children, which is the dominant cost on bursty event streams.
+export function refreshStateForSnapshot(
+  state: StatuslineState,
+  changedChildIDs?: readonly string[],
+  now: Date = new Date(),
+): void {
+  const nowISO = now.toISOString();
+  const nowMs = now.getTime();
+  const children = state.children;
+
+  if (changedChildIDs === undefined) {
+    normalizeExecutionCounters(state);
+    for (const [id, child] of Object.entries(children)) {
+      refreshChildFields(state, id, child, nowISO, nowMs);
+    }
+  } else {
+    // Counter normalization is only relevant if a counted child changed.
+    let countersDirty = false;
+    for (const id of changedChildIDs) {
+      const child = children[id];
+      if (!child) continue;
+      refreshChildFields(state, id, child, nowISO, nowMs);
+      countersDirty = true;
+    }
+    if (countersDirty) normalizeExecutionCounters(state);
+  }
+
+  reconcileCountedExecutionsWithChildren(state);
+  state.updatedAt = safeTimestamp(state.updatedAt, nowISO);
+  const pruned = pruneTerminalChildren(state, now);
+  if (pruned > 0) {
+    reconcileCountedExecutionsWithChildren(state);
+    state.updatedAt = nowISO;
+  }
 }
 
 export function upsertRunningChild(

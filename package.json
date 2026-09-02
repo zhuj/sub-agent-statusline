@@ -9,7 +9,7 @@
   },
   "packageManager": "pnpm@11.2.2",
   "engines": {
-    "node": ">=22.13",
+    "node": ">=24",
     "pnpm": ">=11.2.2"
   },
   "main": "./dist/tui.js",
@@ -56,16 +56,16 @@
   ],
   "license": "MIT",
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.14.50 <2",
-    "@opentui/core": ">=0.4.0 <0.6",
-    "@opentui/solid": ">=0.4.0 <0.6",
+    "@opencode-ai/plugin": "1.18.25",
+    "@opentui/core": "0.5.10",
+    "@opentui/solid": "0.5.10",
     "solid-js": ">=1.9.12 <2"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.15.11",
-    "@opentui/core": "^0.4.0",
-    "@opentui/solid": "^0.4.0",
-    "@types/node": "^22.19.19",
+    "@opencode-ai/plugin": "1.18.25",
+    "@opentui/core": "0.5.10",
+    "@opentui/solid": "0.5.10",
+    "@types/node": "^24.13.3",
     "@vitest/coverage-v8": "^4.1.7",
     "esbuild-plugin-solid": "^0.6.0",
     "tsup": "^8.5.1",

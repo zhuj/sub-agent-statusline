@@ -1,9 +1,11 @@
-import { buildSubagentProjectionFromChildren, filterVisibleFromCanonical } from "./projection.js";
-import type { ChildSessionState, StatuslineState } from "./state.js";
 import {
-  correlateSubagentWorkItems,
-  mergeProxyMetadataWithRealExecution,
-} from "./subagent-classification.js";
+  buildCanonicalRows,
+  buildSubagentProjectionFromChildren,
+  filterVisibleFromCanonical,
+  isVisibleWorkItem as projectionIsVisibleWorkItem,
+  type VisibleSubagentWorkItemsOptions,
+} from "./projection.js";
+import type { ChildSessionState, StatuslineState } from "./state.js";
 import {
   formatCompactPercentUsed,
   formatCompactTokenCount,
@@ -116,61 +118,23 @@ export function byPriority(a: ChildSessionState, b: ChildSessionState): number {
   return a.id.localeCompare(b.id);
 }
 
-const RECENT_TERMINAL_VISIBLE_MS = 10 * 60 * 1000;
+// Re-export projection primitives to keep a single source of truth while
+// preserving the existing public render-module surface.
+export const isVisibleWorkItem = projectionIsVisibleWorkItem;
+export const collapseSubagentWorkItems = buildCanonicalRows;
 
-interface VisibleSubagentWorkItemsOptions {
-  showCompletedHistory?: boolean;
-}
-
-export function collapseSubagentWorkItems(
-  children: ChildSessionState[],
-): ChildSessionState[] {
-  return correlateSubagentWorkItems(children).map(({ real, proxies }) =>
-    proxies.reduce(
-      (current, proxy) => mergeProxyMetadataWithRealExecution(current, proxy),
-      real,
-    ),
-  );
-}
-
-function isTerminalWorkItem(child: ChildSessionState): boolean {
-  return child.status === "done" || child.status === "error";
-}
-
-export function isVisibleWorkItem(
-  child: ChildSessionState,
-  nowMs = Date.now(),
-): boolean {
-  if (!isTerminalWorkItem(child)) return true;
-  const endedMs = Date.parse(child.endedAt ?? child.updatedAt);
-  if (Number.isNaN(endedMs)) return false;
-  return nowMs - endedMs <= RECENT_TERMINAL_VISIBLE_MS;
-}
-
+// `visibleSubagentWorkItems` accepts raw (pre-correlation) children so existing
+// callers — including the test suite — can pass state.children-shaped arrays.
 export function visibleSubagentWorkItems(
   children: ChildSessionState[],
   nowMs = Date.now(),
   options: VisibleSubagentWorkItemsOptions = {},
 ): ChildSessionState[] {
-  const projection = buildSubagentProjectionFromChildren(children);
-  const collapsed = projection.canonicalRows;
-  if (options.showCompletedHistory) return collapsed;
-
-  const visible = collapsed.filter((child) => isVisibleWorkItem(child, nowMs));
-  const hasRunning = visible.some((child) => child.status === "running");
-  const activeMessageIDs = new Set(
-    visible
-      .filter((child) => child.status === "running" && child.messageID)
-      .map((child) => child.messageID as string),
+  return filterVisibleFromCanonical(
+    buildCanonicalRows(children),
+    nowMs,
+    options,
   );
-
-  if (!hasRunning) return visible;
-
-  return visible.filter((child) => {
-    if (child.status === "running") return true;
-    if (!child.messageID) return false;
-    return activeMessageIDs.has(child.messageID);
-  });
 }
 
 export function renderStatusLine(state: StatuslineState): string {
@@ -199,3 +163,6 @@ export function renderStatusLine(state: StatuslineState): string {
 
   return `${aggregate} · ${details}`;
 }
+
+// Avoid unused-import warning on the type-only re-export in test contexts.
+export type { VisibleSubagentWorkItemsOptions };

@@ -44,10 +44,8 @@ behavior.
 | `OPENCODE_SUBAGENT_STATUSLINE_COLOR=0` | Disables ANSI colors in text rendering. | Logs or no-color terminals. |
 | `NO_COLOR=1` | Standard no-color switch. | CI/log environments. |
 | `OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS` | Enables TUI event JSONL logging. | Investigating OpenCode payloads. |
-| `OPENCODE_SUBAGENT_STATUSLINE_OPENCODE_DB` | Overrides the OpenCode SQLite DB path. | Token/context debugging. |
 | `OPENCODE_SUBAGENT_STATUSLINE_STALE_RUNNING_MS` | Changes stale-running threshold. | Diagnosing old `running` rows. |
 | `XDG_RUNTIME_DIR` | Default base for runtime state. | Linux/custom environments. |
-| `XDG_DATA_HOME` | Base for OpenCode data lookup. | Non-standard data paths. |
 
 ## State paths
 
@@ -142,29 +140,12 @@ $XDG_RUNTIME_DIR/opencode-subagent-statusline/tui-events.log
 
 Use with care: event logs can grow quickly and may contain session data.
 
-## OpenCode DB for tokens/context
+## Token/context hydration
 
-The TUI can hydrate token/context data from OpenCode's SQLite database.
-
-Override the path with:
-
-```sh
-OPENCODE_SUBAGENT_STATUSLINE_OPENCODE_DB=/path/to/opencode.db opencode
-```
-
-Without an override, the plugin looks under OpenCode's data dir, usually based on:
-
-```txt
-$XDG_DATA_HOME/opencode
-```
-
-or:
-
-```txt
-~/.local/share/opencode
-```
-
-If the DB does not exist, `sqlite3` is missing, or the format does not contain expected data, token hydration fails silently and the UI keeps working.
+The TUI hydrates token/context data from current OpenCode TUI state and the
+`session.messages` API. It does not inspect OpenCode's SQLite database or log
+files directly. If OpenCode does not expose token data, the row remains visible
+without token details.
 
 ## Stale-running threshold
 
