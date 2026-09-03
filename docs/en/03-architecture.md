@@ -12,28 +12,27 @@ src/events.ts
         ↓
 src/state.ts
         ↓
+src/projection.ts
+        ↓
 src/render.ts
         ↓
-┌──────────────────────┬──────────────────────┐
-│ src/tui.tsx          │ src/index.ts          │
-│ Main TUI plugin      │ Runtime plugin        │
-│ Sidebar / footer     │ state.json/status.txt │
-└──────────────────────┴──────────────────────┘
+src/tui.tsx
+Main TUI plugin
+Sidebar / footer / local snapshots
 ```
 
 ## Module map
 
 | File | Responsibility |
 | --- | --- |
-| `src/tui.tsx` | Main TUI plugin: slots, sidebar, footer, hydration, reconciliation, navigation, and lifecycle. |
-| `src/index.ts` | Runtime/file-based plugin: listens to events, persists state, and writes `status.txt`. |
+| `src/tui.tsx` | Main TUI plugin: slots, sidebar, footer, all-depth hydration, reconciliation, navigation, persistence, and lifecycle. |
 | `src/events.ts` | Converts OpenCode events into internal state mutations. |
 | `src/state.ts` | Defines the data model, counters, persistence, and mutation helpers. |
+| `src/projection.ts` | Builds the cached descendant lineage index, scoped rows, depths, and counters. |
 | `src/render.ts` | Formats rows, collapses duplicates, filters visibility, and builds statusline text. |
 | `src/reconcile.ts` | Normalizes OpenCode statuses and safely closes stale `running` cases. |
 | `src/tui-commands.ts` | Registers commands and keybindings, especially `Alt+B`. |
 | `src/*.test.ts` | Unit tests for deterministic core behavior. |
-| `test/index.integration.test.ts` | Runtime plugin integration tests for filesystem persistence. |
 
 ## Entrypoints
 
@@ -41,7 +40,7 @@ src/render.ts
 
 Source: `src/tui.tsx`
 
-This is the package's main entrypoint:
+This is the package's only supported plugin endpoint, available through two package entrypoints:
 
 ```txt
 opencode-subagent-statusline
@@ -58,26 +57,8 @@ Main responsibilities:
 - register commands and shortcuts;
 - hydrate existing subagents when navigating between sessions;
 - reconcile stale `running` items;
-- persist auxiliary state snapshots.
-
-### Runtime plugin
-
-Source: `src/index.ts`
-
-Published as:
-
-```txt
-opencode-subagent-statusline/runtime
-```
-
-This is a lower-level mode. It does not render the TUI sidebar. Instead, it:
-
-1. initializes state paths;
-2. processes events;
-3. saves `state.json`;
-4. writes `status.txt` with text rendering.
-
-It is useful for understanding the project core because it uses the same event, state, and render pipeline without the visual `src/tui.tsx` layer.
+- persist TUI-owned `state.json` and `status.txt` snapshots;
+- write `tui-events.log` when event diagnostics are enabled.
 
 ## Internal model
 
@@ -123,7 +104,7 @@ The plugin must distinguish where each work item came from.
 | Source | Typical origin | Use |
 | --- | --- | --- |
 | `session` | OpenCode `session.*` events with a real child session. | Strongest source. Counts as real execution. |
-| `subtask` | Message parts describing a subtask. | Early/provisional fallback. |
+| `subtask` | Message parts describing a subtask. | Early/provisional display and correlation evidence; does not count as execution. |
 | `tool` | Tool calls such as `task` or `delegate`. | Status evidence; does not count as execution. |
 
 This split exists because OpenCode may first report a technical wrapper and reveal the real session later, or expose incomplete data across multiple events.
@@ -152,17 +133,17 @@ This split exists because OpenCode may first report a technical wrapper and reve
 - mark children as `done` or `error`;
 - merge title, summary, agent, target, and token details;
 - refresh durations and derived fields;
-- persist and load state;
+- persist TUI-owned state and text snapshots;
 - prune old terminal children;
 - keep `totalExecuted` free of duplicates.
 
 Critical rules:
 
-- `source: "tool"` wrappers do not increment counters;
-- real sessions count exactly once;
-- subtasks may count as fallback;
-- when a real session appears later, counts reconcile to that session;
-- state loaded from disk is normalized to avoid duplicate identities.
+- synthetic `source: "tool"` and `source: "subtask"` rows do not enter `countedChildIDs` or increment `totalExecuted`;
+- each observed real `ses_*` session counts exactly once;
+- a subtask may appear before, then correlate with and navigate to, a later real session without counting itself;
+- when the real session appears, its `ses_*` identity is the only identity added to execution counters;
+- persisted snapshots keep shared state and render output available to local tools without becoming token evidence.
 
 ## Rendering
 
@@ -170,11 +151,11 @@ Critical rules:
 
 Before showing anything, it:
 
-1. sorts by priority/recency;
-2. collapses duplicates;
-3. merges useful session data into synthetic rows when appropriate;
-4. filters old `done` rows;
-5. keeps errors and running items visible;
+1. selects the complete retained descendant subtree;
+2. collapses duplicates and correlates real sessions with provisional rows;
+3. sorts siblings by the existing priority rules;
+4. emits parents before children with a depth for each row;
+5. filters old `done` rows while keeping errors and running items visible;
 6. builds the aggregate summary.
 
 That is why there can be more children in state than visible rows in the UI.
@@ -183,9 +164,17 @@ That is why there can be more children in state than visible rows in the UI.
 
 `src/tui.tsx` is the largest module because it integrates several OpenCode runtime concerns.
 
-It handles initialization, visual slots, the sidebar, hydration, reconciliation, token/context best-effort loading, navigation, prompt focus preservation, and lifecycle cleanup.
+It handles initialization, visual slots, the sidebar, hydration, reconciliation, token/context best-effort loading, navigation, prompt focus preservation, local persistence, and lifecycle cleanup.
 
-The sidebar shows subagents related to the current session only. Home summary and text/status-file rendering remain global across sessions. Rows are navigable only when a real `ses_*` target is known.
+The sidebar shows the complete retained descendant tree for the current session. Home summary and text/status-file rendering remain global across sessions. Rows are navigable only when a real `ses_*` target is known.
+
+## Descendant discovery and projection
+
+Cold hydration walks `session.children(parentID)` iteratively from the viewed session. The breadth-first traversal has fixed request concurrency, queries each real session ID at most once, and continues through every discovered depth. A visited set prevents cycles and duplicate requests. Route changes and aborts stop stale work, while verified partial results follow the existing retry policy.
+
+The shared lineage projection selects that all-depth subtree once per immutable state snapshot. It correlates duplicates once, sorts siblings by priority, and emits a depth-first parent-before-child row order. Only authoritative real session relationships can extend ancestry. Synthetic targets remain correlation and navigation evidence, not ancestry evidence.
+
+Token/context hydration uses live TUI state plus `session.messages`. Local databases, `state.json`, `status.txt`, and event logs are not token-recovery sources.
 
 ## Reconciliation
 
@@ -227,8 +216,10 @@ Tests document design decisions as much as they verify code.
 | `src/state.test.ts` | Counters, persistence, normalization, and source rules. |
 | `src/render.test.ts` | Collapse, visibility, formatting, and aggregate summary. |
 | `src/reconcile.test.ts` | Status normalization and conservative reconciliation. |
-| `src/tui.test.ts` | Command/keybinding registration. |
-| `test/index.integration.test.ts` | Runtime plugin, state files, and error tolerance. |
+| `src/projection.test.ts` | All-depth lineage, correlation, ordering, counters, and cycle safety. |
+| `src/tui-descendant-hydration.test.ts` | Iterative bounded discovery, cancellation, batching, and fail-closed responses. |
+| `src/tui-tree-row.test.ts` | Depth indentation, narrow-width clamping, and nested navigation targets. |
+| `src/tui.test.ts` | TUI lifecycle, persistence, commands, keybindings, and integration seams. |
 
 Current boundary: the full visual UI in `src/tui.tsx` does not have deep E2E coverage against the OpenCode/OpenTUI host.
 
@@ -237,7 +228,7 @@ Current boundary: the full visual UI in `src/tui.tsx` does not have deep E2E cov
 | File | Role |
 | --- | --- |
 | `package.json` | Package name, exports, scripts, peers, and release metadata. |
-| `tsup.config.ts` | Dual build: runtime and TUI. |
+| `tsup.config.ts` | Single TUI build that emits `dist/tui.js` and `dist/tui.d.ts`. |
 | `tsconfig.json` | Base TypeScript config for source. |
 | `tsconfig.test.json` | TypeScript config for tests. |
 | `vitest.config.ts` | Vitest, coverage, and setup. |

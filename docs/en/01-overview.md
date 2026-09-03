@@ -33,17 +33,18 @@ In the TUI, the plugin can show:
 - an aggregate summary on the home screen;
 - navigation to the real child session when a navigable `sessionID` exists.
 
+The TUI hydrates token/context data from live in-memory and event state plus `session.messages`. Persisted snapshots, OpenCode's local database, and recent log files are not recovery sources.
+
 ## Public entrypoints
 
-The package exposes these entrypoints:
+The package supports these two TUI entrypoints:
 
-| Entrypoint                             | Source         | Primary use                                                                                |
-| -------------------------------------- | -------------- | ------------------------------------------------------------------------------------------ |
-| `opencode-subagent-statusline`         | `src/tui.tsx`  | Main TUI plugin. Recommended path for users.                                               |
-| `opencode-subagent-statusline/tui`     | `src/tui.tsx`  | Explicit alias for the TUI plugin.                                                         |
-| `opencode-subagent-statusline/runtime` | `src/index.ts` | Advanced runtime/file-based plugin. Processes events and writes `state.json`/`status.txt`. |
+| Entrypoint | Source | Primary use |
+| --- | --- | --- |
+| `opencode-subagent-statusline` | `src/tui.tsx` | Main TUI plugin. Recommended path for users. |
+| `opencode-subagent-statusline/tui` | `src/tui.tsx` | Explicit alias for the same TUI plugin. |
 
-The current README focuses on the TUI mode, which is the package's main experience.
+Both entrypoints load the same supported TUI plugin.
 
 ## High-level flow
 
@@ -51,8 +52,9 @@ The current README focuses on the TUI mode, which is the package's main experien
 OpenCode event
   -> src/events.ts
   -> src/state.ts
+  -> src/projection.ts
   -> src/render.ts
-  -> src/tui.tsx or src/index.ts
+  -> src/tui.tsx
   -> sidebar / home footer / status.txt
 ```
 
@@ -81,9 +83,9 @@ OpenCode can represent delegated work in several ways:
 
 | Internal source | What it represents                                          | Counts as execution      |
 | --------------- | ----------------------------------------------------------- | ------------------------ |
-| `session`       | A real OpenCode child session.                              | Yes, once.               |
-| `subtask`       | A synthetic row derived from message parts.                 | May count provisionally. |
-| `tool`          | A technical wrapper for tools such as `task` or `delegate`. | No.                      |
+| `session`       | A real OpenCode child session.                              | Yes, once. |
+| `subtask`       | A synthetic row derived from message parts.                 | No. It can correlate with a later real session. |
+| `tool`          | A technical wrapper for tools such as `task` or `delegate`. | No. |
 
 The plugin therefore separates three concepts:
 
@@ -91,7 +93,7 @@ The plugin therefore separates three concepts:
 2. **Visible rows**: what should be shown after duplicate collapse.
 3. **Executed total**: the semantic count of real work.
 
-A visible row does not always equal one execution. A `tool:*` wrapper can provide status evidence, but it must not inflate `totalExecuted`.
+A visible row does not always equal one execution. Synthetic `subtask:*` and `tool:*` rows can provide display, status, correlation, or navigation evidence, but they never enter `countedChildIDs` or increment `totalExecuted`. Only an observed real `ses_*` session counts, once.
 
 ## Defensive design
 
@@ -116,8 +118,8 @@ The deterministic core has strong test coverage for:
 - counters and deduplication;
 - text rendering;
 - conservative reconciliation;
-- basic command/keybinding registration;
-- runtime plugin persistence.
+- all-depth projection, discovery, and tree rows;
+- commands, keybindings, and TUI-owned persistence.
 
 The current boundary is the full visual UI inside the OpenCode/OpenTUI host: deep TUI E2E automation does not exist yet. For visual changes, the project recommends manual OpenCode smoke tests in addition to automated tests.
 

@@ -92,12 +92,14 @@ The `Σ total` value is not a count of visible rows.
 
 It represents real subagent executions.
 
+Only observed real `ses_*` sessions contribute to this total. Synthetic `subtask:*` and `tool:*` rows can be visible or correlated but add zero executions.
+
 These situations are normal:
 
 | Situation                                                   | Correct result                          |
 | ----------------------------------------------------------- | --------------------------------------- |
-| A `task` wrapper and a real session represent the same work | Count 1.                                |
-| There are three internal entries but one visible row        | It may count 1.                         |
+| A `task` wrapper and a real session represent the same work | The real `ses_*` session counts 1; the wrapper counts 0. |
+| Three correlated entries produce one visible row and include one real session | Only the real `ses_*` session counts, so the total is 1. |
 | An old `done` row is no longer visible                      | The historical total does not decrease. |
 | Tokens/context are missing                                  | The row is shown without those details. |
 
@@ -134,14 +136,14 @@ If a row only comes from a technical wrapper or a subtask without a known sessio
 
 ## Tokens and context
 
-The plugin shows token/context details only when it finds reliable evidence.
+The TUI shows token/context details only when it finds reliable evidence.
 
-Possible sources include:
+Hydration uses:
 
-- event payloads;
-- live TUI state;
-- OpenCode's SQLite database;
-- recent logs.
+- live in-memory and event state;
+- OpenCode's `session.messages` API.
+
+Persisted snapshots, OpenCode's local database, and recent log files are not recovery sources.
 
 If OpenCode does not expose those details, the plugin omits them without breaking the row.
 
@@ -176,7 +178,7 @@ Then restart OpenCode.
 
 ### Token/context usage is missing
 
-This can be normal. Availability depends on what OpenCode exposes through events, state, SQLite, or logs.
+This can be normal. Availability depends on what OpenCode exposes through live in-memory/event state and `session.messages`; persisted snapshots, the local database, and recent log files are not recovery sources.
 
 The plugin is designed to keep working when that information is absent.
 
