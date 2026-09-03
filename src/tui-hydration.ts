@@ -1,7 +1,7 @@
 import type { ChildTokenState } from "./state.js";
 
 export const ROUTE_CHILD_MESSAGE_CONCURRENCY = 4;
-export const ROUTE_CHILD_MESSAGE_ADMISSION_LIMIT = 64;
+export const ROUTE_CHILD_MESSAGE_LIMIT = 50;
 export const TOKEN_HYDRATION_CONCURRENCY = 2;
 export const TOKEN_HYDRATION_ADMISSION_LIMIT = 128;
 export const HYDRATE_RETRY_MAX_ATTEMPTS = 6;
@@ -187,6 +187,29 @@ export function scheduleHydrateRetry(input: {
     ),
   );
   return nextAttempts;
+}
+
+/**
+ * Settles as soon as the route is aborted, even when the host request ignores
+ * its signal. Promise.race installs rejection handlers on the host promise, so
+ * an eventual rejection after abort cannot become unhandled.
+ */
+export async function raceRouteAbort<Value>(
+  request: () => Promise<Value>,
+  signal: AbortSignal,
+): Promise<Value | undefined> {
+  if (signal.aborted) return undefined;
+
+  let resolveAbort: () => void = () => undefined;
+  const aborted = new Promise<undefined>((resolve) => {
+    resolveAbort = () => resolve(undefined);
+  });
+  signal.addEventListener("abort", resolveAbort, { once: true });
+  try {
+    return await Promise.race([request(), aborted]);
+  } finally {
+    signal.removeEventListener("abort", resolveAbort);
+  }
 }
 
 export async function mapWithBoundedConcurrency<Item, Result>(
