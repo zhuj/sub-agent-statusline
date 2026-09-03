@@ -189,40 +189,62 @@ describe("subagent projection", () => {
     expect(result.executionIDs).toEqual(new Set(["ses_first", "ses_second"]));
   });
 
-  it("preserves descendants parented under a deduplicated authoritative alias", () => {
+  it("preserves many nested descendants under deduplicated aliases", () => {
     // Given
-    const primary = child({
-      id: "ses_primary",
-      parentID: "ses_root",
-      targetSessionID: "ses_execution",
-    });
-    const alias = child({
-      id: "ses_alias",
-      parentID: "ses_root",
-      targetSessionID: "ses_execution",
-    });
-    const primaryDescendant = child({
-      id: "ses_primary_descendant",
-      parentID: "ses_primary",
-      targetSessionID: "ses_primary_descendant",
-      startedAt: "2026-01-01T00:00:00Z",
-    });
-    const aliasDescendant = child({
-      id: "ses_alias_descendant",
-      parentID: "ses_alias",
-      targetSessionID: "ses_alias_descendant",
-      startedAt: "2026-01-02T00:00:00Z",
-    });
+    const aliasNames = ["a", "b", "c", "d", "e", "f"] as const;
+    const aliases = aliasNames.map((suffix, index) => ({
+      suffix,
+      row: child({
+        id: `ses_alias_${suffix}`,
+        parentID: "ses_root",
+        targetSessionID: "ses_execution",
+        startedAt: `2026-01-${String(index + 1).padStart(2, "0")}T00:00:00Z`,
+      }),
+    }));
+    const descendants = aliases.map(({ suffix, row }, index) => ({
+      suffix,
+      row: child({
+        id: `ses_alias_descendant_${suffix}`,
+        parentID: row.id,
+        targetSessionID: `ses_alias_descendant_${suffix}`,
+        startedAt: `2026-01-${String(index + 1).padStart(2, "0")}T00:00:00Z`,
+      }),
+    }));
+    const nestedDescendants = descendants.map(({ suffix, row }) => ({
+      suffix,
+      row: child({
+        id: `ses_alias_nested_${suffix}`,
+        parentID: row.id,
+        targetSessionID: `ses_alias_nested_${suffix}`,
+      }),
+    }));
+    const deepDescendants = nestedDescendants.map(({ suffix, row }) =>
+      child({
+        id: `ses_alias_deep_${suffix}`,
+        parentID: row.id,
+        targetSessionID: `ses_alias_deep_${suffix}`,
+      }),
+    );
+    const allRows = [
+      ...aliases.map(({ row }) => row),
+      ...descendants.map(({ row }) => row),
+      ...nestedDescendants.map(({ row }) => row),
+      ...deepDescendants,
+    ];
     const state: StatuslineState = {
       ...stateWithProjectionRows([]),
-      children: { primary, alias, primaryDescendant, aliasDescendant },
+      children: Object.fromEntries(
+        allRows.map(
+          (row): readonly [string, ChildSessionState] => [row.id, row],
+        ),
+      ),
     };
 
     // When
     const result = projectSubagentSubtree({
       index: getSubagentLineageIndex(state),
       rootSessionID: "ses_root",
-      compareSiblings: byPriority,
+      compareSiblings: () => 0,
     });
 
     // Then
@@ -233,17 +255,50 @@ describe("subagent projection", () => {
         parentSessionID,
       ]),
     ).toEqual([
-      ["ses_primary", 0, "ses_root"],
-      ["ses_alias_descendant", 1, "ses_alias"],
-      ["ses_primary_descendant", 1, "ses_primary"],
+      ["ses_alias_a", 0, "ses_root"],
+      ["ses_alias_descendant_a", 1, "ses_alias_a"],
+      ["ses_alias_nested_a", 2, "ses_alias_descendant_a"],
+      ["ses_alias_deep_a", 3, "ses_alias_nested_a"],
+      ["ses_alias_descendant_b", 1, "ses_alias_b"],
+      ["ses_alias_nested_b", 2, "ses_alias_descendant_b"],
+      ["ses_alias_deep_b", 3, "ses_alias_nested_b"],
+      ["ses_alias_descendant_c", 1, "ses_alias_c"],
+      ["ses_alias_nested_c", 2, "ses_alias_descendant_c"],
+      ["ses_alias_deep_c", 3, "ses_alias_nested_c"],
+      ["ses_alias_descendant_d", 1, "ses_alias_d"],
+      ["ses_alias_nested_d", 2, "ses_alias_descendant_d"],
+      ["ses_alias_deep_d", 3, "ses_alias_nested_d"],
+      ["ses_alias_descendant_e", 1, "ses_alias_e"],
+      ["ses_alias_nested_e", 2, "ses_alias_descendant_e"],
+      ["ses_alias_deep_e", 3, "ses_alias_nested_e"],
+      ["ses_alias_descendant_f", 1, "ses_alias_f"],
+      ["ses_alias_nested_f", 2, "ses_alias_descendant_f"],
+      ["ses_alias_deep_f", 3, "ses_alias_nested_f"],
     ]);
     expect(result.executionIDs).toEqual(
       new Set([
         "ses_execution",
-        "ses_alias_descendant",
-        "ses_primary_descendant",
+        "ses_alias_descendant_a",
+        "ses_alias_descendant_b",
+        "ses_alias_descendant_c",
+        "ses_alias_descendant_d",
+        "ses_alias_descendant_e",
+        "ses_alias_descendant_f",
+        "ses_alias_nested_a",
+        "ses_alias_nested_b",
+        "ses_alias_nested_c",
+        "ses_alias_nested_d",
+        "ses_alias_nested_e",
+        "ses_alias_nested_f",
+        "ses_alias_deep_a",
+        "ses_alias_deep_b",
+        "ses_alias_deep_c",
+        "ses_alias_deep_d",
+        "ses_alias_deep_e",
+        "ses_alias_deep_f",
       ]),
     );
+    expect(result.retainedCounts).toEqual({ running: 19, done: 0, error: 0 });
   });
 
   it("emits malformed cycles and duplicate execution identities at most once", () => {

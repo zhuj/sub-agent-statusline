@@ -94,29 +94,58 @@ export function projectSubagentSubtree(input: {
     }
   }
 
-  const lineageIDsByExecutionID = new Map<string, string[]>();
+  const executionIDsByLineageID = new Map<string, Set<string>>();
+  const lineageOrderByID = new Map<string, number>();
   for (const row of scopedRows) {
     const classification = classifySubagentWorkItem(row);
     if (classification.kind !== "real-execution") continue;
 
-    const lineageIDs = lineageIDsByExecutionID.get(classification.executionID);
-    if (lineageIDs) lineageIDs.push(row.id);
-    else lineageIDsByExecutionID.set(classification.executionID, [row.id]);
+    if (!lineageOrderByID.has(row.id)) {
+      lineageOrderByID.set(row.id, lineageOrderByID.size);
+    }
+    const executionIDs = executionIDsByLineageID.get(row.id);
+    if (executionIDs) executionIDs.add(classification.executionID);
+    else {
+      executionIDsByLineageID.set(
+        row.id,
+        new Set([classification.executionID]),
+      );
+    }
   }
 
-  const canonicalByParentID = new Map<string, ChildSessionState[]>();
-  for (const row of buildCanonicalRows(scopedRows)) {
-    const siblings = canonicalByParentID.get(row.parentID);
-    if (siblings) siblings.push(row);
-    else canonicalByParentID.set(row.parentID, [row]);
+  const canonicalChildrenByParentExecutionID = new Map<
+    string,
+    ChildSessionState[]
+  >();
+  const scopedCanonicalRows = buildCanonicalRows(scopedRows);
+  const rootChildren: ChildSessionState[] = [];
+  for (const row of scopedCanonicalRows) {
+    if (row.parentID === input.rootSessionID) rootChildren.push(row);
+
+    const parentExecutionIDs = executionIDsByLineageID.get(row.parentID);
+    if (!parentExecutionIDs) continue;
+    for (const parentExecutionID of parentExecutionIDs) {
+      const children = canonicalChildrenByParentExecutionID.get(
+        parentExecutionID,
+      );
+      if (children) children.push(row);
+      else canonicalChildrenByParentExecutionID.set(parentExecutionID, [row]);
+    }
   }
+  for (const children of canonicalChildrenByParentExecutionID.values()) {
+    children.sort(
+      (left, right) =>
+        (lineageOrderByID.get(left.parentID) ?? 0) -
+        (lineageOrderByID.get(right.parentID) ?? 0),
+    );
+  }
+
   const rows: SubagentTreeRow[] = [];
   const executionIDs = new Set<string>();
   const stack: Array<{
     readonly child: ChildSessionState;
     readonly depth: number;
   }> = [];
-  const rootChildren = [...(canonicalByParentID.get(input.rootSessionID) ?? [])];
   rootChildren.sort(input.compareSiblings);
   for (let index = rootChildren.length - 1; index >= 0; index -= 1) {
     const child = rootChildren[index];
@@ -136,17 +165,9 @@ export function projectSubagentSubtree(input: {
       parentSessionID: current.child.parentID,
     });
 
-    const lineageIDs = lineageIDsByExecutionID.get(executionID) ?? [current.child.id];
-    const children: ChildSessionState[] = [];
-    const childExecutionIDs = new Set<string>();
-    for (const lineageID of lineageIDs) {
-      for (const child of canonicalByParentID.get(lineageID) ?? []) {
-        const childExecutionID = trustedTargetSessionID(child) ?? child.id;
-        if (childExecutionIDs.has(childExecutionID)) continue;
-        childExecutionIDs.add(childExecutionID);
-        children.push(child);
-      }
-    }
+    const children = [
+      ...(canonicalChildrenByParentExecutionID.get(executionID) ?? []),
+    ];
     children.sort(input.compareSiblings);
     for (let index = children.length - 1; index >= 0; index -= 1) {
       const child = children[index];
