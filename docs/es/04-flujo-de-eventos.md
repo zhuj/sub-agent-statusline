@@ -96,9 +96,9 @@ part kind/type = subtask
   ↓
 se crea child id subtask:<partID>
   ↓
-puede contar como fallback provisional
+puede aportar una fila visible temprana, pero no cuenta
   ↓
-si luego aparece una sesión real, se reconcilia
+si luego aparece una sesión real, se correlaciona
 ```
 
 Ejemplo conceptual:
@@ -131,7 +131,7 @@ children["subtask:prt_1"] = {
 };
 ```
 
-Un `subtask` puede ser útil aunque todavía no exista `targetSessionID`. El plugin lo usa como señal temprana para mostrar que hay trabajo delegado activo.
+Un `subtask` puede ser útil aunque todavía no exista `targetSessionID`. El plugin lo usa como señal temprana para mostrar que hay trabajo delegado activo, pero no entra en `countedChildIDs` ni incrementa `totalExecuted`.
 
 ## Caso 3: aparece un wrapper `task` o `delegate`
 
@@ -194,9 +194,9 @@ Por eso la regla es:
 
 | Source    | Cuenta                          |
 | --------- | ------------------------------- |
-| `session` | Sí.                             |
-| `subtask` | Solo como fallback provisional. |
-| `tool`    | No.                             |
+| `session` | Sí, una vez por cada identidad real `ses_*` observada. |
+| `subtask` | No. |
+| `tool`    | No. |
 
 ## Correlación entre wrapper, subtask y sesión
 
@@ -243,7 +243,7 @@ Esto significa:
 - la fila visible puede seguir usando el título del `subtask`;
 - la navegación puede abrir `ses_child`;
 - los datos terminales de `ses_child` pueden fusionarse en la fila sintética;
-- el contador puede reconciliarse hacia la sesión real.
+- la fila sintética sigue sin contar; cuando `ses_child` se observa como sesión real, esa identidad `ses_*` cuenta una vez.
 
 ## Estados terminales
 
@@ -334,14 +334,12 @@ Esto evita marcar como terminado un subagente que quizá sigue trabajando.
 
 ## Tokens y contexto
 
-La información de tokens/contexto puede llegar por varias fuentes:
+La TUI hidrata la información de tokens/contexto desde:
 
-- payload del evento;
-- estado vivo de TUI;
-- base SQLite de OpenCode;
-- logs recientes.
+- estado vivo en memoria y eventos;
+- la API `session.messages` de OpenCode.
 
-El plugin mezcla esa evidencia de forma best-effort. Si no hay datos, la fila se muestra sin tokens/contexto.
+Los snapshots persistidos, la base de datos local de OpenCode y los archivos de log recientes no son fuentes de recuperación. Si no hay evidencia viva o de la API, la fila se muestra sin tokens/contexto.
 
 ## Comportamiento fail-closed
 
@@ -372,7 +370,7 @@ Actualizar estado
   ↓
 Normalizar status/tokens/timestamps
   ↓
-Reconciliar contadores si corresponde
+Reconstruir contadores desde sesiones reales observadas
   ↓
 Renderizar filas visibles
   ↓

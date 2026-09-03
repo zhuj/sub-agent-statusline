@@ -56,6 +56,8 @@ Deduplicar filas visibles no es lo mismo que contar ejecuciones.
 | Deduplicación visual | `src/render.ts`            | ¿Cuántas filas debería ver el usuario? |
 | Estado interno       | `StatuslineState.children` | ¿Qué evidencia conoce el plugin?       |
 
+Solo las sesiones reales `ses_*` observadas cuentan como ejecuciones. Las filas sintéticas `subtask:*` y `tool:*` pueden seguir visibles, correlacionarse con una sesión real o conservar su destino de navegación, pero nunca incrementan `totalExecuted`.
+
 Ejemplo:
 
 ```txt
@@ -248,7 +250,7 @@ Ejemplos conceptuales:
 1.5k ctx 12%
 ```
 
-La disponibilidad depende de OpenCode. Si la información no aparece en eventos, TUI state, SQLite o logs, se omite.
+La disponibilidad depende de OpenCode. La TUI usa el estado vivo en memoria y los eventos, junto con `session.messages`; los snapshots persistidos, la base de datos local de OpenCode y los archivos de log recientes no son fuentes de recuperación. Si no hay evidencia viva o de la API, la información se omite.
 
 ## Color
 

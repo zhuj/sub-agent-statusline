@@ -24,7 +24,7 @@ type StatuslineState = {
 | Campo             | Significado                                                         |
 | ----------------- | ------------------------------------------------------------------- |
 | `children`        | Mapa de work items conocidos: sesiones reales, subtasks y wrappers. |
-| `countedChildIDs` | Identidades que ya fueron contadas como ejecución.                  |
+| `countedChildIDs` | Identidades reales `ses_*` observadas que ya fueron contadas como ejecución. |
 | `totalExecuted`   | Total semántico de ejecuciones reales.                              |
 | `updatedAt`       | Última actualización derivada del estado.                           |
 
@@ -61,7 +61,7 @@ El campo `source` es clave para entender el comportamiento del plugin.
 | Source    | Qué representa                                    | Ejemplo de ID   | Cuenta como ejecución       |
 | --------- | ------------------------------------------------- | --------------- | --------------------------- |
 | `session` | Sesión hija real de OpenCode.                     | `ses_abc123`    | Sí, una vez.                |
-| `subtask` | Representación sintética de una parte de mensaje. | `subtask:prt_1` | Puede contar como fallback. |
+| `subtask` | Representación sintética de una parte de mensaje. | `subtask:prt_1` | No. |
 | `tool`    | Wrapper técnico de una tool call.                 | `tool:prt_2`    | No.                         |
 
 El contador se basa en esta clasificación, no en duración ni visibilidad.
@@ -103,7 +103,8 @@ Esto significa:
 - el item interno sigue siendo el subtask;
 - la sesión real asociada es `ses_child`;
 - la UI puede navegar a `ses_child`;
-- los contadores pueden reconciliarse hacia `ses_child`;
+- la fila sintética sigue excluida de los contadores de ejecución;
+- observar la sesión real `ses_child` agrega esa identidad una sola vez;
 - el render puede fusionar datos de la sesión real en la fila sintética.
 
 ## Regla de conteo
@@ -112,11 +113,11 @@ El plugin cuenta ejecuciones reales, no eventos ni filas.
 
 Reglas:
 
-1. `source: "tool"` nunca incrementa `totalExecuted`.
-2. `source: "session"` incrementa una vez por sesión real.
-3. `source: "subtask"` puede incrementar como fallback si no hay sesión real asociada.
-4. Cuando aparece una sesión real para un subtask ya contado, el contador se reconcilia sin incrementar de nuevo.
-5. Las actualizaciones repetidas del mismo child no vuelven a contar.
+1. Las filas sintéticas `source: "tool"` y `source: "subtask"` nunca entran en `countedChildIDs` ni incrementan `totalExecuted`.
+2. `source: "session"` incrementa una vez por cada identidad real `ses_*` observada.
+3. Una fila sintética puede aparecer antes que la sesión real y luego aportar correlación o navegación mediante `targetSessionID` sin contar.
+4. Cuando aparece la sesión real, solo su identidad `ses_*` entra en `countedChildIDs`.
+5. Las actualizaciones repetidas de la misma sesión real no vuelven a contar.
 
 ## Por qué `tool` no cuenta
 
@@ -169,7 +170,7 @@ totalExecuted = 1;
 
 Si llega otra actualización de `ses_child`, no vuelve a sumar.
 
-## Conteo fallback de subtasks
+## Filas sintéticas antes de una sesión real
 
 A veces aparece un `subtask` antes que la sesión real.
 
@@ -178,49 +179,48 @@ subtask:prt_1 aparece primero
 ses_child aparece después
 ```
 
-Mientras no se conozca la sesión real, el subtask puede contar como fallback. Esto permite representar trabajo real aunque OpenCode todavía no haya expuesto `ses_*`.
+Mientras no se conozca la sesión real, el subtask puede ser visible, pero sigue sin contar.
 
 Estado inicial:
 
 ```ts
-countedChildIDs = ["subtask:prt_1"];
-totalExecuted = 1;
+countedChildIDs = [];
+totalExecuted = 0;
 ```
 
-Después aparece la sesión real:
+Agregar `targetSessionID` puede hacer que la fila sintética sea correlacionable y navegable. Ese dato por sí solo tampoco cuenta una ejecución. Después se observa la sesión real:
 
 ```ts
 children["subtask:prt_1"].targetSessionID = "ses_child";
 children["ses_child"] = { source: "session", id: "ses_child" };
 ```
 
-El contador se reconcilia:
+La identidad real cuenta una vez:
 
 ```ts
 countedChildIDs = ["ses_child"];
 totalExecuted = 1;
 ```
 
-El total no sube a dos porque se trata del mismo trabajo.
+El render puede conservar el título sintético y fusionar estado, tiempos o tokens de la sesión real en una sola fila visible. La visibilidad y la correlación no cambian la regla de conteo.
 
-## Rekeying
+## Correlación sin rekeying sintético
 
-El rekeying es el proceso de cambiar la identidad contada desde una identidad provisional hacia una identidad más fuerte.
+No existe una identidad sintética contada que deba cambiarse. Un ID `subtask:*` o `tool:*` queda fuera de `countedChildIDs`, aunque obtenga un `targetSessionID` confiable.
 
 Ejemplo:
 
 ```txt
-Antes:   countedChildIDs = ["subtask:prt_1"]
-Después: countedChildIDs = ["ses_child"]
+Antes de la sesión real: countedChildIDs = []
+Después de observarla:   countedChildIDs = ["ses_child"]
 ```
 
-Esto pasa cuando:
+La proyección puede correlacionar entradas cuando:
 
-- un subtask contado obtiene `targetSessionID`;
-- aparece una sesión real correlacionada;
-- el estado cargado desde disco se normaliza.
+- una fila sintética obtiene un `targetSessionID` confiable;
+- aparece una sesión real correlacionada.
 
-El objetivo es mantener `totalExecuted` correcto y evitar duplicados.
+La sesión real aporta la única identidad de ejecución. La fila sintética correlacionada puede aportar un título útil o un destino de navegación sin inflar `totalExecuted`.
 
 ## Persistencia
 
@@ -234,7 +234,7 @@ $XDG_RUNTIME_DIR/opencode-subagent-statusline/<instance>/state.json
 
 Si `XDG_RUNTIME_DIR` no existe, se usa el tempdir del sistema.
 
-También existe `status.txt` junto a `state.json` para el render textual del runtime plugin.
+También existe `status.txt` junto a `state.json` para el snapshot textual de la TUI.
 
 Variables relevantes:
 
@@ -242,25 +242,17 @@ Variables relevantes:
 | ----------------------------------------------- | -------------------------------------------------- |
 | `OPENCODE_SUBAGENT_STATUSLINE_STATE`            | Sobrescribe la ruta de `state.json`.               |
 | `OPENCODE_SUBAGENT_STATUSLINE_INSTANCE`         | Define el nombre de instancia.                     |
-| `OPENCODE_SUBAGENT_STATUSLINE_PRESERVE_STATE=1` | Evita limpiar estado al iniciar el runtime plugin. |
-| `XDG_RUNTIME_DIR`                               | Base por defecto para estado runtime.              |
+| `XDG_RUNTIME_DIR`                               | Base por defecto para archivos locales de la TUI.  |
 
-La TUI también puede persistir snapshots auxiliares, pero su estado principal vive en memoria mientras el plugin está activo.
+La TUI es dueña de estos snapshots, pero su estado autoritativo vive en memoria mientras está activa.
 
-## Normalización al cargar estado
+## Escritura de snapshots
 
-`loadState()` es defensivo.
+La TUI escribe `state.json` y `status.txt` de forma best-effort mediante los helpers compartidos de persistencia. Las escrituras conservan permisos exclusivos para el propietario y reemplazo atómico cuando el filesystem lo permite.
 
-Si el JSON está roto o no existe, vuelve a un estado vacío.
+Antes de escribir un snapshot, se refrescan los campos derivados actuales y los detalles de tokens/modelo de los children modificados. Los archivos persistidos exponen estado local actual; no son entradas para restaurar el inicio ni recuperar tokens.
 
-Además, al cargar estado persistido, normaliza contadores para reducir inconsistencias:
-
-- evita agregar wrappers `tool:*` nuevos al conteo;
-- reconcilia subtasks con `targetSessionID` conocido;
-- deduplica identidades equivalentes;
-- mantiene compatibilidad con datos históricos.
-
-Importante: el proyecto no promete reparar todos los contadores inflados de versiones viejas. La prioridad es evitar nuevos conteos incorrectos.
+La hidratación de tokens/contexto usa el estado vivo en memoria y los eventos, junto con `session.messages`. Los snapshots persistidos, la base de datos local de OpenCode y los archivos de log recientes no son fuentes de recuperación.
 
 ## Campos derivados
 
@@ -271,7 +263,7 @@ Al refrescar estado, el plugin recalcula o normaliza campos como:
 | `elapsedMs`     | Diferencia entre `startedAt` y `endedAt` o tiempo actual.   |
 | `color`         | Derivado de `status`.                                       |
 | `updatedAt`     | Último cambio conocido.                                     |
-| tokens/contexto | Evidencia mezclada desde eventos, TUI state, SQLite o logs. |
+| tokens/contexto | Evidencia viva en memoria/eventos más `session.messages`.   |
 
 También poda filas terminales viejas para evitar crecimiento indefinido.
 
@@ -297,7 +289,6 @@ La poda de filas no implica reducir `totalExecuted`.
 | `markChildStatus()`      | Marcar child como `done` o `error`.               |
 | `upsertChildDetails()`   | Mezclar título, resumen, agente, tokens y target. |
 | `refreshDerivedFields()` | Recalcular duración, color, poda y timestamps.    |
-| `loadState()`            | Cargar y normalizar estado persistido.            |
 | `saveState()`            | Guardar estado normalizado en disco.              |
 
 ## Ejemplo completo
@@ -324,8 +315,8 @@ children["subtask:prt_1"] = {
   status: "running",
 };
 
-countedChildIDs = ["subtask:prt_1"];
-totalExecuted = 1;
+countedChildIDs = [];
+totalExecuted = 0;
 ```
 
 ### 3. Aparece sesión real
@@ -361,11 +352,11 @@ El render puede mostrar una sola fila visible, aunque el estado conserve varias 
 
 Cuando modifiques este proyecto, verificá estas reglas:
 
-- Un wrapper `tool:*` no debe incrementar `totalExecuted`.
+- Las filas sintéticas `tool:*` y `subtask:*` no deben entrar en `countedChildIDs` ni incrementar `totalExecuted`.
 - Una sesión real debe contar una sola vez.
-- Un subtask contado como fallback no debe duplicarse cuando aparece su sesión real.
+- Una fila sintética puede seguir visible, correlacionarse y volverse navegable sin contar como ejecución.
 - `targetSessionID` debe usarse solo cuando la correlación sea segura.
-- El estado debe tolerar JSON inválido o datos viejos.
+- Los fallos al escribir snapshots no deben romper la TUI.
 - La poda de hijos no debe alterar el total histórico ejecutado.
 - Los tests de `state`, `events` y `render` deben cubrir cualquier cambio de conteo.
 
@@ -373,7 +364,7 @@ Cuando modifiques este proyecto, verificá estas reglas:
 
 | Archivo                 | Qué confirma                                              |
 | ----------------------- | --------------------------------------------------------- |
-| `src/state.test.ts`     | Reglas de conteo, rekeying, persistencia y normalización. |
+| `src/state.test.ts`     | Conteo de sesiones reales, exclusión de filas sintéticas, persistencia y sanitización de snapshots. |
 | `src/events.test.ts`    | Extracción de targets y correlación segura.               |
 | `src/render.test.ts`    | Collapse visual sin duplicar filas.                       |
 | `src/reconcile.test.ts` | Cierre conservador de estados viejos.                     |
