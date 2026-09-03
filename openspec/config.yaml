@@ -7,8 +7,8 @@ project:
   runtime: Node.js
   package_manager: pnpm
   entrypoints:
-    plugin_tui: src/tui.tsx
-    runtime: src/index.ts
+    package_root: src/tui.tsx
+    package_tui: src/tui.tsx
   core_modules:
     events: src/events.ts
     state: src/state.ts
@@ -27,10 +27,10 @@ testing:
     - test/setup.ts
   include:
     - src/**/*.test.ts
-    - test/**/*.integration.test.ts
+    - test/package-contract.test.ts
   layers:
     unit: src/**/*.test.ts
-    integration: test/**/*.integration.test.ts
+    package_contract: test/package-contract.test.ts
     e2e: unavailable
   quality:
     linter: unavailable
@@ -39,7 +39,8 @@ testing:
     - docs/testing.md
   guidance:
     - Prefer focused unit tests for event parsing, state transitions, counters, and rendering.
-    - Use runtime integration tests for filesystem persistence and OpenCode-style event handling.
+    - Cover all-depth projection, bounded descendant discovery, and tree-row behavior with pure tests.
+    - Use test/helpers/test-harness.ts for isolated filesystem persistence tests.
     - Avoid deep TUI/e2e automation unless the TUI seam explicitly requires it.
 
 sdd:
