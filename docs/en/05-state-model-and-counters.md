@@ -24,7 +24,7 @@ type StatuslineState = {
 | Field | Meaning |
 | --- | --- |
 | `children` | Map of known work items: real sessions, subtasks, and wrappers. |
-| `countedChildIDs` | Identities that already counted as execution. |
+| `countedChildIDs` | Observed real `ses_*` identities that already counted as execution. |
 | `totalExecuted` | Semantic total of real executions. |
 | `updatedAt` | Last derived state update. |
 
@@ -61,7 +61,7 @@ type ChildSessionState = {
 | Source | Represents | Example ID | Counts as execution |
 | --- | --- | --- | --- |
 | `session` | Real OpenCode child session. | `ses_abc123` | Yes, once. |
-| `subtask` | Synthetic representation of a message part. | `subtask:prt_1` | May count as fallback. |
+| `subtask` | Synthetic representation of a message part. | `subtask:prt_1` | No. |
 | `tool` | Technical tool-call wrapper. | `tool:prt_2` | No. |
 
 Counters use this classification, not duration or visibility.
@@ -101,7 +101,8 @@ That means:
 - the internal item is still the subtask;
 - the associated real session is `ses_child`;
 - the UI can navigate to `ses_child`;
-- counters can reconcile toward `ses_child`;
+- the synthetic row remains excluded from execution counters;
+- observing the real `ses_child` session adds that identity to the counters once;
 - rendering can merge real session data into the synthetic row.
 
 ## Counting rules
@@ -110,11 +111,11 @@ The plugin counts real executions, not events or rows.
 
 Rules:
 
-1. `source: "tool"` never increments `totalExecuted`.
-2. `source: "session"` increments once per real session.
-3. `source: "subtask"` may increment as fallback if no real session is associated yet.
-4. When a real session appears for an already-counted subtask, the counter reconciles without incrementing again.
-5. Repeated updates of the same child do not count again.
+1. Synthetic `source: "tool"` and `source: "subtask"` rows never enter `countedChildIDs` or increment `totalExecuted`.
+2. `source: "session"` increments once per observed real `ses_*` identity.
+3. A synthetic row can appear before a real session and later provide correlation or navigation through `targetSessionID` without counting.
+4. When the real session appears, only its `ses_*` identity enters `countedChildIDs`.
+5. Repeated updates of the same real session do not count again.
 
 ## Why `tool` does not count
 
@@ -158,7 +159,7 @@ The plugin:
 
 A later update for `ses_child` does not increment again.
 
-## Subtask fallback counting
+## Synthetic rows before a real session
 
 Sometimes a `subtask` appears before the real session.
 
@@ -167,38 +168,37 @@ subtask:prt_1 appears first
 ses_child appears later
 ```
 
-Before the real session is known, the subtask may count as fallback:
+Before the real session is known, the subtask can be visible but remains uncounted:
 
 ```ts
-countedChildIDs = ["subtask:prt_1"]
-totalExecuted = 1
+countedChildIDs = []
+totalExecuted = 0
 ```
 
-When the real session appears and the subtask gets `targetSessionID`, the counter reconciles:
+Adding `targetSessionID` can make the synthetic row correlatable and navigable. That metadata alone still does not count an execution. When the real session is observed, its identity counts once:
 
 ```ts
 countedChildIDs = ["ses_child"]
 totalExecuted = 1
 ```
 
-The total stays one because it is the same work.
+Rendering may keep the synthetic title and merge status, timing, or token data from the real session into one visible row. Visibility and correlation do not change the counting rule.
 
-## Rekeying
+## Correlation without synthetic rekeying
 
-Rekeying changes the counted identity from a provisional ID to a stronger ID.
+There is no counted synthetic identity to rekey. A `subtask:*` or `tool:*` ID remains outside `countedChildIDs`, even if it gains a trusted `targetSessionID`.
 
 ```txt
-Before: countedChildIDs = ["subtask:prt_1"]
-After:  countedChildIDs = ["ses_child"]
+Before the real session: countedChildIDs = []
+After observing it:     countedChildIDs = ["ses_child"]
 ```
 
-This happens when:
+The projection can still correlate entries when:
 
-- a counted subtask gets `targetSessionID`;
-- a correlated real session appears;
-- loaded state is normalized.
+- a synthetic row gets a trusted `targetSessionID`;
+- a correlated real session appears.
 
-The goal is to keep `totalExecuted` correct and avoid duplicates.
+The real session supplies the sole execution identity. The correlated synthetic row can supply a useful title or navigation target without inflating `totalExecuted`.
 
 ## Persistence
 
@@ -212,7 +212,7 @@ $XDG_RUNTIME_DIR/opencode-subagent-statusline/<instance>/state.json
 
 If `XDG_RUNTIME_DIR` is absent, the system temp directory is used.
 
-`status.txt` lives next to `state.json` and contains runtime text output.
+`status.txt` lives next to `state.json` and contains the TUI's text snapshot.
 
 Relevant variables:
 
@@ -220,25 +220,17 @@ Relevant variables:
 | --- | --- |
 | `OPENCODE_SUBAGENT_STATUSLINE_STATE` | Overrides the `state.json` path. |
 | `OPENCODE_SUBAGENT_STATUSLINE_INSTANCE` | Defines the instance name. |
-| `OPENCODE_SUBAGENT_STATUSLINE_PRESERVE_STATE=1` | Prevents runtime startup state clearing. |
-| `XDG_RUNTIME_DIR` | Default base for runtime state. |
+| `XDG_RUNTIME_DIR` | Default base for TUI-owned local files. |
 
-The TUI also persists auxiliary snapshots, but its main state is in memory while active.
+The TUI owns these snapshots, but its authoritative state remains in memory while active.
 
-## Load normalization
+## Snapshot writes
 
-`loadState()` is defensive.
+The TUI writes `state.json` and `status.txt` best-effort through the shared persistence helpers. Snapshot writes preserve owner-only permissions and atomic replacement where the host filesystem supports them.
 
-If JSON is broken or missing, it returns an empty state.
+Before a state snapshot is written, current derived fields and changed-child token/model details are refreshed. The persisted files expose current local status; they are not startup restoration or token-recovery inputs.
 
-When loading persisted state, it normalizes counters to reduce inconsistencies:
-
-- avoids adding new `tool:*` wrappers to counts;
-- reconciles subtasks with known `targetSessionID`;
-- deduplicates equivalent identities;
-- preserves compatibility with historical data.
-
-Important: the project does not promise to repair every inflated counter from old versions. The priority is preventing new incorrect counts.
+Token/context hydration uses live in-memory and event state plus `session.messages`. Persisted snapshots, OpenCode's local database, and recent log files are not recovery sources.
 
 ## Derived fields and pruning
 
@@ -249,7 +241,7 @@ State refresh recalculates fields such as:
 | `elapsedMs` | Difference between `startedAt` and `endedAt` or current time. |
 | `color` | Derived from `status`. |
 | `updatedAt` | Latest known update. |
-| tokens/context | Evidence from events, TUI state, SQLite, or logs. |
+| tokens/context | Live in-memory/event evidence plus `session.messages`. |
 
 Old terminal children may be pruned to avoid unbounded growth. Terminal rows are
 retained for up to 3 days with a 1,500-row cap. Pruning rows must not reduce
@@ -264,7 +256,6 @@ retained for up to 3 days with a 1,500-row cap. Pruning rows must not reduce
 | `markChildStatus()` | Mark a child as `done` or `error`. |
 | `upsertChildDetails()` | Merge title, summary, agent, tokens, and target. |
 | `refreshDerivedFields()` | Recalculate duration, color, pruning, and timestamps. |
-| `loadState()` | Load and normalize persisted state. |
 | `saveState()` | Save normalized state to disk. |
 
 ## Example flow
@@ -275,8 +266,8 @@ countedChildIDs = []
 totalExecuted = 0
 
 children["subtask:prt_1"] = { id: "subtask:prt_1", source: "subtask", status: "running" }
-countedChildIDs = ["subtask:prt_1"]
-totalExecuted = 1
+countedChildIDs = []
+totalExecuted = 0
 
 children["ses_child"] = { id: "ses_child", source: "session", targetSessionID: "ses_child", status: "running" }
 children["subtask:prt_1"].targetSessionID = "ses_child"
@@ -289,11 +280,11 @@ Rendering may show one visible row even though state keeps multiple evidence ent
 
 ## Invariants for future changes
 
-- A `tool:*` wrapper must not increment `totalExecuted`.
+- Synthetic `tool:*` and `subtask:*` rows must not enter `countedChildIDs` or increment `totalExecuted`.
 - A real session must count exactly once.
-- A fallback-counted subtask must not duplicate when its real session appears.
+- A synthetic row may remain visible, correlate, and become navigable without counting as an execution.
 - `targetSessionID` must be used only with safe correlation.
-- State must tolerate invalid JSON and old data.
+- Snapshot write failures must not crash the TUI.
 - Pruning children must not change historical execution totals.
 - Counter changes should update `state`, `events`, and `render` tests as needed.
 
@@ -301,7 +292,7 @@ Rendering may show one visible row even though state keeps multiple evidence ent
 
 | File | Confirms |
 | --- | --- |
-| `src/state.test.ts` | Counting, rekeying, persistence, and normalization. |
+| `src/state.test.ts` | Real-session counting, synthetic-row exclusion, persistence, and snapshot sanitization. |
 | `src/events.test.ts` | Target extraction and safe correlation. |
 | `src/render.test.ts` | Visual collapse without duplicate rows. |
 | `src/reconcile.test.ts` | Conservative stale-state closure. |

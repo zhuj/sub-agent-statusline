@@ -94,9 +94,9 @@ part kind/type = subtask
   ↓
 create child id subtask:<partID>
   ↓
-may count as provisional fallback
+may provide an early visible row, but does not count
   ↓
-reconcile if a real session appears later
+correlate if a real session appears later
 ```
 
 Conceptual event:
@@ -129,7 +129,7 @@ children["subtask:prt_1"] = {
 }
 ```
 
-A `subtask` is useful even before `targetSessionID` is known. It lets the plugin show early delegated work.
+A `subtask` is useful even before `targetSessionID` is known. It lets the plugin show early delegated work, but it does not enter `countedChildIDs` or increment `totalExecuted`.
 
 ## Case 3: a `task` or `delegate` wrapper appears
 
@@ -190,8 +190,8 @@ If the plugin counted both wrapper and session, totals would be inflated.
 
 | Source | Counts |
 | --- | --- |
-| `session` | Yes. |
-| `subtask` | Only as provisional fallback. |
+| `session` | Yes, once per observed real `ses_*` identity. |
+| `subtask` | No. |
 | `tool` | No. |
 
 ## Correlating wrapper, subtask, and session
@@ -233,7 +233,7 @@ That means:
 - the visible row may keep the subtask title;
 - navigation can open `ses_child`;
 - terminal data from `ses_child` can be merged into the synthetic row;
-- the counter can reconcile toward the real session.
+- the synthetic row remains uncounted; when `ses_child` is observed as a real session, that `ses_*` identity counts once.
 
 ## Terminal states
 
@@ -306,14 +306,12 @@ Only safe candidates are closed.
 
 ## Tokens and context
 
-Token/context data can come from several sources:
+The TUI hydrates token/context data from:
 
-- event payloads;
-- live TUI state;
-- OpenCode SQLite database;
-- recent logs.
+- live in-memory and event state;
+- OpenCode's `session.messages` API.
 
-The plugin merges that evidence best-effort. If none exists, rows are shown without token/context details.
+Persisted snapshots, OpenCode's local database, and recent log files are not recovery sources. If the live/API evidence is absent, rows are shown without token/context details.
 
 ## Fail-closed behavior
 
@@ -342,7 +340,7 @@ Update state
   ↓
 Normalize status/tokens/timestamps
   ↓
-Reconcile counters if needed
+Rebuild counters from observed real sessions
   ↓
 Render visible rows
   ↓

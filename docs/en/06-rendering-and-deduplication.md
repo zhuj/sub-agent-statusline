@@ -44,6 +44,8 @@ Deduplicating visible rows is not the same as counting executions.
 | Visual deduplication | `src/render.ts` | How many rows should the user see? |
 | Internal state | `StatuslineState.children` | What evidence does the plugin know? |
 
+Only observed real `ses_*` sessions count as executions. Synthetic `subtask:*` and `tool:*` rows may remain visible, correlate with a real session, or carry its navigation target, but they never increment `totalExecuted`.
+
 Example:
 
 ```txt
