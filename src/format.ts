@@ -4,6 +4,8 @@
  * (render.ts) and OpenTUI rendering (tui.tsx).
  */
 
+const EN_US_NUMBER_FORMAT = new Intl.NumberFormat("en-US");
+
 /**
  * Formats an elapsed-milliseconds value as `MM:SS` or `HH:MM:SS`.
  * Negative values clamp to zero. `undefined` is treated as zero.
@@ -27,7 +29,7 @@ export function formatDuration(elapsedMs: number | undefined): string {
  */
 export function formatNumber(value: number): string {
   const rounded = Math.round(value);
-  return Math.max(0, rounded).toLocaleString("en-US");
+  return EN_US_NUMBER_FORMAT.format(Math.max(0, rounded));
 }
 
 /**
