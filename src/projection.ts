@@ -291,8 +291,27 @@ export function filterVisibleFromCanonical(
   });
 }
 
+/**
+ * Per-state cache of {@link SubagentProjection} keyed by `StatuslineState`
+ * identity. The TUI produces a fresh state object per accepted event, so this
+ * cache effectively coalesces repeated projection rebuilds within the same
+ * event-handling tick (sidebar + home-bottom + status.txt + reconcile) and
+ * lets pure reads (sidebar subtree projection) reuse a single projection per
+ * state identity. Reclaimed automatically when the state is GC'd.
+ */
+const subagentProjectionCache = new WeakMap<
+  StatuslineState,
+  SubagentProjection
+>();
+
 export function buildSubagentProjection(
   state: StatuslineState,
 ): SubagentProjection {
-  return buildSubagentProjectionFromChildren(Object.values(state.children));
+  const cached = subagentProjectionCache.get(state);
+  if (cached !== undefined) return cached;
+  const projection = buildSubagentProjectionFromChildren(
+    Object.values(state.children),
+  );
+  subagentProjectionCache.set(state, projection);
+  return projection;
 }

@@ -1,6 +1,7 @@
 import {
   getSubagentLineageIndex,
   projectSubagentSubtree,
+  type SubagentLineageIndex,
   type SubagentSubtreeProjection,
 } from "./projection.js";
 import { byPriority } from "./render.js";
@@ -17,6 +18,37 @@ type CurrentRouteSubtreeBuilder = (
   sessionID: string,
 ) => CurrentRouteSubtreeProjection;
 
+/**
+ * Per-lineage-index cache of subtree projections keyed by rootSessionID.
+ * `getSubagentLineageIndex(state)` is itself a `WeakMap`-cached factory, so
+ * this cache effectively keys on `(state, rootSessionID)`. Reclaimed
+ * automatically when the lineage index is GC'd.
+ */
+const subtreeProjectionCache = new WeakMap<
+  SubagentLineageIndex,
+  Map<string, SubagentSubtreeProjection>
+>();
+
+function projectSubagentSubtreeCached(
+  index: SubagentLineageIndex,
+  rootSessionID: string,
+): SubagentSubtreeProjection {
+  let perRoot = subtreeProjectionCache.get(index);
+  if (!perRoot) {
+    perRoot = new Map();
+    subtreeProjectionCache.set(index, perRoot);
+  }
+  const cached = perRoot.get(rootSessionID);
+  if (cached) return cached;
+  const projection = projectSubagentSubtree({
+    index,
+    rootSessionID,
+    compareSiblings: byPriority,
+  });
+  perRoot.set(rootSessionID, projection);
+  return projection;
+}
+
 export function buildCurrentRouteSubtreeProjection(
   state: StatuslineState,
   sessionID: string,
@@ -24,11 +56,10 @@ export function buildCurrentRouteSubtreeProjection(
   return {
     state,
     sessionID,
-    subtree: projectSubagentSubtree({
-      index: getSubagentLineageIndex(state),
-      rootSessionID: sessionID,
-      compareSiblings: byPriority,
-    }),
+    subtree: projectSubagentSubtreeCached(
+      getSubagentLineageIndex(state),
+      sessionID,
+    ),
   };
 }
 

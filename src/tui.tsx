@@ -114,6 +114,7 @@ import {
   formatCompactTokenCount,
 } from "./format.js";
 import {
+  buildSubagentProjection,
   buildSubagentProjectionFromChildren,
   filterVisibleFromCanonical,
   type SubagentTreeRow,
@@ -1335,8 +1336,12 @@ export function resolveTuiSubagentSnapshot(input: {
   readonly showCompletedHistory?: boolean;
   readonly currentRouteProjection?: CurrentRouteSubtreeProjection;
 }): TuiSubagentSnapshot {
-  const options = { showCompletedHistory: input.showCompletedHistory };
+  // Note: `filterVisibleFromCanonical` accepts an options bag, but with one
+  // boolean field inlining the call is just as clear and skips an object
+  // allocation per snapshot. The visibility options are not shared across
+  // calls, so a fresh conditional is cheaper than constructing an object.
   const nowMs = input.nowMs ?? Date.now();
+  const showCompletedHistory = input.showCompletedHistory;
   if (input.sessionID) {
     const subtree =
       input.currentRouteProjection?.state === input.state &&
@@ -1344,11 +1349,11 @@ export function resolveTuiSubagentSnapshot(input: {
         ? input.currentRouteProjection.subtree
         : buildCurrentRouteSubtreeProjection(input.state, input.sessionID).subtree;
     const visibleChildren = new Set(
-      filterVisibleFromCanonical(
-        [...subtree.canonicalRows],
-        nowMs,
-        options,
-      ),
+      showCompletedHistory
+        ? [...subtree.canonicalRows]
+        : filterVisibleFromCanonical([...subtree.canonicalRows], nowMs, {
+            showCompletedHistory,
+          }),
     );
     let totalExecuted = 0;
     for (const executionID of subtree.executionIDs) {
@@ -1364,12 +1369,12 @@ export function resolveTuiSubagentSnapshot(input: {
     };
   }
 
-  const allChildren = Object.values(input.state.children);
-  const projection = buildSubagentProjectionFromChildren(allChildren);
-  const visibleChildren = filterVisibleFromCanonical(
-    projection.canonicalRows,
-    nowMs,
-    options,
+  const projection = buildSubagentProjection(input.state);
+  const visibleChildren = (showCompletedHistory
+    ? projection.canonicalRows
+    : filterVisibleFromCanonical(projection.canonicalRows, nowMs, {
+        showCompletedHistory,
+      })
   ).sort(byPriority);
   return {
     visibleRows: visibleChildren.map((child) => ({

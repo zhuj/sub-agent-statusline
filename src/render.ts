@@ -1,6 +1,6 @@
 import {
   buildCanonicalRows,
-  buildSubagentProjectionFromChildren,
+  buildSubagentProjection,
   filterVisibleFromCanonical,
   isVisibleWorkItem as projectionIsVisibleWorkItem,
   type VisibleSubagentWorkItemsOptions,
@@ -138,9 +138,7 @@ export function visibleSubagentWorkItems(
 }
 
 export function renderStatusLine(state: StatuslineState): string {
-  const projection = buildSubagentProjectionFromChildren(
-    Object.values(state.children),
-  );
+  const projection = buildSubagentProjection(state);
   const children = filterVisibleFromCanonical(projection.canonicalRows).sort(
     byPriority,
   );
