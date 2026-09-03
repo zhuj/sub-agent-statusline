@@ -10,18 +10,52 @@ describe("textColumns", () => {
     expect(textColumns("e\u0301")).toBe(1);
   });
 
-  it("counts ZWJ emoji sequences as a single grapheme column total", () => {
-    // Family ZWJ sequence (man + ZWJ + woman + ZWJ + girl + ZWJ + boy).
-    // Treated as one grapheme cluster; advancing by code-point still yields
-    // a small integer width, never a string-length-derived blow-up.
+  it("counts a family ZWJ grapheme as two terminal columns", () => {
+    // Given
     const family = "👨‍👩‍👧‍👦";
-    expect(textColumns(family)).toBeLessThan(family.length);
-    expect(textColumns(family)).toBeGreaterThanOrEqual(1);
+
+    // When
+    const columns = textColumns(family);
+
+    // Then
+    expect(columns).toBe(2);
+  });
+
+  it("counts an emoji modifier grapheme as two terminal columns", () => {
+    // Given
+    const thumbsUp = "👍🏽";
+
+    // When
+    const columns = textColumns(thumbsUp);
+
+    // Then
+    expect(columns).toBe(2);
   });
 
   it("counts regional-indicator flag emoji as a single two-column grapheme", () => {
     const flag = "🇦🇷";
     expect(textColumns(flag)).toBe(2);
+  });
+
+  it("counts a keycap grapheme as two terminal columns", () => {
+    // Given / When / Then
+    expect(textColumns("1️⃣")).toBe(2);
+  });
+
+  it("preserves ASCII and ambiguous-width characters as one column each", () => {
+    // Given / When / Then
+    expect(textColumns("A·Ω")).toBe(3);
+  });
+
+  it("distinguishes text and emoji presentation for pictographic symbols", () => {
+    // Given / When / Then
+    expect(textColumns("♥")).toBe(1);
+    expect(textColumns("♥️")).toBe(2);
+  });
+
+  it("keeps controls and standalone zero-width code points at zero columns", () => {
+    // Given / When / Then
+    expect(textColumns("\u0000\u001f\u007f\u200d")).toBe(0);
   });
 });
 
@@ -35,6 +69,40 @@ describe("takeColumns", () => {
     const result = takeColumns("🇦🇷hi", 4);
     expect(result.startsWith("🇦🇷")).toBe(true);
     expect(textColumns(result)).toBeLessThanOrEqual(4);
+  });
+
+  it("returns a complete family grapheme when it exactly fits", () => {
+    // Given / When
+    const result = takeColumns("👨‍👩‍👧‍👦x", 2);
+
+    // Then
+    expect(result).toBe("👨‍👩‍👧‍👦");
+  });
+
+  it("returns a complete emoji modifier grapheme when it exactly fits", () => {
+    // Given / When
+    const result = takeColumns("👍🏽x", 2);
+
+    // Then
+    expect(result).toBe("👍🏽");
+  });
+
+  it("keeps a regional-indicator flag atomic at its width boundary", () => {
+    // Given
+    const value = "🇦🇷x";
+
+    // When / Then
+    expect(takeColumns(value, 1)).toBe("");
+    expect(takeColumns(value, 2)).toBe("🇦🇷");
+  });
+
+  it("keeps a keycap grapheme atomic at its width boundary", () => {
+    // Given
+    const value = "1️⃣x";
+
+    // When / Then
+    expect(takeColumns(value, 1)).toBe("");
+    expect(takeColumns(value, 2)).toBe("1️⃣");
   });
 });
 

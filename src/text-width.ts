@@ -1,4 +1,11 @@
 const ELLIPSIS = "…";
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
+  granularity: "grapheme",
+});
+const WIDE_EMOJI_COMPONENT_PATTERN =
+  /[\p{Emoji_Presentation}\p{Regional_Indicator}\p{Emoji_Modifier}]|\u20e3/u;
+const EXTENDED_PICTOGRAPHIC_PATTERN = /\p{Extended_Pictographic}/u;
+const EMOJI_SEQUENCE_MARK_PATTERN = /[\ufe0f\u200d]/u;
 
 function isCombiningCodePoint(codePoint: number): boolean {
   return (
@@ -44,9 +51,25 @@ function characterWidth(character: string): number {
   return isWideCodePoint(codePoint) ? 2 : 1;
 }
 
+function graphemeWidth(grapheme: string): number {
+  if (
+    WIDE_EMOJI_COMPONENT_PATTERN.test(grapheme) ||
+    (EXTENDED_PICTOGRAPHIC_PATTERN.test(grapheme) &&
+      EMOJI_SEQUENCE_MARK_PATTERN.test(grapheme))
+  ) {
+    return 2;
+  }
+
+  let columns = 0;
+  for (const character of grapheme) columns += characterWidth(character);
+  return columns;
+}
+
 export function textColumns(value: string): number {
   let columns = 0;
-  for (const character of value) columns += characterWidth(character);
+  for (const { segment } of GRAPHEME_SEGMENTER.segment(value)) {
+    columns += graphemeWidth(segment);
+  }
   return columns;
 }
 
@@ -55,11 +78,11 @@ export function takeColumns(value: string, maxColumns: number): string {
 
   let columns = 0;
   let result = "";
-  for (const character of value) {
-    const width = characterWidth(character);
+  for (const { segment } of GRAPHEME_SEGMENTER.segment(value)) {
+    const width = graphemeWidth(segment);
     if (columns + width > maxColumns) break;
     columns += width;
-    result += character;
+    result += segment;
   }
   return result;
 }
