@@ -33,17 +33,18 @@ En la TUI, el plugin puede mostrar:
 - resumen agregado en la pantalla de inicio;
 - navegación hacia la sesión hija real cuando existe un `sessionID` navegable.
 
-## Las dos superficies públicas
+La TUI hidrata tokens/contexto desde el estado vivo en memoria y los eventos, junto con `session.messages`. Los snapshots persistidos, la base de datos local de OpenCode y los archivos de log recientes no son fuentes de recuperación.
 
-El paquete publica dos entrypoints:
+## Entrypoints públicos
 
-| Entrypoint                             | Fuente         | Uso principal                                                                            |
-| -------------------------------------- | -------------- | ---------------------------------------------------------------------------------------- |
-| `opencode-subagent-statusline`         | `src/tui.tsx`  | Plugin TUI principal. Es el camino recomendado para usuarios.                            |
-| `opencode-subagent-statusline/tui`     | `src/tui.tsx`  | Alias explícito del plugin TUI.                                                          |
-| `opencode-subagent-statusline/runtime` | `src/index.ts` | Plugin runtime/file-based avanzado. Procesa eventos y escribe `state.json`/`status.txt`. |
+El paquete soporta estos dos entrypoints TUI:
 
-El README actual se concentra en el modo TUI, que es la experiencia principal del paquete.
+| Entrypoint | Fuente | Uso principal |
+| --- | --- | --- |
+| `opencode-subagent-statusline` | `src/tui.tsx` | Plugin TUI principal. Es el camino recomendado para usuarios. |
+| `opencode-subagent-statusline/tui` | `src/tui.tsx` | Alias explícito del mismo plugin TUI. |
+
+Ambos entrypoints cargan el mismo plugin TUI soportado.
 
 ## Cómo funciona a alto nivel
 
@@ -53,8 +54,9 @@ El flujo general es este:
 OpenCode event
   -> src/events.ts
   -> src/state.ts
+  -> src/projection.ts
   -> src/render.ts
-  -> src/tui.tsx o src/index.ts
+  -> src/tui.tsx
   -> sidebar / home footer / status.txt
 ```
 
@@ -83,9 +85,9 @@ OpenCode puede representar el trabajo delegado de varias formas:
 
 | Source interno | Qué representa                                            | Cuenta como ejecución          |
 | -------------- | --------------------------------------------------------- | ------------------------------ |
-| `session`      | Una sesión hija real de OpenCode.                         | Sí, una vez.                   |
-| `subtask`      | Una subtarea sintética derivada de partes de mensaje.     | Puede contar provisionalmente. |
-| `tool`         | Wrapper técnico de herramientas como `task` o `delegate`. | No.                            |
+| `session`      | Una sesión hija real de OpenCode.                         | Sí, una vez. |
+| `subtask`      | Una subtarea sintética derivada de partes de mensaje.     | No. Puede correlacionarse con una sesión real posterior. |
+| `tool`         | Wrapper técnico de herramientas como `task` o `delegate`. | No. |
 
 Por eso el plugin separa tres cosas:
 
@@ -93,7 +95,7 @@ Por eso el plugin separa tres cosas:
 2. **Filas visibles**: lo que conviene mostrar después de colapsar duplicados.
 3. **Total ejecutado**: el conteo semántico de trabajo real.
 
-Una fila visible no siempre equivale a una ejecución. Un wrapper `tool:*` puede aportar evidencia de estado, pero no debe inflar `totalExecuted`.
+Una fila visible no siempre equivale a una ejecución. Las filas sintéticas `subtask:*` y `tool:*` pueden aportar evidencia de visualización, estado, correlación o navegación, pero nunca entran en `countedChildIDs` ni incrementan `totalExecuted`. Solo cuenta una sesión real `ses_*` observada, una vez.
 
 ## Diseño defensivo
 
@@ -118,8 +120,8 @@ El núcleo determinístico tiene buena cobertura de tests:
 - contadores y deduplicación;
 - render textual;
 - reconciliación conservadora;
-- comandos/keybindings básicos;
-- persistencia del runtime plugin.
+- proyección, descubrimiento y filas de árbol a toda profundidad;
+- comandos, keybindings y persistencia propia de la TUI.
 
 El límite actual es la UI visual completa dentro del host OpenCode/OpenTUI: no hay automatización E2E profunda de la TUI. Para cambios visuales, el proyecto recomienda smoke tests manuales además de los tests automatizados.
 

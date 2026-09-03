@@ -12,28 +12,27 @@ src/events.ts
         ↓
 src/state.ts
         ↓
+src/projection.ts
+        ↓
 src/render.ts
         ↓
-┌──────────────────────┬──────────────────────┐
-│ src/tui.tsx          │ src/index.ts          │
-│ Plugin TUI principal │ Plugin runtime        │
-│ Sidebar / footer     │ state.json/status.txt │
-└──────────────────────┴──────────────────────┘
+src/tui.tsx
+Plugin TUI principal
+Sidebar / footer / snapshots locales
 ```
 
 ## Mapa de módulos
 
 | Archivo                          | Responsabilidad                                                                                        |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `src/tui.tsx`                    | Plugin TUI principal: slots, sidebar, footer, hidratación, reconciliación, navegación y ciclo de vida. |
-| `src/index.ts`                   | Plugin runtime/file-based: escucha eventos, persiste estado y escribe `status.txt`.                    |
+| `src/tui.tsx`                    | Plugin TUI principal: slots, sidebar, footer, hidratación a toda profundidad, reconciliación, navegación, persistencia y ciclo de vida. |
 | `src/events.ts`                  | Convierte eventos de OpenCode en mutaciones del estado interno.                                        |
 | `src/state.ts`                   | Define el modelo de datos, contadores, persistencia y helpers de mutación.                             |
+| `src/projection.ts`              | Construye el índice de linaje en caché, las filas del subárbol, sus profundidades y contadores.       |
 | `src/render.ts`                  | Formatea filas, colapsa duplicados, filtra visibilidad y arma el statusline textual.                   |
 | `src/reconcile.ts`               | Normaliza estados de OpenCode y ayuda a cerrar casos `running` viejos de forma segura.                 |
 | `src/tui-commands.ts`            | Registra comandos y keybindings, especialmente `Alt+B`.                                                |
 | `src/*.test.ts`                  | Tests unitarios del núcleo determinístico.                                                             |
-| `test/index.integration.test.ts` | Tests de integración del plugin runtime y persistencia en filesystem.                                  |
 
 ## Entrypoints
 
@@ -41,7 +40,7 @@ src/render.ts
 
 Fuente: `src/tui.tsx`
 
-Es el entrypoint principal del paquete:
+Es el único endpoint de plugin soportado por el paquete, disponible mediante dos entrypoints:
 
 ```txt
 opencode-subagent-statusline
@@ -58,26 +57,8 @@ Responsabilidades principales:
 - registrar comandos y atajos;
 - hidratar subagentes existentes al navegar entre sesiones;
 - reconciliar estados viejos que quedaron como `running`;
-- persistir snapshots auxiliares de estado.
-
-### Runtime plugin
-
-Fuente: `src/index.ts`
-
-Se publica como:
-
-```txt
-opencode-subagent-statusline/runtime
-```
-
-Este modo es más bajo nivel. No renderiza la sidebar TUI. En cambio:
-
-1. inicializa rutas de estado;
-2. procesa eventos;
-3. guarda `state.json`;
-4. escribe `status.txt` con el render textual.
-
-Es útil para entender el núcleo del proyecto porque usa el mismo pipeline de eventos, estado y renderizado, pero sin la capa visual de `src/tui.tsx`.
+- persistir los snapshots TUI `state.json` y `status.txt`;
+- escribir `tui-events.log` cuando está activo el diagnóstico de eventos.
 
 ## Modelo interno
 
@@ -123,7 +104,7 @@ El plugin necesita distinguir de dónde viene cada work item.
 | Source    | Origen típico                                             | Uso                                                        |
 | --------- | --------------------------------------------------------- | ---------------------------------------------------------- |
 | `session` | Eventos `session.*` de OpenCode con una sesión hija real. | Es la fuente más fuerte. Cuenta como ejecución real.       |
-| `subtask` | Partes de mensaje que describen una subtarea.             | Sirve como fallback temprano o provisional.                |
+| `subtask` | Partes de mensaje que describen una subtarea.             | Aporta evidencia temprana o provisional de visualización y correlación, pero no cuenta como ejecución. |
 | `tool`    | Tool calls como `task` o `delegate`.                      | Aporta evidencia de estado, pero no cuenta como ejecución. |
 
 Esta separación existe porque OpenCode puede avisar primero sobre un wrapper técnico y después revelar la sesión real, o puede emitir información incompleta en distintos eventos.
@@ -154,17 +135,17 @@ El objetivo de `events.ts` no es renderizar. Su trabajo es transformar señales 
 - marcar hijos como `done` o `error`;
 - mezclar detalles como título, resumen, agente y tokens;
 - refrescar duración y campos derivados;
-- persistir y cargar estado;
+- persistir snapshots TUI de estado y texto;
 - podar hijos terminales viejos;
 - mantener `totalExecuted` sin duplicados.
 
 Reglas críticas:
 
-- los wrappers `source: "tool"` no incrementan contadores;
-- las sesiones reales cuentan una sola vez;
-- los subtasks pueden contar como fallback;
-- si luego aparece una sesión real, el conteo se reconcilia hacia esa sesión;
-- el estado cargado desde disco se normaliza para evitar identidades duplicadas.
+- las filas sintéticas `source: "tool"` y `source: "subtask"` no entran en `countedChildIDs` ni incrementan `totalExecuted`;
+- cada sesión real `ses_*` observada cuenta una sola vez;
+- un subtask puede aparecer antes, correlacionarse con una sesión real posterior y permitir navegar hacia ella sin contarse a sí mismo;
+- cuando aparece la sesión real, su identidad `ses_*` es la única que entra en los contadores de ejecución;
+- los snapshots persistidos mantienen disponible el estado compartido y el render textual, pero no aportan evidencia de tokens.
 
 ## Renderizado
 
@@ -172,11 +153,11 @@ Reglas críticas:
 
 Antes de mostrar algo:
 
-1. ordena por prioridad/recencia;
-2. colapsa duplicados;
-3. fusiona datos útiles de sesión real hacia filas sintéticas cuando corresponde;
-4. filtra `done` viejos;
-5. conserva errores y running visibles;
+1. selecciona el subárbol completo de descendientes retenidos;
+2. colapsa duplicados y correlaciona sesiones reales con filas provisionales;
+3. ordena hermanos con las reglas actuales de prioridad;
+4. emite padres antes que hijos y asigna una profundidad a cada fila;
+5. filtra `done` viejos mientras conserva errores y elementos `running` visibles;
 6. arma el resumen agregado.
 
 Esto explica por qué puede haber más children en el estado que filas visibles en la UI.
@@ -204,7 +185,7 @@ Los slots de prompt se usan para preservar referencias de foco y compatibilidad 
 
 ### 3. Sidebar
 
-La sidebar muestra solo subagentes relacionados con la sesión actual. El resumen de home y el render textual/status-file siguen siendo globales entre sesiones.
+La sidebar muestra el árbol completo de descendientes retenidos de la sesión actual. El resumen de home y el render textual de `status.txt` siguen siendo globales entre sesiones.
 
 Soporta:
 
@@ -217,9 +198,9 @@ Soporta:
 
 ### 4. Hydration
 
-Cuando se navega a una sesión, el plugin intenta reconstruir subagentes previos consultando APIs de OpenCode como sesiones hijas, mensajes y estados.
+Cuando se navega a una sesión, el plugin recorre `session.children(parentID)` de forma iterativa desde la sesión visible. La búsqueda en anchura usa concurrencia fija, consulta cada ID real una sola vez y sigue por todas las profundidades descubiertas. Un conjunto de visitados evita ciclos y consultas duplicadas. Un cambio de ruta o una cancelación detiene el trabajo obsoleto.
 
-Esto permite que la UI no dependa solamente de eventos vistos en vivo desde que cargó el plugin.
+La proyección de linaje compartida selecciona una vez el subárbol completo para cada snapshot inmutable. Correlaciona duplicados, ordena hermanos por prioridad y emite un recorrido en profundidad con cada padre antes que sus hijos. Solo las relaciones de sesiones reales pueden extender el linaje. Los targets sintéticos sirven para correlación y navegación, nunca como evidencia de ascendencia.
 
 ### 5. Reconciliación
 
@@ -229,14 +210,7 @@ La reconciliación no cierra todo por timeout. Primero busca evidencia en estado
 
 ### 6. Tokens/contexto
 
-La hidratación de tokens es best-effort. Puede venir de:
-
-- payloads de eventos;
-- estado vivo de la TUI;
-- base SQLite de OpenCode;
-- logs recientes.
-
-Si no se consigue información, la UI sigue funcionando sin mostrar esos datos.
+La hidratación de tokens usa únicamente el estado vivo de la TUI y la API `session.messages`. La base de datos local, `state.json`, `status.txt` y los archivos de log no se usan para recuperar evidencia de tokens. Si OpenCode no expone esa información, la UI sigue funcionando sin mostrar esos datos.
 
 ## Reconciliación de estados
 
@@ -282,8 +256,10 @@ Los tests no son solo verificación; también documentan decisiones de diseño.
 | `src/state.test.ts`              | Contadores, persistencia, normalización y reglas de sources. |
 | `src/render.test.ts`             | Collapse, visibilidad, formato y resumen agregado.           |
 | `src/reconcile.test.ts`          | Normalización de estados y reconciliación conservadora.      |
-| `src/tui.test.ts`                | Registro de comandos/keybindings.                            |
-| `test/index.integration.test.ts` | Runtime plugin, archivos de estado y tolerancia a errores.   |
+| `src/projection.test.ts`         | Linaje a toda profundidad, correlación, orden, contadores y seguridad ante ciclos. |
+| `src/tui-descendant-hydration.test.ts` | Descubrimiento iterativo acotado, cancelación, batch único y respuestas fail-closed. |
+| `src/tui-tree-row.test.ts`       | Indentación por profundidad, ajuste en ancho estrecho y navegación anidada. |
+| `src/tui.test.ts`                | Ciclo de vida TUI, persistencia, comandos, keybindings y seams de integración. |
 
 Límite actual: la UI visual completa de `src/tui.tsx` no tiene E2E profundo contra el host OpenCode/OpenTUI.
 
@@ -292,7 +268,7 @@ Límite actual: la UI visual completa de `src/tui.tsx` no tiene E2E profundo con
 | Archivo                         | Rol                                                             |
 | ------------------------------- | --------------------------------------------------------------- |
 | `package.json`                  | Nombre del paquete, exports, scripts, peers y metadatos de release. |
-| `tsup.config.ts`                | Build dual: runtime y TUI.                                      |
+| `tsup.config.ts`                | Build TUI único que genera `dist/tui.js` y `dist/tui.d.ts`.     |
 | `tsconfig.json`                 | TypeScript base para source.                                    |
 | `tsconfig.test.json`            | TypeScript para tests.                                          |
 | `vitest.config.ts`              | Vitest, coverage y setup.                                       |

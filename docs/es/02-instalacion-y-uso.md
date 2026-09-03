@@ -92,12 +92,14 @@ El total mostrado como `Σ total` no es una suma de filas visibles.
 
 Representa ejecuciones reales de subagentes.
 
+Solo las sesiones reales `ses_*` observadas aportan a este total. Las filas sintéticas `subtask:*` y `tool:*` pueden ser visibles o estar correlacionadas, pero agregan cero ejecuciones.
+
 Por eso estas situaciones son normales:
 
 | Situación                                                | Resultado correcto                 |
 | -------------------------------------------------------- | ---------------------------------- |
-| Un wrapper `task` y una sesión real representan lo mismo | Cuenta 1.                          |
-| Hay tres entradas internas pero una sola fila visible    | Puede contar 1.                    |
+| Un wrapper `task` y una sesión real representan lo mismo | La sesión real `ses_*` cuenta 1; el wrapper cuenta 0. |
+| Tres entradas correlacionadas producen una fila visible e incluyen una sesión real | Solo cuenta la sesión real `ses_*`, por lo que el total es 1. |
 | Un `done` viejo ya no se ve                              | El total histórico no baja.        |
 | Tokens/contexto no aparecen                              | La fila se muestra sin esos datos. |
 
@@ -134,14 +136,14 @@ Si la fila viene solo de un wrapper técnico o de una subtarea sin sesión conoc
 
 ## Tokens y contexto
 
-El plugin muestra tokens/contexto solo cuando consigue evidencia confiable.
+La TUI muestra tokens/contexto solo cuando consigue evidencia confiable.
 
-Puede obtenerla desde:
+La hidratación usa:
 
-- payloads de eventos;
-- estado vivo de la TUI;
-- base SQLite de OpenCode;
-- logs recientes.
+- estado vivo en memoria y eventos;
+- la API `session.messages` de OpenCode.
+
+Los snapshots persistidos, la base de datos local de OpenCode y los archivos de log recientes no son fuentes de recuperación.
 
 Si OpenCode no expone esos datos, el plugin omite la información sin romper la fila.
 
@@ -176,7 +178,7 @@ Después reiniciá OpenCode.
 
 ### No veo tokens/contexto
 
-Eso puede ser normal. La disponibilidad depende de lo que OpenCode exponga en eventos, estado, SQLite o logs.
+Eso puede ser normal. La disponibilidad depende de lo que OpenCode exponga en el estado vivo en memoria, los eventos y `session.messages`; los snapshots persistidos, la base de datos local y los archivos de log recientes no son fuentes de recuperación.
 
 El plugin está diseñado para seguir funcionando aunque esa información falte.
 
