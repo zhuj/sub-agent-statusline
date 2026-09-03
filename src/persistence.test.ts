@@ -17,6 +17,32 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
+type MergeSnapshot = {
+  readonly state: string;
+  readonly changedChildIDs?: readonly string[];
+};
+
+function combineSnapshots(
+  accumulated: MergeSnapshot,
+  incoming: MergeSnapshot,
+): MergeSnapshot {
+  if (
+    accumulated.changedChildIDs === undefined ||
+    incoming.changedChildIDs === undefined
+  ) {
+    return { state: incoming.state };
+  }
+  return {
+    state: incoming.state,
+    changedChildIDs: [
+      ...new Set([
+        ...accumulated.changedChildIDs,
+        ...incoming.changedChildIDs,
+      ]),
+    ],
+  };
+}
+
 describe("persistence coordinator", () => {
   test("coalesces ordinary snapshots to the latest pending generation", async () => {
     const firstWrite = deferred<void>();
@@ -144,5 +170,107 @@ describe("persistence coordinator", () => {
     void coordinator.request("a");
     await coordinator.flush("b");
     expect(writes).toEqual(["b"]);
+  });
+
+  test("combines superseded ordinary snapshots into the newest pending item", async () => {
+    // Given
+    const writes: MergeSnapshot[] = [];
+    const coordinator = createPersistenceCoordinator<MergeSnapshot>(
+      async (snapshot) => {
+        writes.push(snapshot);
+      },
+      { settleDelayMs: 20, combineSnapshots },
+    );
+
+    // When
+    const first = coordinator.request({ state: "A", changedChildIDs: ["a"] });
+    const second = coordinator.request({ state: "B", changedChildIDs: ["b"] });
+    await Promise.all([first, second]);
+
+    // Then
+    expect(writes).toEqual([
+      { state: "B", changedChildIDs: ["a", "b"] },
+    ]);
+  });
+
+  test("combines a delayed ordinary snapshot into an immediate flush", async () => {
+    // Given
+    const writes: MergeSnapshot[] = [];
+    const coordinator = createPersistenceCoordinator<MergeSnapshot>(
+      async (snapshot) => {
+        writes.push(snapshot);
+      },
+      { settleDelayMs: 50, combineSnapshots },
+    );
+    const ordinary = coordinator.request({
+      state: "A",
+      changedChildIDs: ["a"],
+    });
+
+    // When
+    const flush = coordinator.flush({ state: "B", changedChildIDs: ["b"] });
+
+    // Then
+    expect(writes).toEqual([
+      { state: "B", changedChildIDs: ["a", "b"] },
+    ]);
+    await Promise.all([ordinary, flush]);
+  });
+
+  test("combines superseded flush snapshots while another write is in flight", async () => {
+    // Given
+    const blocker = deferred<void>();
+    const writes: MergeSnapshot[] = [];
+    const coordinator = createPersistenceCoordinator<MergeSnapshot>(
+      async (snapshot) => {
+        writes.push(snapshot);
+        if (snapshot.state === "blocker") await blocker.promise;
+      },
+      { combineSnapshots },
+    );
+    const inFlight = coordinator.request({
+      state: "blocker",
+      changedChildIDs: ["blocker"],
+    });
+    const firstFlush = coordinator.flush({
+      state: "A",
+      changedChildIDs: ["a"],
+    });
+
+    // When
+    const secondFlush = coordinator.flush({
+      state: "B",
+      changedChildIDs: ["b"],
+    });
+    blocker.resolve(undefined);
+    await Promise.all([inFlight, firstFlush, secondFlush]);
+
+    // Then
+    expect(writes).toEqual([
+      { state: "blocker", changedChildIDs: ["blocker"] },
+      { state: "B", changedChildIDs: ["a", "b"] },
+    ]);
+  });
+
+  test("lets an accumulated full refresh dominate a newer finite ID list", async () => {
+    // Given
+    const writes: MergeSnapshot[] = [];
+    const coordinator = createPersistenceCoordinator<MergeSnapshot>(
+      async (snapshot) => {
+        writes.push(snapshot);
+      },
+      { settleDelayMs: 20, combineSnapshots },
+    );
+
+    // When
+    const fullRefresh = coordinator.request({ state: "A" });
+    const finiteRefresh = coordinator.request({
+      state: "B",
+      changedChildIDs: ["b"],
+    });
+    await Promise.all([fullRefresh, finiteRefresh]);
+
+    // Then
+    expect(writes).toEqual([{ state: "B" }]);
   });
 });

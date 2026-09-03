@@ -16,7 +16,7 @@ export type PersistenceCoordinator<Snapshot> = {
   close(): void;
 };
 
-export type PersistenceCoordinatorOptions = {
+export type PersistenceCoordinatorOptions<Snapshot> = {
   /**
    * Delay before the first write of an ordinary (non-flush) request. When
    * non-zero, `request()` waits this long before pumping so a burst of
@@ -24,11 +24,15 @@ export type PersistenceCoordinatorOptions = {
    * Flushes always pump immediately. Defaults to 0 for backwards compat.
    */
   readonly settleDelayMs?: number;
+  readonly combineSnapshots?: (
+    accumulated: Snapshot,
+    incoming: Snapshot,
+  ) => Snapshot;
 };
 
 export function createPersistenceCoordinator<Snapshot>(
   writer: PersistenceWriter<Snapshot>,
-  options: PersistenceCoordinatorOptions = {},
+  options: PersistenceCoordinatorOptions<Snapshot> = {},
 ): PersistenceCoordinator<Snapshot> {
   const settleDelayMs = options.settleDelayMs ?? 0;
   let nextGeneration = 0;
@@ -37,6 +41,14 @@ export function createPersistenceCoordinator<Snapshot>(
   let pendingOrdinary: PersistenceJob<Snapshot> | undefined;
   let pendingFlush: PersistenceJob<Snapshot> | undefined;
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const combineSnapshots = (
+    accumulated: Snapshot,
+    incoming: Snapshot,
+  ): Snapshot =>
+    options.combineSnapshots === undefined
+      ? incoming
+      : options.combineSnapshots(accumulated, incoming);
 
   const clearSettleTimer = (): void => {
     if (settleTimer !== undefined) {
@@ -96,6 +108,22 @@ export function createPersistenceCoordinator<Snapshot>(
     if (closed) return Promise.resolve();
 
     const generation = ++nextGeneration;
+    let queuedSnapshot = snapshot;
+    if (flush) {
+      const supersededJobs: Array<PersistenceJob<Snapshot>> = [];
+      if (pendingFlush !== undefined) supersededJobs.push(pendingFlush);
+      if (pendingOrdinary !== undefined) supersededJobs.push(pendingOrdinary);
+      supersededJobs.sort((left, right) => right.generation - left.generation);
+      for (const supersededJob of supersededJobs) {
+        queuedSnapshot = combineSnapshots(
+          supersededJob.snapshot,
+          queuedSnapshot,
+        );
+      }
+    } else if (pendingOrdinary !== undefined) {
+      queuedSnapshot = combineSnapshots(pendingOrdinary.snapshot, snapshot);
+    }
+
     let resolveJob: () => void = () => undefined;
     let rejectJob: (reason: unknown) => void = () => undefined;
     const completion = new Promise<void>((resolve, reject) => {
@@ -103,7 +131,7 @@ export function createPersistenceCoordinator<Snapshot>(
       rejectJob = reject;
     });
     const job: PersistenceJob<Snapshot> = {
-      snapshot,
+      snapshot: queuedSnapshot,
       generation,
       resolve: resolveJob,
       reject: rejectJob,
