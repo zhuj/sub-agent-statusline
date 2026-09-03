@@ -1,12 +1,11 @@
 import { afterEach, vi } from "vitest";
 import { __resetLocaleForTests } from "../src/i18n.js";
-import { cleanupRegisteredTempDirs } from "./helpers/runtime-harness.js";
+import { cleanupRegisteredTempDirs } from "./helpers/test-harness.js";
 
 const envKeys = [
   "NO_COLOR",
   "OPENCODE_SUBAGENT_STATUSLINE_COLOR",
   "OPENCODE_SUBAGENT_STATUSLINE_INSTANCE",
-  "OPENCODE_SUBAGENT_STATUSLINE_PRESERVE_STATE",
   "OPENCODE_SUBAGENT_STATUSLINE_STATE",
   "OPENCODE_SUBAGENT_STATUSLINE_STALE_RUNNING_MS",
   "OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS",
