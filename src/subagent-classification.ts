@@ -32,7 +32,9 @@ export interface CorrelatedSubagentExecution<
 }
 
 export function isRealSessionID(value: string | undefined): value is string {
-  return typeof value === "string" && value.startsWith("ses_");
+  return (
+    typeof value === "string" && value.startsWith("ses_") && value.length > 4
+  );
 }
 
 export function isTrustedTargetSessionID(
