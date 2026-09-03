@@ -507,6 +507,45 @@ describe("state", () => {
     });
   });
 
+  it("returns an isolated normalized snapshot without mutating the caller", async () => {
+    // Given
+    const harness = await createFileHarness();
+    const state = createEmptyState();
+    state.children.ses_child = child({
+      color: "red",
+      tokens: { input: 4, output: 6, contextPercent: 12.5 },
+      model: {
+        providerID: " openai ",
+        modelID: " gpt-5.6 ",
+        variant: " high ",
+      },
+    });
+
+    // When
+    const prepared = await saveState(harness.statePath, state);
+
+    // Then
+    expect(prepared).not.toBe(state);
+    expect(prepared.children.ses_child).toMatchObject({
+      color: "yellow",
+      tokens: { input: 4, output: 6, contextPercent: 12.5 },
+      model: {
+        providerID: "openai",
+        modelID: "gpt-5.6",
+        variant: "high",
+      },
+    });
+    expect(state.children.ses_child).toMatchObject({
+      color: "red",
+      tokens: { input: 4, output: 6, contextPercent: 12.5 },
+      model: {
+        providerID: " openai ",
+        modelID: " gpt-5.6 ",
+        variant: " high ",
+      },
+    });
+  });
+
   it("writes state and text snapshots atomically with owner-only file modes", async () => {
     const harness = await createFileHarness();
     const state = createEmptyState();

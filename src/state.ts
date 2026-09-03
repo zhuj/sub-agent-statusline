@@ -648,13 +648,33 @@ export async function saveStatusText(
   await writeLocalStatusFile(textPath, contents);
 }
 
+function cloneStateForPersistence(state: StatuslineState): StatuslineState {
+  return {
+    updatedAt: state.updatedAt,
+    totalExecuted: state.totalExecuted,
+    countedChildIDs: { ...state.countedChildIDs },
+    children: Object.fromEntries(
+      Object.entries(state.children).map(([id, child]) => [
+        id,
+        {
+          ...child,
+          tokens: child.tokens ? { ...child.tokens } : undefined,
+          model: child.model ? { ...child.model } : undefined,
+        },
+      ]),
+    ),
+  };
+}
+
 export async function saveState(
   statePath: string,
   state: StatuslineState,
   options: { readonly changedChildIDs?: readonly string[] } = {},
-): Promise<void> {
-  refreshStateForSnapshot(state, options.changedChildIDs);
-  await writeLocalStatusFile(statePath, JSON.stringify(state));
+): Promise<StatuslineState> {
+  const prepared = cloneStateForPersistence(state);
+  refreshStateForSnapshot(prepared, options.changedChildIDs);
+  await writeLocalStatusFile(statePath, JSON.stringify(prepared));
+  return prepared;
 }
 
 // Differential refresh: re-derive fields for `changedChildIDs` only (or every
