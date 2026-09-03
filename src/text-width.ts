@@ -37,20 +37,6 @@ function isWideCodePoint(codePoint: number): boolean {
   );
 }
 
-function characterWidth(character: string): number {
-  const codePoint = character.codePointAt(0);
-  if (codePoint === undefined) return 0;
-  if (
-    codePoint === 0 ||
-    codePoint < 0x20 ||
-    (codePoint >= 0x7f && codePoint < 0xa0)
-  ) {
-    return 0;
-  }
-  if (codePoint === 0x200d || isCombiningCodePoint(codePoint)) return 0;
-  return isWideCodePoint(codePoint) ? 2 : 1;
-}
-
 function graphemeWidth(grapheme: string): number {
   if (
     WIDE_EMOJI_COMPONENT_PATTERN.test(grapheme) ||
@@ -61,8 +47,33 @@ function graphemeWidth(grapheme: string): number {
   }
 
   let columns = 0;
-  for (const character of grapheme) columns += characterWidth(character);
+  // Iterate by code point, not by UTF-16 code unit, so multi-codepoint
+  // graphemes (skin-tone emoji, flag sequences) are measured correctly.
+  for (const codePoint of codePointsOf(grapheme)) {
+    columns += codePointWidth(codePoint);
+  }
   return columns;
+}
+
+function* codePointsOf(value: string): Generator<number> {
+  for (let index = 0; index < value.length; ) {
+    const codePoint = value.codePointAt(index);
+    if (codePoint === undefined) break;
+    yield codePoint;
+    index += codePoint > 0xffff ? 2 : 1;
+  }
+}
+
+function codePointWidth(codePoint: number): number {
+  if (
+    codePoint === 0 ||
+    codePoint < 0x20 ||
+    (codePoint >= 0x7f && codePoint < 0xa0)
+  ) {
+    return 0;
+  }
+  if (codePoint === 0x200d || isCombiningCodePoint(codePoint)) return 0;
+  return isWideCodePoint(codePoint) ? 2 : 1;
 }
 
 export function textColumns(value: string): number {
