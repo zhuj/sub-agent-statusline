@@ -64,6 +64,15 @@ function* codePointsOf(value: string): Generator<number> {
   }
 }
 
+/**
+ * Returns the column width of a single Unicode code point.
+ *
+ * Performance note: this is implemented as an explicit `||` chain of
+ * numeric range checks rather than a single regex (`/[\u{1100}-\u{115F}\u{2329}\u{232A}…]/u`).
+ * Benchmarks show the explicit form is significantly faster on V8 for
+ * short ASCII-heavy strings (the common case for sidebar titles). Do not
+ * "modernize" this to a regex without re-measuring the per-row render cost.
+ */
 function codePointWidth(codePoint: number): number {
   if (
     codePoint === 0 ||

@@ -241,6 +241,12 @@ interface SidebarCompletedHistoryRegistration {
   toggleCompletedHistory: () => boolean;
 }
 
+// Module-level sidebar registration sets. Today the TUI mounts exactly one
+// `SidebarSubagents` instance (inside the `sidebar_content` slot), so these
+// sets hold at most one entry each and `onCleanup` removes that entry on
+// dispose. If multiple instances ever need to coexist in the future, switch
+// these to `WeakRef<SidebarScrollRegistration>[]` (or per-instance closures
+// lookups) to avoid leaking across disposes.
 const sidebarScrollRegistrations = new Set<SidebarScrollRegistration>();
 const sidebarListFocusRegistrations = new Set<SidebarListFocusRegistration>();
 const sidebarCompletedHistoryRegistrations =
