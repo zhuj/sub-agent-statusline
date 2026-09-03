@@ -22,10 +22,6 @@
     "./tui": {
       "types": "./dist/tui.d.ts",
       "import": "./dist/tui.js"
-    },
-    "./runtime": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
     }
   },
   "files": [
