@@ -16,10 +16,9 @@ import { useKeyboard } from "@opentui/solid";
 import {
   appendFileSync,
   chmodSync,
-  closeSync,
-  fchmodSync,
   mkdirSync,
-  openSync,
+  renameSync,
+  statSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -99,6 +98,7 @@ import {
   refreshDerivedFields,
   resolveStatePath,
   resolveTextPath,
+  sameChildModel,
   sameTokens,
   saveState,
   saveStatusText,
@@ -404,27 +404,76 @@ export interface RunningReconcileCandidate extends RunningReconcileVersion {
   readonly updatedMs: number;
 }
 
+const DEBUG_LOG_DEFAULT_MAX_BYTES = 1_048_576; // 1 MiB
+const DEBUG_LOG_MIN_MAX_BYTES = 16_384; // 16 KiB
+
+function resolveDebugLogMaxBytes(): number {
+  const raw = process.env.OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS_MAX_BYTES;
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    return DEBUG_LOG_DEFAULT_MAX_BYTES;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < DEBUG_LOG_MIN_MAX_BYTES) {
+    return DEBUG_LOG_DEFAULT_MAX_BYTES;
+  }
+  return parsed;
+}
+
+function resolveDebugLogPath(): string {
+  return join(
+    process.env.XDG_RUNTIME_DIR ?? os.tmpdir(),
+    "opencode-subagent-statusline",
+    "tui-events.log",
+  );
+}
+
+let cachedDebugLogMaxBytes: number | undefined;
+
 function debugLog(input: Record<string, unknown>): void {
   if (!process.env.OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS) return;
   try {
-    const path = join(
-      process.env.XDG_RUNTIME_DIR ?? os.tmpdir(),
-      "opencode-subagent-statusline",
-      "tui-events.log",
-    );
+    const path = resolveDebugLogPath();
+    const maxBytes =
+      cachedDebugLogMaxBytes ??
+      (cachedDebugLogMaxBytes = resolveDebugLogMaxBytes());
     const directory = dirname(path);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     chmodSync(directory, 0o700);
-    const file = openSync(path, "a", 0o600);
-    try {
-      fchmodSync(file, 0o600);
-      const line = JSON.stringify({ time: new Date().toISOString(), ...input });
-      appendFileSync(file, `${line}\n`, "utf8");
-    } finally {
-      closeSync(file);
-    }
+    const line = `${JSON.stringify({ time: new Date().toISOString(), ...input })}\n`;
+    appendFileSync(path, line, { encoding: "utf8", mode: 0o600 });
+    // appendFileSync's `mode` option only applies on creation; repair any
+    // pre-existing file with a permissive mode.
+    repairDebugLogMode(path);
+    tryRotateDebugLog(path, maxBytes);
   } catch {
     // Debug logging must never crash the TUI.
+  }
+}
+
+function repairDebugLogMode(path: string): void {
+  try {
+    const stats = statSync(path);
+    if ((stats.mode & 0o777) === 0o600) return;
+    chmodSync(path, 0o600);
+  } catch {
+    // Best-effort: if the file is missing or inaccessible, the next event
+    // will retry.
+  }
+}
+
+function tryRotateDebugLog(path: string, maxBytes: number): void {
+  let stats;
+  try {
+    stats = statSync(path);
+  } catch {
+    return;
+  }
+  if (stats.size <= maxBytes) return;
+  try {
+    renameSync(path, `${path}.1`);
+  } catch {
+    // Rotation is best-effort: if it fails, the next event will keep
+    // appending until the next call or the file system refuses writes.
   }
 }
 
@@ -486,7 +535,7 @@ function sameHydrationChild(
     left.endedAt === right.endedAt &&
     left.elapsedMs === right.elapsedMs &&
     sameTokens(left.tokens, right.tokens) &&
-    JSON.stringify(left.model) === JSON.stringify(right.model)
+    sameChildModel(left.model, right.model)
   );
 }
 
@@ -505,13 +554,6 @@ function changedHydrationChildIDs(
         after.children[childID],
       ),
   );
-}
-
-function sameChildModel(
-  left: ChildSessionState["model"],
-  right: ChildSessionState["model"],
-): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function preserveFreshHydrationEvidence(

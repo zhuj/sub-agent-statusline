@@ -342,7 +342,32 @@ export function sameTokens(
   left: ChildTokenState | undefined,
   right: ChildTokenState | undefined,
 ): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return (
+    left.input === right.input &&
+    left.output === right.output &&
+    left.total === right.total &&
+    left.contextPercent === right.contextPercent
+  );
+}
+
+/**
+ * Returns true when both model snapshots are structurally equal. Replaces a
+ * `JSON.stringify` round-trip with a fixed-shape field comparison so the
+ * per-event no-op check stays O(1) and does not allocate.
+ */
+export function sameChildModel(
+  left: ChildModelState | undefined,
+  right: ChildModelState | undefined,
+): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return (
+    left.providerID === right.providerID &&
+    left.modelID === right.modelID &&
+    left.variant === right.variant
+  );
 }
 
 function normalizeComparableText(value: string): string {
@@ -573,6 +598,30 @@ export function resolveTextPath(statePath: string): string {
 const STALE_INSTANCE_DIR_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /**
+ * Filesystem error codes that are safe to swallow during best-effort
+ * cleanup. Anything else is treated as a programming or environment error
+ * and re-thrown so it can be observed in tests and debug logs.
+ */
+const SWALLOWED_FS_ERROR_CODES: ReadonlySet<string> = new Set([
+  "ENOENT",
+  "EACCES",
+  "EPERM",
+  "ENOTDIR",
+  "EBUSY",
+  "EIO",
+]);
+
+function isSwallowedFsError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof (error as { code?: unknown }).code === "string" &&
+    SWALLOWED_FS_ERROR_CODES.has((error as { code: string }).code)
+  );
+}
+
+/**
  * Removes stale `pid-*` instance directories under the runtime base dir whose
  * last-modified time is older than `STALE_INSTANCE_DIR_TTL_MS`. Best-effort:
  * any per-entry error is swallowed because directory cleanup must never
@@ -596,7 +645,8 @@ export async function gcStaleInstanceDirs(
   let entries;
   try {
     entries = await readdir(base, { withFileTypes: true });
-  } catch {
+  } catch (error) {
+    if (!isSwallowedFsError(error)) throw error;
     return 0;
   }
   const cutoffMs = Date.now() - ttlMs;
@@ -610,7 +660,8 @@ export async function gcStaleInstanceDirs(
       if (dirStat.mtimeMs >= cutoffMs) continue;
       await rm(dir, { force: true, recursive: true });
       removed += 1;
-    } catch {
+    } catch (error) {
+      if (!isSwallowedFsError(error)) throw error;
       // Defensive: never let cleanup errors escape.
     }
   }
@@ -791,7 +842,7 @@ export function upsertRunningChild(
     next.startedAt === existing.startedAt &&
     next.endedAt === existing.endedAt &&
     sameTokens(next.tokens, existing.tokens) &&
-    JSON.stringify(next.model) === JSON.stringify(existing.model)
+    sameChildModel(next.model, existing.model)
   ) {
     return counted;
   }
@@ -930,7 +981,7 @@ export function setChildModel(
   const observedUpdatedAt = safeTimestamp(updatedAt, new Date().toISOString());
   for (const child of matches) {
     const sanitized = sanitizeModel(model);
-    if (JSON.stringify(child.model) === JSON.stringify(sanitized)) continue;
+    if (sameChildModel(child.model, sanitized)) continue;
     state.children[child.id] = { ...child, model: sanitized };
     changed = true;
   }
