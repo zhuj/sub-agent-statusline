@@ -57,6 +57,17 @@ export function createPersistenceCoordinator<Snapshot>(
     }
   };
 
+  /**
+   * Resolves the superseded job's promise without writing its snapshot.
+   *
+   * Semantics: a `request()` or `flush()` call resolves when its snapshot
+   * has been incorporated into a future write — either as the active job
+   * or via {@link PersistenceCoordinatorOptions.combineSnapshots} into a
+   * newer pending job. The promise does NOT wait for the writer to finish.
+   * Callers that need the write to complete on disk must observe their own
+   * flush boundary (e.g. by issuing a final `flush()` and awaiting it
+   * after the coordinator is closed or quiescent).
+   */
   const settleSuperseded = (job: PersistenceJob<Snapshot>): void => {
     job.resolve();
   };
