@@ -1272,4 +1272,40 @@ describe("task tool to subtask mapping", () => {
       state.children["subtask:prt_ddea56110001RtlmRJFV99PmiU"]?.endedAt,
     ).toBe("2026-04-30T12:20:00.000Z");
   });
+
+  describe("child lookup cache", () => {
+    it("reuses the same lookup for the same state object identity", () => {
+      const state = createEmptyState();
+      upsertRunningChild(state, {
+        id: "subtask:prt_cache_test",
+        title: "cache test",
+        parentID: "ses_cache_root",
+        messageID: "msg_cache_root",
+        targetSessionID: "ses_cache_child",
+        source: "subtask",
+      });
+      const first = createChildLookup(state);
+      const second = createChildLookup(state);
+      expect(second).toBe(first);
+    });
+
+    it("builds a fresh lookup for a different state object", () => {
+      const state = createEmptyState();
+      upsertRunningChild(state, {
+        id: "subtask:prt_cache_a",
+        title: "first",
+        parentID: "ses_a",
+        messageID: "msg_a",
+        targetSessionID: "ses_a_child",
+        source: "subtask",
+      });
+      const first = createChildLookup(state);
+      const other: typeof state = {
+        ...state,
+        children: { ...state.children },
+      };
+      const second = createChildLookup(other);
+      expect(second).not.toBe(first);
+    });
+  });
 });

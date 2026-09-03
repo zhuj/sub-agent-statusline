@@ -1,6 +1,17 @@
 import type { ChildSessionState, StatuslineState } from "./state.js";
 
 /**
+ * Per-state cache of {@link ChildLookup} instances, keyed by the
+ * `StatuslineState` object identity. The TUI produces a fresh state object
+ * per accepted event, so each event rebuilds the lookup once; subsequent
+ * operations that share the same state (synthetic-target resolution,
+ * backfill, reconciliation) reuse the cached lookup instead of scanning
+ * `state.children` again. The WeakMap is automatically reclaimed when the
+ * state is garbage-collected.
+ */
+const childLookupCache = new WeakMap<StatuslineState, ChildLookup>();
+
+/**
  * Per-process in-memory index of `state.children` used to answer
  * "which child matches this parent/message/target?" questions in O(1)
  * during event application and hydration. Ephemeral: rebuilt on demand
@@ -57,6 +68,8 @@ function removeLookupValue(
 }
 
 export function createChildLookup(state: StatuslineState): ChildLookup {
+  const cached = childLookupCache.get(state);
+  if (cached !== undefined) return cached;
   const lookup: ChildLookup = {
     byID: new Map(),
     byTarget: new Map(),
@@ -72,7 +85,20 @@ export function createChildLookup(state: StatuslineState): ChildLookup {
   for (const child of Object.values(state.children)) {
     refreshChildLookup(lookup, state, child.id);
   }
+  childLookupCache.set(state, lookup);
   return lookup;
+}
+
+/**
+ * Drops any cached {@link ChildLookup} for the given state. Callers that
+ * mutate a state object in place (rather than cloning) must invalidate the
+ * cache so subsequent lookups do not return a stale index. The
+ * `refreshChildLookup` / `setChildTarget` helpers already keep an existing
+ * lookup consistent, so this is only needed when the lookup is discarded
+ * without per-child refresh.
+ */
+export function invalidateChildLookup(state: StatuslineState): void {
+  childLookupCache.delete(state);
 }
 
 export function refreshChildLookup(
@@ -156,6 +182,12 @@ export function lookupChildren(
 ): ChildSessionState[] {
   const ids = key ? bucket.get(key) : undefined;
   if (!ids) return [];
+  // Fast path: a single child is the common case (most synthetic targets
+  // resolve to one real session). Avoid the spread+filter allocation.
+  if (ids.size === 1) {
+    const child = state.children[ids.values().next().value as string];
+    return child ? [child] : [];
+  }
   return [...ids]
     .map((id) => state.children[id])
     .filter((child): child is ChildSessionState => child !== undefined);
