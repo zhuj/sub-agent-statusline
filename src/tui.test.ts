@@ -763,6 +763,24 @@ describe("TUI subagent snapshots", () => {
     persistence.close();
   });
 
+  it("surfaces saveState writer failures to the coordinator caller", async () => {
+    // Given
+    const harness = await createFileHarness();
+    const state = stateWith([child({ id: "ses_fail", title: "Fail" })]);
+    const writerError = new Error("disk full");
+    const persistence = createPersistenceCoordinator<TuiPersistenceSnapshot>(
+      async () => {
+        throw writerError;
+      },
+    );
+
+    // When / Then
+    await expect(
+      persistStateSnapshot(persistence, state, true, ["ses_fail"]),
+    ).rejects.toBe(writerError);
+    persistence.close();
+  });
+
   it("retries an unchanged status text after a transient write failure", async () => {
     // Given
     const harness = await createFileHarness();
@@ -2312,11 +2330,10 @@ describe("hydratePreviousSubagents", () => {
 
       // Then
       expect(fsMockState.appendCalls).toBe(1);
-      expect(fsMockState.appendDescriptors).toHaveLength(1);
-      expect(fsMockState.closeDescriptors).toEqual(
-        fsMockState.appendDescriptors,
-      );
-      expect(fsMockState.lifecycle).toEqual(["append", "close"]);
+      // debugLog now uses appendFileSync with a string path and no longer
+      // maintains a per-call openSync/closeSync descriptor pair.
+      expect(fsMockState.appendDescriptors).toHaveLength(0);
+      expect(fsMockState.closeDescriptors).toHaveLength(0);
     } finally {
       fsMockState.appendShouldThrow = false;
       fsMockState.appendCalls = 0;
