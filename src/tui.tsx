@@ -178,6 +178,11 @@ const SIDEBAR_ARROW_COLLAPSED = "▶";
 const SUBAGENTS_EXPANDED_KV_KEY = "subagents.sidebar.expanded";
 const SUBAGENTS_SECTION_ENABLED_KV_KEY = "subagents.sidebar.enabled";
 const SUBAGENTS_MAX_VISIBLE_ROWS = 5;
+// Soft cap on the hydrate-retry attempts map to bound memory growth under
+// pathological conditions (e.g. navigation loops). Bounded well above the
+// real per-session retry cap (`HYDRATE_RETRY_MAX_ATTEMPTS = 6`) so it only
+// triggers after the map has accumulated many distinct session IDs.
+const HYDRATE_RETRY_ATTEMPTS_SOFT_CAP = 256;
 const SUBAGENTS_RUNNING_ROW_HEIGHT = 3;
 const SUBAGENTS_TERMINAL_ROW_HEIGHT = 2;
 const SUBAGENTS_MODEL_ROW_HEIGHT = 1;
@@ -451,11 +456,23 @@ function debugLog(input: Record<string, unknown>): void {
   }
 }
 
+// Per-path "mode already verified" cache. Once we've confirmed a debug log
+// file is at mode 0o600 we can skip the per-event `statSync` until either
+// the file is rotated (creating a fresh `.1` backup at mode 0o600) or the
+// path is otherwise invalidated. `appendFileSync` recreates the file at
+// mode 0o600 if it was deleted, so we just need to invalidate on rotation.
+const debugLogModeVerified = new Set<string>();
+
 function repairDebugLogMode(path: string): void {
+  if (debugLogModeVerified.has(path)) return;
   try {
     const stats = statSync(path);
-    if ((stats.mode & 0o777) === 0o600) return;
+    if ((stats.mode & 0o777) === 0o600) {
+      debugLogModeVerified.add(path);
+      return;
+    }
     chmodSync(path, 0o600);
+    debugLogModeVerified.add(path);
   } catch {
     // Best-effort: if the file is missing or inaccessible, the next event
     // will retry.
@@ -467,11 +484,16 @@ function tryRotateDebugLog(path: string, maxBytes: number): void {
   try {
     stats = statSync(path);
   } catch {
+    debugLogModeVerified.delete(path);
     return;
   }
   if (stats.size <= maxBytes) return;
   try {
     renameSync(path, `${path}.1`);
+    // The rotated file retains its 0o600 mode. The new active file will be
+    // created on the next append with mode 0o600 (appendFileSync honors
+    // `mode` on creation); invalidate the cache so the next event re-checks.
+    debugLogModeVerified.delete(path);
   } catch {
     // Rotation is best-effort: if it fails, the next event will keep
     // appending until the next call or the file system refuses writes.
@@ -831,23 +853,29 @@ export function persistStateSnapshot(
 }
 
 function refreshLiveState(state: StatuslineState): boolean {
-  const beforeChildIDs = new Set(Object.keys(state.children));
-  refreshDerivedFields(state, undefined, (prunedCount, nowISO) => {
+  // Cheap pre-check: if no children were deleted before vs after
+  // `refreshDerivedFields`, we can avoid allocating the `Set` for the
+  // membership check. `pruneTerminalChildren` is the only in-place mutation
+  // that shrinks `state.children`; everything else writes into existing
+  // entries.
+  let prunedCount = 0;
+  refreshDerivedFields(state, undefined, (count, nowISO) => {
+    prunedCount = count;
     debugLog({
       kind: "state.prune",
-      prunedCount,
+      prunedCount: count,
       now: nowISO,
     });
   });
 
-  if (Object.keys(state.children).length !== beforeChildIDs.size) {
-    return true;
-  }
+  if (prunedCount > 0) return true;
 
-  for (const childID of beforeChildIDs) {
-    if (!state.children[childID]) return true;
-  }
-
+  // No pruning happened — `state.children` is structurally identical to the
+  // input. The derived-fields pass already refreshed elapsedMs / tokens /
+  // model / status on every child, so the only remaining "changed" signal
+  // would be a counter reconciliation update. That is reflected by
+  // `state.updatedAt`, which the caller can compare; for the boolean
+  // "did anything user-observable change" contract we return false here.
   return false;
 }
 
@@ -1485,9 +1513,6 @@ function SidebarSubagents(props: {
   const [showCompletedHistory, setShowCompletedHistory] = createSignal(
     props.restoreFromChild?.showCompletedHistory ?? false,
   );
-  const completedHistoryOptions = () => ({
-    showCompletedHistory: showCompletedHistory(),
-  });
   const snapshot = createMemo(() => {
     const state = props.state();
     return resolveSidebarSubagentSnapshot({
@@ -1495,7 +1520,7 @@ function SidebarSubagents(props: {
       sessionID: props.sessionID,
       nowMs: props.nowMs(),
       currentRouteProjection: props.currentRouteProjection?.(),
-      ...completedHistoryOptions(),
+      showCompletedHistory: showCompletedHistory(),
     });
   });
   const visibleRows = createMemo(() => snapshot().visibleRows);
@@ -3592,6 +3617,17 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
       setHydrateRetryAttempts((prev) => {
         const next = new Map(prev);
         next.set(sessionID, nextAttempts);
+        // Enforce the soft cap by evicting the oldest entry (Map iteration
+        // order is insertion order in JS) when the map grows past the cap.
+        // In practice the cap is well above the real per-session retry
+        // ceiling, so eviction only triggers after many distinct session
+        // IDs have been tracked.
+        if (next.size > HYDRATE_RETRY_ATTEMPTS_SOFT_CAP) {
+          const oldestKey = next.keys().next().value;
+          if (oldestKey !== undefined && oldestKey !== sessionID) {
+            next.delete(oldestKey);
+          }
+        }
         return next;
       });
 
