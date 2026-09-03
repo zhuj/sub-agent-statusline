@@ -178,6 +178,50 @@ export type PersistedStaleSubtaskResolution = {
   targetSessionID?: string;
 };
 
+type PersistedStaleSubtaskMessageContext = {
+  readonly message: Record<string, unknown>;
+  readonly info: Record<string, unknown>;
+  readonly parts: readonly unknown[];
+  readonly assistantParentID?: string;
+};
+
+type PersistedStaleSubtaskMessageEntry = {
+  readonly context: PersistedStaleSubtaskMessageContext;
+  readonly part: Record<string, unknown>;
+  readonly state: Record<string, unknown>;
+  readonly status: "done" | "error";
+  readonly targetSessionID?: string;
+  readonly title?: string;
+  readonly summary?: string;
+  readonly agent?: string;
+  readonly endedAt?: string;
+  readonly order: number;
+};
+
+export type PersistedStaleSubtaskMessageIndex = {
+  readonly byMessageID: ReadonlyMap<
+    string,
+    readonly PersistedStaleSubtaskMessageEntry[]
+  >;
+  readonly byTitle: ReadonlyMap<
+    string,
+    readonly PersistedStaleSubtaskMessageEntry[]
+  >;
+  readonly bySummary: ReadonlyMap<
+    string,
+    readonly PersistedStaleSubtaskMessageEntry[]
+  >;
+  readonly byAgent: ReadonlyMap<
+    string,
+    readonly PersistedStaleSubtaskMessageEntry[]
+  >;
+};
+
+const staleSubtaskMessageIndexCache = new WeakMap<
+  readonly unknown[],
+  PersistedStaleSubtaskMessageIndex
+>();
+
 export function summarizeSessionMessages(messages: unknown[]): {
   completedAt?: string;
   evidenceAt?: string;
@@ -194,11 +238,13 @@ export function summarizeSessionMessages(messages: unknown[]): {
   let latestAssistantActivityAtMs: number | undefined;
   let latestMessageActivityAt: string | undefined;
   let latestMessageActivityAtMs: number | undefined;
-  const messageInfos = messages
-    .map((rawMessage) => asRecord(rawMessage))
-    .map((message) => asRecord(message?.info));
+  let latestTerminalTimeMs: number | undefined;
+  let latestEvidenceTimeMs: number | undefined;
+  let latestCompletedTimeMs: number | undefined;
 
-  for (const info of messageInfos) {
+  for (const rawMessage of messages) {
+    const message = asRecord(rawMessage);
+    const info = asRecord(message?.info);
     if (!info) continue;
     const activityMs = messageTimeMillis(info);
     if (
@@ -209,17 +255,9 @@ export function summarizeSessionMessages(messages: unknown[]): {
       latestMessageActivityAtMs = activityMs;
       latestMessageActivityAt = new Date(activityMs).toISOString();
     }
-  }
 
-  const assistantMessages = messageInfos
-    .filter(
-      (info): info is Record<string, unknown> => info?.role === "assistant",
-    )
-    .sort((left, right) => messageTimeMillis(left) - messageTimeMillis(right));
-
-  for (const info of assistantMessages) {
+    if (info.role !== "assistant") continue;
     const time = asRecord(info.time);
-    const activityMs = messageTimeMillis(info);
     if (
       activityMs > 0 &&
       (latestAssistantActivityAtMs === undefined ||
@@ -233,13 +271,35 @@ export function summarizeSessionMessages(messages: unknown[]): {
       timestampFromUnknown(time?.updated) ??
       timestampFromUnknown(time?.completed) ??
       timestampFromUnknown(time?.created);
-    if (info.error) {
-      hasError = true;
-      evidenceAt = errorAt ?? evidenceAt;
-    } else if (candidate) {
-      completedAt = candidate;
-      evidenceAt = candidate;
-      hasError = false;
+
+    if (!info.error && candidate) {
+      if (
+        latestCompletedTimeMs === undefined ||
+        activityMs >= latestCompletedTimeMs
+      ) {
+        latestCompletedTimeMs = activityMs;
+        completedAt = candidate;
+      }
+    }
+
+    if (!info.error && !candidate) continue;
+
+    if (
+      latestTerminalTimeMs === undefined ||
+      activityMs >= latestTerminalTimeMs
+    ) {
+      latestTerminalTimeMs = activityMs;
+      hasError = Boolean(info.error);
+    }
+
+    const evidence = info.error ? errorAt : candidate;
+    if (
+      evidence !== undefined &&
+      (latestEvidenceTimeMs === undefined ||
+        activityMs >= latestEvidenceTimeMs)
+    ) {
+      latestEvidenceTimeMs = activityMs;
+      evidenceAt = evidence;
     }
   }
 
@@ -376,22 +436,32 @@ export function capCandidates<T>(candidates: T[], maxCandidates: number): T[] {
     : candidates.slice(0, maxCandidates);
 }
 
-export function resolvePersistedStaleSubtaskFromParentMessages(input: {
-  candidate: PersistedStaleSubtaskCandidate;
-  messages: unknown[];
-}): PersistedStaleSubtaskResolution | undefined {
-  type RankedMatch = PersistedStaleSubtaskResolution & { score: number };
-  const matches: RankedMatch[] = [];
+/** Builds terminal task lookup buckets while parsing each message once. */
+export function buildStaleSubtaskMessageIndex(input: {
+  readonly messages: readonly unknown[];
+}): PersistedStaleSubtaskMessageIndex {
+  const byMessageID = new Map<string, PersistedStaleSubtaskMessageEntry[]>();
+  const byTitle = new Map<string, PersistedStaleSubtaskMessageEntry[]>();
+  const bySummary = new Map<string, PersistedStaleSubtaskMessageEntry[]>();
+  const byAgent = new Map<string, PersistedStaleSubtaskMessageEntry[]>();
+  let order = 0;
 
   for (const rawMessage of input.messages) {
     const message = asRecord(rawMessage);
     const info = asRecord(message?.info);
-    if (!info || info.role !== "assistant") continue;
+    if (!message || !info || info.role !== "assistant") continue;
 
     const assistantParentID = asString(
-      info.parentID ?? message?.parentID ?? message?.parentMessageID,
+      info.parentID ?? message.parentID ?? message.parentMessageID,
     );
-    const parts = Array.isArray(message?.parts) ? message.parts : [];
+    const rawParts = message.parts;
+    const parts = Array.isArray(rawParts) ? rawParts : [];
+    const context = {
+      message,
+      info,
+      parts,
+      ...(assistantParentID === undefined ? {} : { assistantParentID }),
+    };
 
     for (const rawPart of parts) {
       const part = asRecord(rawPart);
@@ -405,83 +475,193 @@ export function resolvePersistedStaleSubtaskFromParentMessages(input: {
           : rawStatus === "error"
             ? "error"
             : undefined;
-      if (!status) continue;
+      if (!state || !status) continue;
 
-      const metadata = asRecord(state?.metadata);
+      const taskInput = asRecord(state.input);
+      const metadata = asRecord(state.metadata);
       const targetSessionID =
         sessionIDFromUnknown(metadata?.sessionId) ??
         sessionIDFromUnknown(metadata?.sessionID) ??
-        parseTaskSessionIDFromOutput(state?.output);
-
-      const partTitle =
-        asString(state?.input && asRecord(state.input)?.description) ??
-        asString(state?.title) ??
+        parseTaskSessionIDFromOutput(state.output);
+      const title =
+        asString(taskInput?.description) ??
+        asString(state.title) ??
         asString(part.description);
-      const partSummary =
-        asString(state?.input && asRecord(state.input)?.prompt) ??
-        asString(state?.description);
-      const partAgent =
-        asString(state?.input && asRecord(state.input)?.subagent_type) ??
-        asString(part.agent);
-
-      const parentMessageMatch =
-        assistantParentID !== undefined &&
-        assistantParentID === input.candidate.messageID;
-      const titleMatch = sameDisplayText(partTitle, input.candidate.title);
-      const summaryMatch = sameDisplayText(partSummary, input.candidate.summary);
-      const agentMatch = sameDisplayText(partAgent, input.candidate.agentName);
-
-      const metadataCompositeMatch =
-        summaryMatch || (titleMatch && agentMatch && !!input.candidate.summary);
-      if (!parentMessageMatch && !metadataCompositeMatch) {
-        continue;
-      }
-
-      const score =
-        (parentMessageMatch ? 100 : 0) +
-        (summaryMatch ? 40 : 0) +
-        (titleMatch ? 20 : 0) +
-        (agentMatch ? 10 : 0);
-
+      const summary =
+        asString(taskInput?.prompt) ?? asString(state.description);
+      const agent =
+        asString(taskInput?.subagent_type) ?? asString(part.agent);
+      const stateTime = asRecord(state.time);
+      const infoTime = asRecord(info.time);
       const endedAt =
         timestampFromUnknown(
-          asRecord(state?.time)?.end ??
-            asRecord(state?.time)?.completed ??
-            asRecord(state?.time)?.updated,
+          stateTime?.end ?? stateTime?.completed ?? stateTime?.updated,
         ) ??
         timestampFromUnknown(
-          asRecord(info?.time)?.completed ??
-            asRecord(info?.time)?.updated ??
-            asRecord(info?.time)?.created,
+          infoTime?.completed ?? infoTime?.updated ?? infoTime?.created,
         );
-
-      matches.push({
+      const entry: PersistedStaleSubtaskMessageEntry = {
+        context,
+        part,
+        state,
         status,
-        endedAt,
-        targetSessionID,
-        score,
-      });
+        ...(targetSessionID === undefined ? {} : { targetSessionID }),
+        ...(title === undefined ? {} : { title }),
+        ...(summary === undefined ? {} : { summary }),
+        ...(agent === undefined ? {} : { agent }),
+        ...(endedAt === undefined ? {} : { endedAt }),
+        order: order++,
+      };
+
+      addStaleSubtaskIndexEntry(
+        byMessageID,
+        assistantParentID,
+        entry,
+      );
+      addStaleSubtaskIndexEntry(
+        byTitle,
+        staleSubtaskDisplayTextKey(title),
+        entry,
+      );
+      addStaleSubtaskIndexEntry(
+        bySummary,
+        staleSubtaskDisplayTextKey(summary),
+        entry,
+      );
+      addStaleSubtaskIndexEntry(
+        byAgent,
+        staleSubtaskDisplayTextKey(agent),
+        entry,
+      );
     }
   }
 
-  if (matches.length === 0) return undefined;
-  if (matches.length === 1) {
-    const [only] = matches;
-    return {
-      status: only.status,
-      endedAt: only.endedAt,
-      targetSessionID: only.targetSessionID,
-    };
+  return { byMessageID, byTitle, bySummary, byAgent };
+}
+
+function addStaleSubtaskIndexEntry(
+  buckets: Map<string, PersistedStaleSubtaskMessageEntry[]>,
+  key: string | undefined,
+  entry: PersistedStaleSubtaskMessageEntry,
+): void {
+  if (key === undefined) return;
+  const bucket = buckets.get(key);
+  if (bucket === undefined) {
+    buckets.set(key, [entry]);
+    return;
+  }
+  bucket.push(entry);
+}
+
+function staleSubtaskDisplayTextKey(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  return value.trim().toLowerCase();
+}
+
+function getStaleSubtaskMessageIndex(
+  messages: readonly unknown[],
+): PersistedStaleSubtaskMessageIndex {
+  const cached = staleSubtaskMessageIndexCache.get(messages);
+  if (cached !== undefined) return cached;
+  const index = buildStaleSubtaskMessageIndex({ messages });
+  staleSubtaskMessageIndexCache.set(messages, index);
+  return index;
+}
+
+function matchingStaleSubtaskEntries(
+  index: PersistedStaleSubtaskMessageIndex,
+  candidate: PersistedStaleSubtaskCandidate,
+): PersistedStaleSubtaskMessageEntry[] {
+  const buckets: readonly (readonly PersistedStaleSubtaskMessageEntry[])[] = [
+    index.byMessageID.get(candidate.messageID) ?? [],
+  ];
+  const titleKey = staleSubtaskDisplayTextKey(candidate.title);
+  const summaryKey = staleSubtaskDisplayTextKey(candidate.summary);
+  const agentKey = staleSubtaskDisplayTextKey(candidate.agentName);
+  const matchingBuckets = [
+    ...buckets,
+    ...(titleKey === undefined ? [] : [index.byTitle.get(titleKey) ?? []]),
+    ...(summaryKey === undefined ? [] : [index.bySummary.get(summaryKey) ?? []]),
+    ...(agentKey === undefined ? [] : [index.byAgent.get(agentKey) ?? []]),
+  ];
+  const offsets = matchingBuckets.map(() => 0);
+  const entries: PersistedStaleSubtaskMessageEntry[] = [];
+
+  while (true) {
+    let nextEntry: PersistedStaleSubtaskMessageEntry | undefined;
+    for (let bucketIndex = 0; bucketIndex < matchingBuckets.length; bucketIndex += 1) {
+      const bucket = matchingBuckets[bucketIndex];
+      const offset = offsets[bucketIndex];
+      const entry = bucket?.[offset];
+      if (entry !== undefined && (nextEntry === undefined || entry.order < nextEntry.order)) {
+        nextEntry = entry;
+      }
+    }
+    if (nextEntry === undefined) break;
+
+    entries.push(nextEntry);
+    for (let bucketIndex = 0; bucketIndex < matchingBuckets.length; bucketIndex += 1) {
+      const bucket = matchingBuckets[bucketIndex];
+      while (bucket?.[offsets[bucketIndex]]?.order === nextEntry.order) {
+        offsets[bucketIndex] += 1;
+      }
+    }
   }
 
-  const ranked = [...matches].sort((left, right) => right.score - left.score);
-  const [best, second] = ranked;
-  if (!best || (second && best.score === second.score)) return undefined;
-  return {
-    status: best.status,
-    endedAt: best.endedAt,
-    targetSessionID: best.targetSessionID,
-  };
+  return entries;
+}
+
+/** Resolves one persisted candidate from a shared or lazily cached message index. */
+export function resolvePersistedStaleSubtaskFromParentMessages(input: {
+  candidate: PersistedStaleSubtaskCandidate;
+  messages: unknown[];
+  readonly index?: PersistedStaleSubtaskMessageIndex;
+}): PersistedStaleSubtaskResolution | undefined {
+  let bestMatch: PersistedStaleSubtaskResolution | undefined;
+  let bestScore: number | undefined;
+  let secondBestScore: number | undefined;
+
+  const index = input.index ?? getStaleSubtaskMessageIndex(input.messages);
+  for (const entry of matchingStaleSubtaskEntries(index, input.candidate)) {
+    const parentMessageMatch =
+      entry.context.assistantParentID !== undefined &&
+      entry.context.assistantParentID === input.candidate.messageID;
+    const titleMatch = sameDisplayText(entry.title, input.candidate.title);
+    const summaryMatch = sameDisplayText(
+      entry.summary,
+      input.candidate.summary,
+    );
+    const agentMatch = sameDisplayText(entry.agent, input.candidate.agentName);
+
+    const metadataCompositeMatch =
+      summaryMatch || (titleMatch && agentMatch && !!input.candidate.summary);
+    if (!parentMessageMatch && !metadataCompositeMatch) continue;
+
+    const score =
+      (parentMessageMatch ? 100 : 0) +
+      (summaryMatch ? 40 : 0) +
+      (titleMatch ? 20 : 0) +
+      (agentMatch ? 10 : 0);
+
+    const resolution = {
+      status: entry.status,
+      endedAt: entry.endedAt,
+      targetSessionID: entry.targetSessionID,
+    };
+
+    if (bestScore === undefined || score > bestScore) {
+      secondBestScore = bestScore;
+      bestScore = score;
+      bestMatch = resolution;
+    } else if (secondBestScore === undefined || score > secondBestScore) {
+      secondBestScore = score;
+    }
+  }
+
+  if (bestMatch === undefined || bestScore === secondBestScore) {
+    return undefined;
+  }
+  return bestMatch;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   awaitCurrentRunningReconcileResult,
+  buildStaleSubtaskMessageIndex,
   canSafelyCloseNoTargetPersistedCandidate,
   capCandidates,
   defaultStaleRunningThresholdMs,
@@ -152,6 +153,53 @@ describe("terminal positive evidence", () => {
     ]);
     expect(errorSummary.hasError).toBe(true);
     expect(errorSummary.evidenceAt).toBe(errorAt);
+  });
+
+  it("uses chronological order for out-of-order completion and error evidence", () => {
+    const completedAt = "2026-07-17T09:00:00.000Z";
+    const errorAt = "2026-07-17T09:01:00.000Z";
+
+    // Given assistant messages arrive newest first.
+    const summary = summarizeSessionMessages([
+      {
+        info: {
+          role: "assistant",
+          error: { message: "boom" },
+          time: { updated: errorAt },
+        },
+      },
+      { info: { role: "assistant", time: { completed: completedAt } } },
+    ]);
+
+    // Then the later error remains authoritative over the older completion.
+    expect(summary.completedAt).toBe(completedAt);
+    expect(summary.evidenceAt).toBe(errorAt);
+    expect(summary.hasError).toBe(true);
+    expect(summary.latestAssistantActivityAt).toBe(errorAt);
+    expect(summary.latestAssistantActivityAtMs).toBe(Date.parse(errorAt));
+  });
+
+  it("uses input order to break equal assistant timestamps", () => {
+    const timestamp = "2026-07-17T09:00:00.000Z";
+
+    // Given an error is followed by a completion at the same timestamp.
+    const summary = summarizeSessionMessages([
+      {
+        info: {
+          role: "assistant",
+          error: { message: "transient" },
+          time: { updated: timestamp },
+        },
+      },
+      { info: { role: "assistant", time: { completed: timestamp } } },
+    ]);
+
+    // Then the later input wins the stable chronological tie.
+    expect(summary.completedAt).toBe(timestamp);
+    expect(summary.evidenceAt).toBe(timestamp);
+    expect(summary.hasError).toBe(false);
+    expect(summary.latestAssistantActivityAt).toBe(timestamp);
+    expect(summary.latestAssistantActivityAtMs).toBe(Date.parse(timestamp));
   });
 
   it("lets assistant error evidence override idle or done session status", () => {
@@ -410,6 +458,113 @@ describe("persisted stale subtask recovery evidence", () => {
     expect(result).toBeUndefined();
   });
 
+  it("selects a unique highest-score stale match regardless of input order", () => {
+    const result = resolvePersistedStaleSubtaskFromParentMessages({
+      candidate: {
+        ...stale,
+        summary: "Run auth migration",
+        agentName: "code",
+      },
+      messages: [
+        {
+          info: { role: "assistant", parentID: "msg_unrelated" },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                input: { prompt: "Run auth migration" },
+                metadata: { sessionId: "ses_lower_score" },
+              },
+            },
+          ],
+        },
+        {
+          info: {
+            role: "assistant",
+            parentID: "msg_ddea560fd001mnSF0ssrplOLZq",
+          },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "error",
+                output: "task_id: ses_best_score",
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result).toEqual({
+      status: "error",
+      endedAt: undefined,
+      targetSessionID: "ses_best_score",
+    });
+  });
+
+  it("fails closed when the highest stale-match score is tied", () => {
+    const result = resolvePersistedStaleSubtaskFromParentMessages({
+      candidate: {
+        ...stale,
+        summary: "Run auth migration",
+      },
+      messages: [
+        {
+          info: { role: "assistant", parentID: "msg_unrelated" },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                input: { prompt: "Run auth migration" },
+                metadata: { sessionId: "ses_lower_score" },
+              },
+            },
+          ],
+        },
+        {
+          info: {
+            role: "assistant",
+            parentID: "msg_ddea560fd001mnSF0ssrplOLZq",
+          },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                metadata: { sessionId: "ses_tied_one" },
+              },
+            },
+          ],
+        },
+        {
+          info: {
+            role: "assistant",
+            parentID: "msg_ddea560fd001mnSF0ssrplOLZq",
+          },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "error",
+                output: "task_id: ses_tied_two",
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result).toBeUndefined();
+  });
+
   it("prefers parent-message linkage with metadata tie-breakers", () => {
     const result = resolvePersistedStaleSubtaskFromParentMessages({
       candidate: {
@@ -510,6 +665,183 @@ describe("persisted stale subtask recovery evidence", () => {
     });
 
     expect(result?.targetSessionID).toBe("ses_child-01_abc");
+  });
+
+  describe("shared stale-subtask message indexes", () => {
+    it("preserves the winner for out-of-order messages", () => {
+      // Given a lower-scoring task appears before a later parent-linked task.
+      const candidate = {
+        ...stale,
+        summary: "Run auth migration",
+        agentName: "code",
+      };
+      const messages = [
+        {
+          info: { role: "assistant", parentID: "msg_unrelated" },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                input: {
+                  description: "Execute subtask",
+                  prompt: "Run something else",
+                  subagent_type: "code",
+                },
+                metadata: { sessionId: "ses_lower_score" },
+              },
+            },
+          ],
+        },
+        {
+          info: { role: "assistant", parentID: stale.messageID },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "error",
+                output: "task_id: ses_parent_linked",
+              },
+            },
+          ],
+        },
+      ];
+
+      // When the same snapshot is resolved directly and through its index.
+      const indexed = resolvePersistedStaleSubtaskFromParentMessages({
+        candidate,
+        messages,
+        index: buildStaleSubtaskMessageIndex({ messages }),
+      });
+      const direct = resolvePersistedStaleSubtaskFromParentMessages({
+        candidate,
+        messages,
+      });
+
+      // Then indexing does not change the unique highest-score result.
+      expect(indexed).toEqual(direct);
+      expect(indexed).toEqual({
+        status: "error",
+        endedAt: undefined,
+        targetSessionID: "ses_parent_linked",
+      });
+    });
+
+    it("preserves the winner when duplicate titles share lookup buckets", () => {
+      // Given two terminal task parts with the same title but only one matching summary.
+      const candidate = {
+        ...stale,
+        summary: "Run auth migration",
+        agentName: "code",
+      };
+      const messages = [
+        {
+          info: { role: "assistant", parentID: "msg_unrelated" },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                input: {
+                  description: "Execute subtask",
+                  prompt: "Run something else",
+                  subagent_type: "code",
+                },
+                metadata: { sessionId: "ses_duplicate_title" },
+              },
+            },
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                input: {
+                  description: "Execute subtask",
+                  prompt: "Run auth migration",
+                  subagent_type: "code",
+                },
+                metadata: { sessionId: "ses_summary_winner" },
+              },
+            },
+          ],
+        },
+      ];
+
+      // When the duplicate-title snapshot is resolved through the shared index.
+      const indexed = resolvePersistedStaleSubtaskFromParentMessages({
+        candidate,
+        messages,
+        index: buildStaleSubtaskMessageIndex({ messages }),
+      });
+      const direct = resolvePersistedStaleSubtaskFromParentMessages({
+        candidate,
+        messages,
+      });
+
+      // Then overlapping title, summary, and agent buckets do not duplicate an entry.
+      expect(indexed).toEqual(direct);
+      expect(indexed).toEqual({
+        status: "done",
+        endedAt: undefined,
+        targetSessionID: "ses_summary_winner",
+      });
+    });
+
+    it("preserves ambiguity when the highest score is tied", () => {
+      // Given two terminal tasks have the same summary and therefore the same score.
+      const candidate = {
+        ...stale,
+        summary: "Run auth migration",
+      };
+      const messages = [
+        {
+          info: { role: "assistant", parentID: "msg_unrelated_one" },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                input: { prompt: "Run auth migration" },
+                metadata: { sessionId: "ses_tied_one" },
+              },
+            },
+          ],
+        },
+        {
+          info: { role: "assistant", parentID: "msg_unrelated_two" },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "error",
+                input: { prompt: "Run auth migration" },
+                metadata: { sessionId: "ses_tied_two" },
+              },
+            },
+          ],
+        },
+      ];
+
+      // When the tied snapshot is resolved directly and through its summary bucket.
+      const indexed = resolvePersistedStaleSubtaskFromParentMessages({
+        candidate,
+        messages,
+        index: buildStaleSubtaskMessageIndex({ messages }),
+      });
+      const direct = resolvePersistedStaleSubtaskFromParentMessages({
+        candidate,
+        messages,
+      });
+
+      // Then both paths fail closed on the tied highest score.
+      expect(indexed).toEqual(direct);
+      expect(indexed).toBeUndefined();
+    });
   });
 });
 
