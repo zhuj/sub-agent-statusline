@@ -46,6 +46,7 @@ The sidebar shows:
 - running subagents;
 - recent completed subagents;
 - failed subagents;
+- every retained descendant at any depth, indented in parent-before-child order;
 - elapsed time;
 - token/context usage when available.
 
@@ -91,10 +92,10 @@ When a child session is opened from the sidebar, returning with OpenCode `Up` (`
 <details>
 <summary>Stable 1.x public contract</summary>
 
-For 1.x releases, the stable user-facing contract is:
+For 1.x releases, the supported TUI entrypoints are `opencode-subagent-statusline` and `opencode-subagent-statusline/tui`. Both load the same sidebar plugin. The stable user-facing contract is:
 
 - npm package name: `opencode-subagent-statusline`;
-- TUI plugin entrypoints: `opencode-subagent-statusline` and `opencode-subagent-statusline/tui`;
+- supported TUI plugin entrypoints: `opencode-subagent-statusline` and `opencode-subagent-statusline/tui`;
 - OpenCode `tui.json` plugin configuration;
 - visible sidebar and home/footer behavior;
 - command palette entry, `Alt+B`, and focused-list navigation;
@@ -103,12 +104,11 @@ For 1.x releases, the stable user-facing contract is:
 
 Experimental or internal surfaces may change in 1.x without a SemVer-major bump:
 
-- `opencode-subagent-statusline/runtime`, intended for diagnostics and file-based runtime experiments;
 - diagnostic environment variables;
 - exact `state.json` schema and `status.txt` format;
 - internal source modules and source-level exports.
 
-Use the TUI plugin entrypoints for normal OpenCode usage.
+Use either supported TUI entrypoint for OpenCode usage.
 
 </details>
 
@@ -148,11 +148,11 @@ OpenCode event payloads can vary by version and by event type. The plugin shows 
 
 ## Local privacy and persistence
 
-The plugin persists a local JSON state file and `status.txt` snapshot under `XDG_RUNTIME_DIR` or the system temp directory by default. Those files can include OpenCode-derived subagent titles and summaries, which may contain short fragments derived from prompts or task descriptions. Files are written best-effort with owner-only permissions and atomic temp-file replacement where Node and the host filesystem support them.
+The TUI plugin persists a local JSON state file and `status.txt` snapshot under `XDG_RUNTIME_DIR` or the system temp directory by default. When TUI event diagnostics are enabled, it also writes `tui-events.log`. These files can include OpenCode-derived subagent titles, summaries, and event data, which may contain short fragments derived from prompts or task descriptions. Files are written best-effort with owner-only permissions and atomic temp-file replacement where Node and the host filesystem support them.
 
 `OPENCODE_SUBAGENT_STATUSLINE_STATE` overrides the state file path. Treat that environment variable as trusted local configuration because the plugin will write status data to the configured path.
 
-For token/context backfill, the TUI uses current OpenCode TUI state and the `session.messages` API. It does not inspect OpenCode's SQLite database or log files directly.
+For token/context backfill, the TUI uses current OpenCode TUI state and the `session.messages` API. It does not recover token evidence from OpenCode's local database or log files.
 
 <details>
 <summary>Development and testing</summary>
@@ -180,12 +180,11 @@ Test a local TUI build by pointing OpenCode directly at `dist/tui.js`:
 
 This project ships the OpenCode TUI sidebar plugin from `src/tui.tsx`. The TUI bundle is built with `tsup` and `esbuild-plugin-solid` in Solid `universal` mode for OpenTUI compatibility.
 
-Package entrypoints:
+The package supports only these TUI entrypoints:
 
 ```txt
 opencode-subagent-statusline          -> TUI plugin
 opencode-subagent-statusline/tui      -> TUI plugin
-opencode-subagent-statusline/runtime  -> experimental/diagnostic runtime mode
 ```
 
 Useful commands:
