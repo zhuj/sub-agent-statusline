@@ -50,6 +50,7 @@ behavior.
 | `OPENCODE_SUBAGENT_STATUSLINE_COLOR=0` | Disables ANSI colors in text rendering. | Logs or no-color terminals. |
 | `NO_COLOR=1` | Standard no-color switch. | CI/log environments. |
 | `OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS` | Enables TUI event JSONL logging. | Investigating OpenCode payloads. |
+| `OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS_MAX_BYTES` | Caps `tui-events.log` size (default 1 MiB, min 16 KiB); the file rotates to `tui-events.log.1` when exceeded. | Long-running debug sessions. |
 | `OPENCODE_SUBAGENT_STATUSLINE_STALE_RUNNING_MS` | Changes stale-running threshold. | Diagnosing old `running` rows. |
 | `XDG_RUNTIME_DIR` | Default base for TUI-owned local files. | Linux/custom environments. |
 
