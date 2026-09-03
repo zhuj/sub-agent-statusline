@@ -14,6 +14,12 @@ export interface SidebarRowLayoutIndex {
   readonly rows: readonly SidebarIndexedRow[];
   readonly rowByID: ReadonlyMap<string, SidebarIndexedRow>;
   readonly contentHeight: number;
+  /**
+   * Clamped visible height for the sidebar list. Always in
+   * `[1, SUBAGENTS_MAX_LIST_HEIGHT]`. Pre-computed here so the sidebar does
+   * not need a separate `createMemo` to derive the value on every render.
+   */
+  readonly listHeight: number;
 }
 
 export interface SidebarRowWindow {
@@ -33,6 +39,8 @@ export interface SidebarSelectionActivation {
 }
 
 export const SIDEBAR_ROW_WINDOW_OVERSCAN_ROWS = 2 as const;
+export const SIDEBAR_LIST_MAX_HEIGHT = 5 as const;
+export const SIDEBAR_LIST_MIN_HEIGHT = 1 as const;
 
 function positiveGeometry(value: number, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? value : fallback;
@@ -102,7 +110,15 @@ export function buildSidebarRowLayoutIndex(
     top = indexedRow.bottom + indexedRow.gapAfter;
   }
 
-  return { rows: indexedRows, rowByID, contentHeight: top };
+  return {
+    rows: indexedRows,
+    rowByID,
+    contentHeight: top,
+    listHeight: Math.max(
+      SIDEBAR_LIST_MIN_HEIGHT,
+      Math.min(SIDEBAR_LIST_MAX_HEIGHT, top),
+    ),
+  };
 }
 
 export function resolveSidebarRowWindow(

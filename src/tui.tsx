@@ -1308,6 +1308,65 @@ export function subagentRowHeight(input: {
   );
 }
 
+/**
+ * Per-child cache of the layout-relevant row height. Terminal rows depend
+ * only on `(status, hasModel)` so the result is stable for the lifetime of a
+ * given `ChildSessionState` object and we can return the cached value without
+ * recomputing on every elapsed-tick re-render. Running rows fall through to
+ * {@link subagentRowHeight} (title-wrap depends on sidebar width, depth, and
+ * the live `nowMs`).
+ *
+ * Evicted automatically when the child object is GC'd (WeakMap).
+ */
+const terminalRowHeightCache = new WeakMap<ChildSessionState, number>();
+
+export function subagentRowHeightCached(input: {
+  child: ChildSessionState;
+  nowMs: number;
+  depth?: number;
+  sidebarWidth?: number;
+  reservedWidth?: number;
+}): number {
+  if (input.child.status !== "running") {
+    const cached = terminalRowHeightCache.get(input.child);
+    if (cached !== undefined) return cached;
+    const height = subagentRowHeight(input);
+    terminalRowHeightCache.set(input.child, height);
+    return height;
+  }
+  return subagentRowHeight(input);
+}
+
+/**
+ * Variant of {@link subagentRowHeightCached} that lazily reads the `nowMs`
+ * accessor only when a running row needs the time-dependent title-wrap path.
+ * Lets layout memos track only the structural inputs (`visibleRows`,
+ * `sidebarWidth`) and skip re-evaluation on the 1-second elapsed tick when no
+ * running row's title actually re-wrapped.
+ */
+export function subagentRowHeightLazy(input: {
+  child: ChildSessionState;
+  readNowMs: () => number;
+  depth?: number;
+  sidebarWidth?: number;
+  reservedWidth?: number;
+}): number {
+  if (input.child.status !== "running") {
+    const cached = terminalRowHeightCache.get(input.child);
+    if (cached !== undefined) return cached;
+    const height = subagentRowHeight({
+      ...input,
+      nowMs: input.readNowMs(),
+    });
+    terminalRowHeightCache.set(input.child, height);
+    return height;
+  }
+  return subagentRowHeight({
+    ...input,
+    nowMs: input.readNowMs(),
+  });
+}
+
 export function formatChildModelLine(
   child: ChildSessionState,
   providers: TuiPluginApi["state"]["provider"],
@@ -1464,27 +1523,19 @@ function SidebarSubagents(props: {
   });
 
   const rowLayoutIndex = createMemo(() => {
-    const nowMs = props.nowMs();
     const sidebarWidth = props.sidebarWidth?.();
     return buildSidebarRowLayoutIndex(
       visibleRows().map(({ child, depth }) => ({
         id: child.id,
-        height: subagentRowHeight({
+        height: subagentRowHeightLazy({
           child,
           depth,
-          nowMs,
+          readNowMs: props.nowMs,
           sidebarWidth,
           reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
         }),
       })),
       SUBAGENTS_ROW_GAP,
-    );
-  });
-
-  const listHeight = createMemo(() => {
-    return Math.max(
-      1,
-      Math.min(SUBAGENTS_MAX_LIST_HEIGHT, rowLayoutIndex().contentHeight),
     );
   });
 
@@ -1589,7 +1640,7 @@ function SidebarSubagents(props: {
       : 0;
     const nextViewportHeight = Math.max(
       1,
-      scrollbox?.viewport.height ?? listHeight(),
+      scrollbox?.viewport.height ?? rowLayoutIndex().listHeight,
     );
     if (rowWindowScrollTop() !== nextScrollTop) {
       setRowWindowScrollTop(nextScrollTop);
@@ -1616,7 +1667,7 @@ function SidebarSubagents(props: {
     const firstVisibleIndex = resolveSidebarRowWindow(
       layout,
       viewportTop,
-      listHeight(),
+      rowLayoutIndex().listHeight,
     ).visibleStartIndex;
     const firstVisibleRow = rows[firstVisibleIndex];
     if (!firstVisibleRow) return undefined;
@@ -1638,14 +1689,14 @@ function SidebarSubagents(props: {
     const rowTop = rowTopForIndex(selectedRow.index);
     const rowBottom = selectedRow.bottom;
     const viewportTop = scrollbox.scrollTop;
-    const viewportBottom = viewportTop + listHeight();
+    const viewportBottom = viewportTop + rowLayoutIndex().listHeight;
 
     if (rowTop < viewportTop) {
       const nextTop = clampedScrollTop(scrollbox, rowTop);
       scrollRegistration.offsetTop = nextTop;
       scrollbox.scrollTop = nextTop;
     } else if (rowBottom > viewportBottom) {
-      const nextTop = clampedScrollTop(scrollbox, rowBottom - listHeight());
+      const nextTop = clampedScrollTop(scrollbox, rowBottom - rowLayoutIndex().listHeight);
       scrollRegistration.offsetTop = nextTop;
       scrollbox.scrollTop = nextTop;
     }
@@ -1717,7 +1768,7 @@ function SidebarSubagents(props: {
 
   createEffect(() => {
     selectedChildID();
-    listHeight();
+    rowLayoutIndex().listHeight;
     if (!listFocused()) return;
     scrollSelectedChildIntoView();
   });
@@ -1854,7 +1905,7 @@ function SidebarSubagents(props: {
     const rowHeight = createMemo(() => {
       const currentChild = child();
       if (!currentChild) return SUBAGENTS_TERMINAL_ROW_HEIGHT;
-      return subagentRowHeight({
+      return subagentRowHeightCached({
         child: currentChild,
         depth: row()?.depth,
         nowMs: props.nowMs(),
@@ -2094,7 +2145,7 @@ function SidebarSubagents(props: {
             restorePreservedScroll();
             refreshMountedWindowViewport();
           }}
-          height={listHeight()}
+          height={rowLayoutIndex().listHeight}
           scrollY
           viewportCulling={true}
           contentOptions={{ flexDirection: "column" }}
