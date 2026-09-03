@@ -1,11 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import os from "node:os";
-import {
-  classifySubagentWorkItem,
-  correlateSubagentWorkItems,
-} from "./subagent-classification.js";
+import { classifySubagentWorkItem } from "./subagent-classification.js";
 import { buildSubagentProjection, buildSubagentProjectionFromChildren } from "./projection.js";
 
 export type ChildStatus = "running" | "done" | "error";
@@ -246,10 +243,13 @@ function reconcileCountedExecutionsWithChildren(state: StatuslineState): void {
   if (reconcileFingerprints.get(state) === fingerprint) return;
   reconcileFingerprints.set(state, fingerprint);
 
-  state.countedChildIDs = Object.fromEntries(
-    projection.orderedExecutionIDs.map((id) => [id, true]),
-  ) as Record<string, true>;
-  state.totalExecuted = projection.totalExecuted;
+  for (const id of projection.orderedExecutionIDs) {
+    state.countedChildIDs[id] = true;
+  }
+  state.totalExecuted = Math.max(
+    state.totalExecuted,
+    Object.keys(state.countedChildIDs).length,
+  );
 }
 
 function countChildExecution(
@@ -546,10 +546,6 @@ function resolveDefaultInstanceName(): string {
   return `pid-${process.pid}`;
 }
 
-export function shouldPreserveStateOnStartup(): boolean {
-  return process.env.OPENCODE_SUBAGENT_STATUSLINE_PRESERVE_STATE === "1";
-}
-
 export function createEmptyState(): StatuslineState {
   return {
     children: {},
@@ -621,66 +617,6 @@ export async function gcStaleInstanceDirs(
   return removed;
 }
 
-export async function loadState(statePath: string): Promise<StatuslineState> {
-  try {
-    const raw = await readFile(statePath, "utf8");
-    const parsed = JSON.parse(raw) as Partial<StatuslineState>;
-    if (!parsed || typeof parsed !== "object") {
-      return createEmptyState();
-    }
-
-    const children =
-      parsed.children && typeof parsed.children === "object"
-        ? parsed.children
-        : {};
-    const countedChildIDs = sanitizeCountedChildIDs(parsed.countedChildIDs);
-
-    const state: StatuslineState = {
-      children: children as Record<string, ChildSessionState>,
-      countedChildIDs,
-      totalExecuted: Math.max(
-        toNonNegativeInteger(parsed.totalExecuted) ?? 0,
-        Object.keys(countedChildIDs).length,
-      ),
-      updatedAt:
-        typeof parsed.updatedAt === "string"
-          ? parsed.updatedAt
-          : new Date().toISOString(),
-    };
-
-    for (const [id, child] of Object.entries(children)) {
-      const candidate = child as Partial<ChildSessionState>;
-      if (
-        typeof candidate.title !== "string" ||
-        typeof candidate.parentID !== "string"
-      ) {
-        continue;
-      }
-      const targetSessionID = sanitizeTargetSessionID(
-        candidate.targetSessionID,
-        id.startsWith("ses_") ? id : undefined,
-      );
-      const countIdentity = resolveExecutionCountIdentity({
-        id,
-        title: candidate.title,
-        parentID: candidate.parentID,
-        messageID: candidate.messageID,
-        source: candidate.source,
-        targetSessionID,
-      });
-      if (countIdentity) {
-        state.countedChildIDs[countIdentity] = true;
-      }
-    }
-
-    reconcileCountedExecutionsWithChildren(state);
-    refreshDerivedFields(state);
-    return state;
-  } catch {
-    return createEmptyState();
-  }
-}
-
 async function writeLocalStatusFile(
   path: string,
   contents: string,
@@ -705,16 +641,6 @@ async function writeLocalStatusFile(
   }
 }
 
-/**
- * Non-enumerable symbol used by the runtime plugin to thread the list of
- * child IDs that changed in this event round-trip through to `saveState`,
- * so the differential refresh can skip re-deriving fields for the other
- * children. Hidden from JSON.stringify because Symbol keys are skipped.
- */
-export const CHANGED_CHILD_IDS = Symbol.for(
-  "opencode-subagent-statusline.changedChildIDs",
-);
-
 export async function saveStatusText(
   textPath: string,
   contents: string,
@@ -727,17 +653,7 @@ export async function saveState(
   state: StatuslineState,
   options: { readonly changedChildIDs?: readonly string[] } = {},
 ): Promise<void> {
-  // The caller may have attached CHANGED_CHILD_IDS via the persistence
-  // coordinator (Symbol property is invisible to JSON.stringify).
-  const changedChildIDs =
-    options.changedChildIDs ??
-    ((state as unknown as Record<symbol, unknown>)[CHANGED_CHILD_IDS] as
-      | readonly string[]
-      | undefined);
-  refreshStateForSnapshot(state, changedChildIDs);
-  // Compact JSON — the file is consumed by `loadState` (machine-only), so we
-  // skip the human-readable pretty-print to halve bytes and speed up both
-  // serialize and parse on every persistence round-trip.
+  refreshStateForSnapshot(state, options.changedChildIDs);
   await writeLocalStatusFile(statePath, JSON.stringify(state));
 }
 
