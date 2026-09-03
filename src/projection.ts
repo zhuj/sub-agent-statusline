@@ -1,6 +1,8 @@
 import {
+  classifySubagentWorkItem,
   correlateSubagentWorkItems,
   mergeProxyMetadataWithRealExecution,
+  trustedTargetSessionID,
 } from "./subagent-classification.js";
 import type { ChildSessionState, StatuslineState, StatusCounts } from "./state.js";
 
@@ -20,6 +22,147 @@ export interface SubagentProjection {
   totalExecuted: number;
 }
 
+export interface SubagentLineageIndex {
+  readonly rowsByParentID: ReadonlyMap<
+    string,
+    readonly ChildSessionState[]
+  >;
+  readonly authoritativeSessionIDs: ReadonlySet<string>;
+}
+
+export interface SubagentTreeRow {
+  readonly child: ChildSessionState;
+  readonly depth: number;
+  readonly parentSessionID: string;
+}
+
+export interface SubagentSubtreeProjection {
+  readonly rows: readonly SubagentTreeRow[];
+  readonly canonicalRows: readonly ChildSessionState[];
+  readonly executionIDs: ReadonlySet<string>;
+  readonly retainedCounts: StatusCounts;
+}
+
+export function getSubagentLineageIndex(
+  state: StatuslineState,
+): SubagentLineageIndex {
+  const rowsByParentID = new Map<string, ChildSessionState[]>();
+  const authoritativeSessionIDs = new Set<string>();
+  for (const row of Object.values(state.children)) {
+    const siblings = rowsByParentID.get(row.parentID);
+    if (siblings) siblings.push(row);
+    else rowsByParentID.set(row.parentID, [row]);
+
+    if (classifySubagentWorkItem(row).kind === "real-execution") {
+      authoritativeSessionIDs.add(row.id);
+    }
+  }
+
+  return {
+    rowsByParentID,
+    authoritativeSessionIDs,
+  };
+}
+
+export function projectSubagentSubtree(input: {
+  readonly index: SubagentLineageIndex;
+  readonly rootSessionID: string;
+  readonly compareSiblings: (
+    left: ChildSessionState,
+    right: ChildSessionState,
+  ) => number;
+}): SubagentSubtreeProjection {
+  const scopedRows: ChildSessionState[] = [];
+  const pendingParentIDs = [input.rootSessionID];
+  const visitedSessionIDs = new Set([input.rootSessionID]);
+
+  while (pendingParentIDs.length > 0) {
+    const parentSessionID = pendingParentIDs.pop();
+    if (parentSessionID === undefined) continue;
+
+    const children = input.index.rowsByParentID.get(parentSessionID) ?? [];
+    for (const child of children) {
+      if (classifySubagentWorkItem(child).kind !== "real-execution") {
+        scopedRows.push(child);
+        continue;
+      }
+      if (visitedSessionIDs.has(child.id)) continue;
+
+      visitedSessionIDs.add(child.id);
+      scopedRows.push(child);
+      pendingParentIDs.push(child.id);
+    }
+  }
+
+  const lineageIDsByExecutionID = new Map<string, string[]>();
+  for (const row of scopedRows) {
+    const classification = classifySubagentWorkItem(row);
+    if (classification.kind !== "real-execution") continue;
+
+    const lineageIDs = lineageIDsByExecutionID.get(classification.executionID);
+    if (lineageIDs) lineageIDs.push(row.id);
+    else lineageIDsByExecutionID.set(classification.executionID, [row.id]);
+  }
+
+  const canonicalByParentID = new Map<string, ChildSessionState[]>();
+  for (const row of buildCanonicalRows(scopedRows)) {
+    const siblings = canonicalByParentID.get(row.parentID);
+    if (siblings) siblings.push(row);
+    else canonicalByParentID.set(row.parentID, [row]);
+  }
+  const rows: SubagentTreeRow[] = [];
+  const executionIDs = new Set<string>();
+  const stack: Array<{
+    readonly child: ChildSessionState;
+    readonly depth: number;
+  }> = [];
+  const rootChildren = [...(canonicalByParentID.get(input.rootSessionID) ?? [])];
+  rootChildren.sort(input.compareSiblings);
+  for (let index = rootChildren.length - 1; index >= 0; index -= 1) {
+    const child = rootChildren[index];
+    if (child) stack.push({ child, depth: 0 });
+  }
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) continue;
+
+    const executionID = trustedTargetSessionID(current.child) ?? current.child.id;
+    if (executionIDs.has(executionID)) continue;
+    executionIDs.add(executionID);
+    rows.push({
+      child: current.child,
+      depth: current.depth,
+      parentSessionID: current.child.parentID,
+    });
+
+    const lineageIDs = lineageIDsByExecutionID.get(executionID) ?? [current.child.id];
+    const children: ChildSessionState[] = [];
+    const childExecutionIDs = new Set<string>();
+    for (const lineageID of lineageIDs) {
+      for (const child of canonicalByParentID.get(lineageID) ?? []) {
+        const childExecutionID = trustedTargetSessionID(child) ?? child.id;
+        if (childExecutionIDs.has(childExecutionID)) continue;
+        childExecutionIDs.add(childExecutionID);
+        children.push(child);
+      }
+    }
+    children.sort(input.compareSiblings);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      const child = children[index];
+      if (child) stack.push({ child, depth: current.depth + 1 });
+    }
+  }
+
+  const canonicalRows = rows.map(({ child }) => child);
+  return {
+    rows,
+    canonicalRows,
+    executionIDs,
+    retainedCounts: computeRetainedCounts(canonicalRows),
+  };
+}
+
 export function buildCanonicalRows(children: ChildSessionState[]): ChildSessionState[] {
   return correlateSubagentWorkItems(children).map(({ real, proxies }) =>
     proxies.reduce(
@@ -29,7 +172,7 @@ export function buildCanonicalRows(children: ChildSessionState[]): ChildSessionS
   );
 }
 
-function computeRetainedCounts(rows: ChildSessionState[]): StatusCounts {
+function computeRetainedCounts(rows: readonly ChildSessionState[]): StatusCounts {
   const counts: StatusCounts = { running: 0, done: 0, error: 0 };
   for (const row of rows) {
     if (row.status === "running") counts.running += 1;
