@@ -58,21 +58,23 @@ export function getLocale(): Locale {
 }
 
 /**
- * Translates a key to the current locale.
- * Throws if the key is not found in translations.
+ * Translates a key to the current locale. Falls back to the English
+ * translation if the current locale is missing the key, and finally to
+ * the key string itself so a typo in a new key cannot crash the plugin.
+ * Callers that need to surface missing keys for diagnostics should call
+ * `hasTranslation(key)` first.
  */
 export function t(key: TranslationKey): string {
   const locale = getLocale();
   const translation = translations[locale][key];
+  if (translation !== undefined) return translation;
 
-  if (translation === undefined) {
-    // Fallback to English if key missing in current locale
-    const fallback = translations.en[key];
-    if (fallback === undefined) {
-      throw new Error(`Missing translation key: ${key}`);
-    }
-    return fallback;
-  }
+  // Fallback to English if key missing in current locale.
+  const fallback = translations.en[key];
+  if (fallback !== undefined) return fallback;
 
-  return translation;
+  // Last resort: return the key itself. The debug log is opt-in via
+  // `OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS`; production runs will just
+  // show the key string, which is better than a plugin crash.
+  return key;
 }
