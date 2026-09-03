@@ -135,7 +135,7 @@ Casos normales:
 | Hay más entradas internas que filas          | El render colapsó duplicados.                   |
 | El total es mayor que filas visibles         | Filas `done` viejas se ocultaron o podaron.     |
 | Un wrapper aparece pero no suma              | `source: "tool"` es evidencia, no ejecución.    |
-| Un subtask y una sesión cuentan una sola vez | El contador se reconcilió hacia la sesión real. |
+| Un subtask y una sesión producen un solo conteo | El subtask sintético no cuenta; la sesión real `ses_*` observada cuenta una vez. |
 
 ## Veo subagentes `running` viejos
 
@@ -168,6 +168,8 @@ El plugin muestra tokens/contexto solo si encuentra datos en alguna fuente:
 - eventos de OpenCode;
 - estado vivo de TUI;
 - API `session.messages` de OpenCode.
+
+Los snapshots persistidos, la base de datos local de OpenCode y los archivos de log recientes no son fuentes para recuperar tokens.
 
 Si OpenCode no expone esa información o el formato cambió, la fila se muestra sin tokens.
 
@@ -246,13 +248,13 @@ Pasos:
 
 ## Tests fallan por estado o filesystem
 
-Los tests de runtime usan temp dirs y variables de entorno.
+Los tests de filesystem usan temp dirs y variables de entorno.
 
 Si agregaste una variable nueva que se muta en tests, asegurate de restaurarla en `test/setup.ts`.
 
 Si un test escribe archivos:
 
-- usá `createRuntimeHarness()`;
+- usá `createFileHarness()` desde `test/helpers/test-harness.ts`;
 - no hardcodees rutas globales;
 - limpiá timers/mocks;
 - preferí fixtures chicos.
@@ -362,4 +364,4 @@ Cuando algo falla, seguí este orden:
 | `src/reconcile.ts`                     | Si un `running` viejo no se cierra.            |
 | `src/tui.tsx`                          | Si falla UI, hydration o navegación.           |
 | `src/tui-commands.ts`                  | Si fallan comandos o `Alt+B`.                  |
-| `test/helpers/runtime-harness.ts`      | Si fallan tests de filesystem/env.             |
+| `test/helpers/test-harness.ts`         | Si fallan tests de filesystem/env.             |

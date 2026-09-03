@@ -8,12 +8,7 @@ La regla práctica:
 
 ## Requisitos
 
-Según `CONTRIBUTING.md`, el proyecto espera:
-
-- Node.js 20+
-- pnpm 9+
-
-Nota: el CI de PR usa pnpm 10, mientras que la documentación de contribución pide pnpm 9+. Para desarrollo normal, usá pnpm 9+ y respetá el lockfile.
+El paquete requiere Node.js 24 o más reciente. Usá la versión de pnpm declarada en `package.json` y respetá el lockfile.
 
 ## Instalación local
 
@@ -51,19 +46,17 @@ pnpm pack --dry-run
 
 ## Build
 
-El build usa `tsup.config.ts` y genera dos salidas principales:
+El build usa `tsup.config.ts` y genera un único bundle TUI:
 
-| Fuente         | Salida                  | Uso                        |
-| -------------- | ----------------------- | -------------------------- |
-| `src/tui.tsx`  | `dist/tui.js` + tipos   | Plugin TUI principal.      |
-| `src/index.ts` | `dist/index.js` + tipos | Runtime plugin file-based. |
+| Fuente | Salida | Uso |
+| --- | --- | --- |
+| `src/tui.tsx` | `dist/tui.js` + `dist/tui.d.ts` | Plugin TUI soportado. |
 
-El paquete publica estos entrypoints:
+Los dos entrypoints soportados resuelven esa misma salida TUI:
 
 ```txt
 opencode-subagent-statusline
 opencode-subagent-statusline/tui
-opencode-subagent-statusline/runtime
 ```
 
 ## TypeScript
@@ -74,16 +67,13 @@ Archivos relevantes:
 | -------------------- | --------------------------------------------------------------------------------- |
 | `tsconfig.json`      | Config base del source. Usa NodeNext, ES2022, strict y JSX para `@opentui/solid`. |
 | `tsconfig.test.json` | Config para tests, Vitest y archivos de setup.                                    |
-| `tsup.config.ts`     | Config de build para runtime y TUI.                                               |
+| `tsup.config.ts`     | Config del único build TUI.                                                       |
 
 ## Estrategia de tests
 
-El proyecto usa Vitest.
+El proyecto usa Vitest para unit tests determinísticos y seams focalizados de integración TUI. Los tests puros de proyección, descubrimiento de descendientes y filas del árbol cubren el comportamiento anidado sin iniciar un host OpenCode completo.
 
-Hay dos capas principales:
-
-1. **Unit tests** para lógica determinística.
-2. **Runtime integration tests** para filesystem y manejo de eventos estilo OpenCode.
+La referencia actual de la suite completa es de 351 tests aprobados en 17 archivos.
 
 La UI visual completa se deja fuera de E2E profundo por ahora para evitar tests frágiles contra el host.
 
@@ -96,10 +86,14 @@ La UI visual completa se deja fuera de E2E profundo por ahora para evitar tests 
 | `src/render.test.ts`              | Render textual, collapse, visibilidad, duración, tokens y color/no-color.               |
 | `src/reconcile.test.ts`           | Normalización de estados, stale-running, backoff y fail-closed.                         |
 | `src/text-width.test.ts`          | Ancho de columnas para texto CJK/full-width, marcas combinantes y truncado.              |
-| `src/tui.test.ts`                 | Registro de comandos, keybinding `Alt+B` y fallback legacy.                             |
-| `test/index.integration.test.ts`  | Plugin runtime, `state.json`, `status.txt`, preserve-state y errores de filesystem.     |
-| `test/helpers/runtime-harness.ts` | Helpers para temp dirs, fixtures, env vars y fake time.                                 |
+| `src/projection.test.ts`          | Proyección pura a toda profundidad, orden padre-hijo, correlación, contadores y ciclos. |
+| `src/tui-descendant-hydration.test.ts` | Descubrimiento iterativo acotado, cancelación, filtrado fail-closed y batch único. |
+| `src/tui-tree-row.test.ts`        | Indentación pura, ajuste en ancho estrecho, labels y navegación anidada.                |
+| `src/tui.test.ts`                 | Ciclo de vida TUI, persistencia, comandos, `Alt+B`, keybindings y seams de integración. |
+| `src/persistence.test.ts`         | Coordinación de persistencia, coalescing, flush y conservación de metadata.             |
+| `test/helpers/test-harness.ts`    | Helpers para temp dirs aislados, fixtures, filesystem y fake time.                      |
 | `test/setup.ts`                   | Limpieza global de timers, mocks, env vars y temp dirs.                                 |
+| `test/package-contract.test.ts`   | Exports raíz y `/tui`, y ausencia de source y artefactos eliminados.                    |
 
 ## Coverage
 
@@ -118,27 +112,23 @@ Punto importante:
 
 > `src/tui.tsx` está excluido de coverage. No digas que la TUI visual completa está cubierta por tests automáticos.
 
-La cobertura actual se enfoca en módulos `.ts` determinísticos: eventos, estado, render, reconcile, helpers de ancho textual, comandos y runtime.
+La cobertura actual se enfoca en módulos `.ts` determinísticos: eventos, estado, proyección, render, reconcile, helpers de ancho textual, comandos, descubrimiento y filas del árbol.
 
 ## Patrón Arrange / Act / Assert
 
 Los tests deberían seguir esta estructura:
 
 ```ts
-it("persists a supported event", async () => {
+it("renders an empty summary", () => {
   // Arrange
-  const harness = await createRuntimeHarness();
-  const plugin = await SubagentStatusline(
-    {} as Parameters<typeof SubagentStatusline>[0],
-  );
-  const event = await readJsonFixture("session-created");
+  const state = createEmptyState();
 
   // Act
-  await plugin.event?.({ event } as never);
+  const output = renderStatusline(state);
 
   // Assert
-  const state = await readRuntimeState(harness.statePath);
-  expect(state.children.ses_child_1.status).toBe("running");
+  expect(output).toContain("0 running");
+  expect(output).toContain("0 done");
 });
 ```
 
@@ -185,25 +175,18 @@ it("does not count tool wrappers", () => {
 });
 ```
 
-## Cómo agregar un integration test runtime
+## Cómo agregar un test aislado de filesystem
 
-Los integration tests viven en `test/**/*.integration.test.ts`.
-
-Usá el harness para aislar filesystem y env vars:
+Usá `test/helpers/test-harness.ts` cuando un test de estado o persistencia necesite filesystem y variables de entorno aislados:
 
 ```ts
-it("writes runtime output after an event", async () => {
-  const harness = await createRuntimeHarness();
-  const plugin = await SubagentStatusline(
-    {} as Parameters<typeof SubagentStatusline>[0],
-  );
-  const event = await readJsonFixture("session-created");
+it("writes an isolated state snapshot", async () => {
+  const harness = await createFileHarness();
+  const state = createEmptyState();
 
-  await plugin.event?.({ event } as never);
+  await saveState(harness.statePath, state);
 
-  expect(await readStatusText(harness.textPath)).toContain(
-    "Review auth changes",
-  );
+  expect(await pathExists(harness.statePath)).toBe(true);
 });
 ```
 
@@ -211,10 +194,8 @@ Helpers útiles:
 
 | Helper                   | Uso                                                 |
 | ------------------------ | --------------------------------------------------- |
-| `createRuntimeHarness()` | Crea temp dir y configura estado aislado.           |
+| `createFileHarness()`    | Crea un temp dir y rutas aisladas de estado y texto. |
 | `readJsonFixture(name)`  | Lee fixtures de `test/fixtures/events/<name>.json`. |
-| `readRuntimeState(path)` | Lee `state.json`.                                   |
-| `readStatusText(path)`   | Lee `status.txt`.                                   |
 | `pathExists(path)`       | Verifica existencia sin throw.                      |
 | `useFrozenTime(iso)`     | Congela tiempo con fake timers.                     |
 
@@ -285,7 +266,7 @@ Cuando tocás `src/tui.tsx`, `src/render.ts` o comportamiento visible:
 
 3. Reiniciá OpenCode.
 4. Ejecutá una delegación/subagente.
-5. Verificá sidebar, estados y duración.
+5. Verificá descendientes en todas las profundidades, orden padre-hijo, estados y duración.
 6. Probá `Alt+B`, `j/k`, flechas, `Enter` y `Esc`.
 7. Si hay tokens/contexto, confirmá que se muestran sin romper la fila.
 8. Revisá logs si el plugin no carga.
@@ -319,7 +300,7 @@ Según `CONTRIBUTING.md`:
 Ejemplos de commits:
 
 ```txt
-feat: add runtime summary grouping
+feat: add nested session rows
 fix: handle missing token metadata
 docs: clarify local setup
 ```

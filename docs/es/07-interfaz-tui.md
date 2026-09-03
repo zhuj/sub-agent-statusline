@@ -57,7 +57,7 @@ No hace fallback a otras sesiones. El resumen de home, el statusline textual y `
 | `done`         | Trabajo terminado recientemente. Puede ocultarse después.         |
 | `error`        | Trabajo fallido. Debe permanecer visible para llamar la atención. |
 
-La UI evita convertir la sidebar en un historial infinito. Por eso las filas `done` viejas pueden desaparecer aunque sigan habiendo contado para `totalExecuted`.
+La UI evita convertir la sidebar en un historial infinito. Por eso las filas `done` viejas pueden desaparecer, aunque las sesiones reales asociadas sigan incluidas en `totalExecuted`.
 
 ## Resumen en home
 
@@ -70,6 +70,8 @@ Ejemplo:
 ```
 
 Este resumen sirve para saber rápidamente si hay subagentes activos sin abrir la sidebar.
+
+`Σ total` cuenta solo sesiones reales `ses_*` observadas. Las filas sintéticas `subtask:*` y `tool:*` pueden ser visibles o navegables después de correlacionarse, pero nunca incrementan el total.
 
 ## Foco de la lista
 
@@ -150,7 +152,7 @@ El plugin guarda preferencias en `api.kv` de OpenCode:
 | `subagents.sidebar.expanded` | Recuerda si la sección está expandida.  |
 | `subagents.sidebar.enabled`  | Recuerda si la sección está habilitada. |
 
-Estas preferencias pertenecen al entorno TUI de OpenCode, no al archivo `state.json` del runtime plugin.
+OpenCode guarda estas preferencias de interfaz en `api.kv`. Por separado, el plugin TUI es dueño de `state.json`, que conserva el estado y los contadores de subagentes. Ningún almacenamiento reemplaza al otro.
 
 Completed history está limitado por la retención de estado: las filas terminales
 se conservan hasta 3 días con un límite de 1.500 filas. Las filas ya podadas del

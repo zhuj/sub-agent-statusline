@@ -1,6 +1,6 @@
 # Configuración avanzada
 
-La configuración normal del plugin es mínima: agregarlo al `tui.json` de OpenCode. Esta página documenta opciones avanzadas para desarrollo, diagnóstico, debugging y runtime file-based.
+La configuración normal del plugin es mínima: agregarlo al `tui.json` de OpenCode. Esta página documenta opciones avanzadas para desarrollo TUI, persistencia y diagnóstico.
 
 Si solo querés usar el plugin, probablemente no necesitás tocar nada de esto.
 
@@ -21,6 +21,13 @@ Contenido mínimo:
 }
 ```
 
+El paquete soporta dos nombres para el mismo plugin TUI:
+
+```txt
+opencode-subagent-statusline
+opencode-subagent-statusline/tui
+```
+
 Para desarrollo local:
 
 ```json
@@ -34,18 +41,17 @@ Para desarrollo local:
 
 | Variable                                        | Uso                                                 | Cuándo tocarla                         |
 | ----------------------------------------------- | --------------------------------------------------- | -------------------------------------- |
-| `OPENCODE_SUBAGENT_STATUSLINE_STATE`            | Sobrescribe la ruta de `state.json`.                | Tests, debugging o runtime custom.     |
+| `OPENCODE_SUBAGENT_STATUSLINE_STATE`            | Sobrescribe la ruta TUI de `state.json`.            | Tests, debugging o una ruta local propia. |
 | `OPENCODE_SUBAGENT_STATUSLINE_INSTANCE`         | Define el nombre de instancia para rutas de estado. | Evitar colisiones entre procesos.      |
-| `OPENCODE_SUBAGENT_STATUSLINE_PRESERVE_STATE=1` | Evita limpiar estado al iniciar el runtime plugin.  | Debug de persistencia.                 |
 | `OPENCODE_SUBAGENT_STATUSLINE_COLOR=0`          | Desactiva ANSI colors en render textual.            | Logs o terminales sin color.           |
 | `NO_COLOR=1`                                    | Desactiva color ANSI de forma estándar.             | Entornos CI/logs.                      |
 | `OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS`     | Activa log JSONL de eventos TUI.                    | Investigar payloads de OpenCode.       |
 | `OPENCODE_SUBAGENT_STATUSLINE_STALE_RUNNING_MS` | Cambia umbral para stale-running.                   | Diagnóstico de filas `running` viejas. |
-| `XDG_RUNTIME_DIR`                               | Base por defecto para estado runtime.               | Entornos Linux/custom.                 |
+| `XDG_RUNTIME_DIR`                               | Base por defecto para archivos locales de la TUI.   | Entornos Linux/custom.                 |
 
 ## Rutas de estado
 
-Por defecto, el estado runtime se guarda bajo:
+Por defecto, el estado de la TUI se guarda bajo:
 
 ```txt
 $XDG_RUNTIME_DIR/opencode-subagent-statusline/<instance>/state.json
@@ -53,7 +59,7 @@ $XDG_RUNTIME_DIR/opencode-subagent-statusline/<instance>/state.json
 
 Si `XDG_RUNTIME_DIR` no existe, se usa el tempdir del sistema.
 
-Junto a `state.json`, el runtime plugin puede escribir:
+Junto a `state.json`, la TUI escribe:
 
 ```txt
 status.txt
@@ -86,22 +92,6 @@ OPENCODE_SUBAGENT_STATUSLINE_STATE=/tmp/subagent-statusline/state.json opencode
 ```
 
 Esto es especialmente útil en tests o reproducciones.
-
-## Preservar estado
-
-El runtime plugin puede limpiar estado al iniciar. Para preservarlo:
-
-```sh
-OPENCODE_SUBAGENT_STATUSLINE_PRESERVE_STATE=1 opencode
-```
-
-Uso típico:
-
-- inspeccionar `state.json` entre runs;
-- reproducir problemas de carga;
-- verificar normalización de estado persistido.
-
-Nota: esta opción aplica al runtime/file-based plugin. La TUI mantiene su estado principal en memoria y puede persistir snapshots auxiliares.
 
 ## Color
 
@@ -139,10 +129,10 @@ Usalo con cuidado: los eventos pueden contener bastante información y crecer r�
 
 ## Hidratación de tokens/contexto
 
-La TUI hidrata tokens/contexto desde el estado actual de OpenCode TUI y la API
-`session.messages`. No inspecciona directamente la base SQLite ni los archivos
-de log de OpenCode. Si OpenCode no expone datos de tokens, la fila sigue visible
-sin esos detalles.
+La TUI hidrata tokens/contexto únicamente desde el estado actual de OpenCode TUI
+y la API `session.messages`. No recupera evidencia de tokens desde la base de
+datos local de OpenCode, `state.json`, `status.txt` ni archivos de log. Si
+OpenCode no expone datos de tokens, la fila sigue visible sin esos detalles.
 
 ## Stale-running threshold
 
@@ -159,39 +149,6 @@ OPENCODE_SUBAGENT_STATUSLINE_STALE_RUNNING_MS=3600000 opencode
 Eso define 1 hora.
 
 No conviene usar valores agresivos salvo para diagnóstico. Un umbral muy bajo puede cerrar filas que todavía están activas si la evidencia no llegó a tiempo.
-
-## Runtime plugin avanzado
-
-El entrypoint runtime es:
-
-```txt
-opencode-subagent-statusline/runtime
-```
-
-Exporta `SubagentStatusline` desde `src/index.ts`.
-
-Este modo:
-
-- inicializa estado en disco;
-- procesa eventos;
-- guarda `state.json`;
-- escribe `status.txt`;
-- evita romper OpenCode ante eventos malformados o errores de escritura.
-
-La experiencia principal para usuarios sigue siendo el plugin TUI.
-
-## Diferencias entre TUI y runtime
-
-| Capacidad                             | TUI plugin        | Runtime plugin        |
-| ------------------------------------- | ----------------- | --------------------- |
-| Sidebar visual                        | Sí                | No                    |
-| Home footer                           | Sí                | No                    |
-| Navegación a sesión hija              | Sí                | No                    |
-| Hydration desde APIs OpenCode         | Sí                | No                    |
-| Reconcile periódico avanzado          | Sí                | No                    |
-| Token hydration desde TUI/SQLite/logs | Sí                | Limitado/no principal |
-| `state.json`                          | Snapshot auxiliar | Estado principal      |
-| `status.txt`                          | Snapshot auxiliar | Salida principal      |
 
 ## Cache de paquetes de OpenCode
 
@@ -269,7 +226,7 @@ Cuando algo no funciona:
 4. Confirmá que `tui.json` usa una ruta absoluta o el nombre del paquete.
 5. Limpiá cache de paquetes si hay una versión vieja.
 6. Activá `OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS` si necesitás ver payloads.
-7. Revisá `state.json` si estás probando el runtime plugin.
+7. Revisá `state.json`, `status.txt` o `tui-events.log` de la TUI para diagnosticar salidas locales.
 8. No asumas que tokens/contexto siempre estarán disponibles.
 
 ## Archivos relacionados
@@ -277,8 +234,7 @@ Cuando algo no funciona:
 | Archivo         | Qué mirar                                                |
 | --------------- | -------------------------------------------------------- |
 | `src/state.ts`  | Resolución de rutas, persistencia y variables de estado. |
-| `src/tui.tsx`   | Debug events, DB lookup, hydration, stale threshold.     |
-| `src/index.ts`  | Runtime plugin file-based.                               |
+| `src/tui.tsx`   | Eventos de debug, hidratación por API, persistencia y stale threshold. |
 | `src/render.ts` | Color y render textual.                                  |
 | `package.json`  | Exports, files publicados y peer dependencies.           |
 | `README.md`     | Instalación y troubleshooting básico.                    |
