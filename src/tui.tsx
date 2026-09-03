@@ -777,8 +777,10 @@ export function persistStateSnapshot(
   changedChildIDs?: readonly string[],
 ): Promise<void> {
   const snapshot: TuiPersistenceSnapshot = {
-    state: cloneState(state),
-    ...(changedChildIDs !== undefined ? { changedChildIDs } : {}),
+    state,
+    ...(changedChildIDs !== undefined
+      ? { changedChildIDs: [...changedChildIDs] }
+      : {}),
   };
   return flush
     ? persistence.flush(snapshot)
@@ -2208,10 +2210,10 @@ export async function hydratePreviousSubagents(
       persistenceCoordinator ??
       createPersistenceCoordinator<TuiPersistenceSnapshot>(
         async ({ state, changedChildIDs }) => {
-          await saveState(statePath, state, {
+          const prepared = await saveState(statePath, state, {
             ...(changedChildIDs !== undefined ? { changedChildIDs } : {}),
           });
-          await saveStatusText(textPath, renderStatusLine(state));
+          await saveStatusText(textPath, renderStatusLine(prepared));
         },
         { combineSnapshots: combineTuiPersistenceSnapshots },
       );
@@ -3092,10 +3094,10 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
   let lastStatusText = "";
   const persistence = createPersistenceCoordinator<TuiPersistenceSnapshot>(
     async ({ state, changedChildIDs }) => {
-      await saveState(statePath, state, {
+      const prepared = await saveState(statePath, state, {
         ...(changedChildIDs !== undefined ? { changedChildIDs } : {}),
       });
-      const nextText = renderStatusLine(state);
+      const nextText = renderStatusLine(prepared);
       // Skip status.txt write when the rendered summary is unchanged — the
       // aggregate text only changes on status/visibility transitions, which
       // are rare relative to detail-only event bursts.

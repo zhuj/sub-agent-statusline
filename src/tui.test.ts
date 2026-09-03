@@ -80,6 +80,7 @@ import {
   TOKEN_HYDRATION_ADMISSION_LIMIT,
 } from "./tui-hydration.js";
 import { textColumns } from "./text-width.js";
+import { renderStatusLine } from "./render.js";
 import {
   createManagedDeferredCallbacks,
   focusPromptWithDeferredRetry,
@@ -100,6 +101,7 @@ import {
 } from "./tui-commands.js";
 import {
   saveState,
+  saveStatusText,
   type ChildSessionState,
   type StatuslineState,
 } from "./state.js";
@@ -572,8 +574,9 @@ describe("TUI subagent snapshots", () => {
       }),
     ]);
     const persistence = createPersistenceCoordinator<TuiPersistenceSnapshot>(
-      async ({ state, changedChildIDs }) =>
-        saveState(harness.statePath, state, { changedChildIDs }),
+      async ({ state, changedChildIDs }) => {
+        await saveState(harness.statePath, state, { changedChildIDs });
+      },
       { settleDelayMs: 20, combineSnapshots: combineTuiPersistenceSnapshots },
     );
     const routeProjection = createCurrentRouteSubtreeCoordinator();
@@ -609,6 +612,154 @@ describe("TUI subagent snapshots", () => {
       ses_a: { status: "running", color: "red" },
       ses_b: { status: "running", color: "green" },
     });
+    persistence.close();
+  });
+
+  it("isolates an earlier writer generation from a mutated replacement state", async () => {
+    // Given
+    const harness = await createFileHarness();
+    const firstWriter = deferred<void>();
+    const stateA = stateWith([
+      child({
+        id: "ses_a",
+        title: "State A",
+        targetSessionID: "ses_a",
+        tokens: { input: 1, output: 2 },
+        model: { providerID: "provider-a", modelID: "model-a", variant: "a" },
+        color: "red",
+      }),
+    ]);
+    const stateB = stateWith([
+      child({
+        id: "ses_b",
+        title: "State B",
+        targetSessionID: "ses_b",
+        tokens: { input: 3, output: 4 },
+        model: { providerID: "provider-b", modelID: "model-b", variant: "b" },
+      }),
+    ]);
+    const preparedStates: StatuslineState[] = [];
+    const changedSnapshots: Array<readonly string[] | undefined> = [];
+    let writerCount = 0;
+    const persistence = createPersistenceCoordinator<TuiPersistenceSnapshot>(
+      async ({ state, changedChildIDs }) => {
+        const currentWriter = writerCount;
+        writerCount += 1;
+        if (currentWriter === 0) await firstWriter.promise;
+        const prepared = await saveState(
+          join(harness.dir, `state-${currentWriter}.json`),
+          state,
+          { ...(changedChildIDs !== undefined ? { changedChildIDs } : {}) },
+        );
+        preparedStates.push(prepared);
+        changedSnapshots.push(changedChildIDs);
+      },
+    );
+
+    // When
+    const first = persistStateSnapshot(persistence, stateA, false, ["ses_a"]);
+    await Promise.resolve();
+    const replacementIDs = ["ses_b"];
+    const second = persistStateSnapshot(
+      persistence,
+      stateB,
+      false,
+      replacementIDs,
+    );
+    replacementIDs.push("mutated-after-enqueue");
+    const replacementChild = stateB.children.ses_b;
+    if (!replacementChild) throw new TypeError("replacement child is missing");
+    replacementChild.tokens = { input: 30, output: 40, contextPercent: 50 };
+    replacementChild.model = {
+      providerID: "mutated-provider",
+      modelID: "mutated-model",
+      variant: "mutated",
+    };
+    firstWriter.resolve(undefined);
+    await Promise.all([first, second]);
+
+    // Then
+    expect(preparedStates).toHaveLength(2);
+    expect(changedSnapshots).toEqual([["ses_a"], ["ses_b"]]);
+    const firstPrepared = preparedStates[0];
+    const secondPrepared = preparedStates[1];
+    if (!firstPrepared || !secondPrepared) {
+      throw new TypeError("both persistence generations should be prepared");
+    }
+    expect(firstPrepared.children.ses_a).toMatchObject({
+      tokens: { input: 1, output: 2 },
+      model: { providerID: "provider-a", modelID: "model-a", variant: "a" },
+    });
+    expect(secondPrepared.children.ses_b).toMatchObject({
+      tokens: { input: 30, output: 40, contextPercent: 50 },
+      model: {
+        providerID: "mutated-provider",
+        modelID: "mutated-model",
+        variant: "mutated",
+      },
+    });
+    expect(stateA.children.ses_a).toMatchObject({
+      tokens: { input: 1, output: 2 },
+      model: { providerID: "provider-a", modelID: "model-a", variant: "a" },
+    });
+    persistence.close();
+  });
+
+  it("writes JSON and status text from the same normalized snapshot", async () => {
+    // Given
+    const harness = await createFileHarness();
+    const nowMs = Date.now();
+    const startedAt = new Date(nowMs - 120_000).toISOString();
+    const endedAt = new Date(nowMs - 60_000).toISOString();
+    const state = stateWith([
+      child({
+        id: "ses_child",
+        title: "Normalized worker",
+        status: "done",
+        color: "red",
+        startedAt,
+        updatedAt: endedAt,
+        endedAt,
+        tokens: { input: 100, output: 50, contextPercent: 12.5 },
+        model: {
+          providerID: " openai ",
+          modelID: " gpt-5.6 ",
+          variant: " high ",
+        },
+      }),
+    ]);
+    const persistence = createPersistenceCoordinator<TuiPersistenceSnapshot>(
+      async ({ state: queuedState, changedChildIDs }) => {
+        const prepared = await saveState(harness.statePath, queuedState, {
+          ...(changedChildIDs !== undefined ? { changedChildIDs } : {}),
+        });
+        await saveStatusText(harness.textPath, renderStatusLine(prepared));
+      },
+    );
+
+    // When
+    await persistStateSnapshot(persistence, state, true, ["ses_child"]);
+
+    // Then
+    const persisted: unknown = JSON.parse(
+      await readFile(harness.statePath, "utf8"),
+    );
+    const text = await readFile(harness.textPath, "utf8");
+    expect(persisted).toMatchObject({
+      children: {
+        ses_child: {
+          color: "green",
+          elapsedMs: 60_000,
+          model: {
+            providerID: "openai",
+            modelID: "gpt-5.6",
+            variant: "high",
+          },
+        },
+      },
+    });
+    expect(text).toContain("Normalized worker 01:00");
+    expect(text).toContain("150 tokens");
     persistence.close();
   });
 
