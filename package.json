@@ -52,15 +52,15 @@
   ],
   "license": "MIT",
   "peerDependencies": {
-    "@opencode-ai/plugin": "1.18.25",
-    "@opentui/core": "0.5.10",
-    "@opentui/solid": "0.5.10",
+    "@opencode-ai/plugin": "^1.18.25 <2",
+    "@opentui/core": "^0.5.10",
+    "@opentui/solid": "^0.5.10",
     "solid-js": ">=1.9.12 <2"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.18.25",
-    "@opentui/core": "0.5.10",
-    "@opentui/solid": "0.5.10",
+    "@opencode-ai/plugin": "^1.18.25 <2",
+    "@opentui/core": "^0.5.10",
+    "@opentui/solid": "^0.5.10",
     "@types/node": "^24.13.3",
     "@vitest/coverage-v8": "^4.1.7",
     "esbuild-plugin-solid": "^0.6.0",

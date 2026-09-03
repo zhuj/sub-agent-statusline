@@ -1,4 +1,7 @@
+/// <reference types="node" />
+
 import type { ChildTokenState } from "./state.js";
+import { createStableMaxHeap } from "./tui-hydration-heap.js";
 
 export const ROUTE_CHILD_MESSAGE_CONCURRENCY = 4;
 export const ROUTE_CHILD_MESSAGE_LIMIT = 50;
@@ -38,7 +41,9 @@ export type TokenHydrationQueue = {
 export function createTokenHydrationQueue(
   input: TokenHydrationQueueInput,
 ): TokenHydrationQueue {
-  const pending: TokenHydrationJob[] = [];
+  const pending = createStableMaxHeap<TokenHydrationJob>(
+    (job) => job.priority ?? 0,
+  );
   const admitted = new Set<string>();
   const idleResolvers: Array<() => void> = [];
   let active = 0;
@@ -64,7 +69,7 @@ export function createTokenHydrationQueue(
       active < TOKEN_HYDRATION_CONCURRENCY &&
       pending.length > 0
     ) {
-      const job = pending.shift();
+      const job = pending.pop();
       if (!job) break;
       active += 1;
       void (async () => {
@@ -108,7 +113,6 @@ export function createTokenHydrationQueue(
       }
       admitted.add(jobKey(job));
       pending.push(job);
-      pending.sort((left, right) => (right.priority ?? 0) - (left.priority ?? 0));
       schedulePump();
       return true;
     },
@@ -121,7 +125,8 @@ export function createTokenHydrationQueue(
     dispose() {
       if (closed) return;
       closed = true;
-      for (const job of pending.splice(0)) admitted.delete(jobKey(job));
+      pending.clear();
+      admitted.clear();
       resolveIdle();
     },
   };

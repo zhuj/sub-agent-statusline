@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   applySubagentEvent,
   applySubagentEventDetailed,
@@ -191,6 +191,31 @@ describe("events", () => {
     expect(result.changedChildIDs).toEqual(["ses_transaction_child"]);
     expect(result.mutationCategories).toEqual(["insert"]);
     expect(state.children.ses_transaction_child?.status).toBe("running");
+  });
+
+  it("deduplicates child IDs when a status mutation includes its own target", () => {
+    const state = createEmptyState();
+    applySubagentEvent(state, {
+      type: "session.created",
+      properties: {
+        info: {
+          id: "ses_deduplicated_child",
+          parentID: "ses_parent",
+          title: "Deduplicated child",
+        },
+      },
+    });
+
+    const result = applySubagentEventDetailed(state, {
+      type: "session.idle",
+      properties: {
+        sessionID: "ses_deduplicated_child",
+        info: { time: { updated: "2026-05-10T10:20:00.000Z" } },
+      },
+    });
+
+    expect(result.changedChildIDs).toEqual(["ses_deduplicated_child"]);
+    expect(result.mutationCategories).toEqual(["status"]);
   });
 
   it("extracts session identifiers from supported event locations", () => {
@@ -675,6 +700,66 @@ describe("assistant model metadata", () => {
       modelID: "gpt-5.6",
       variant: "high",
     });
+  });
+
+  it("selects the latest out-of-order assistant with a single scan", () => {
+    const sort = vi.spyOn(Array.prototype, "sort");
+    const latest = extractLatestAssistantModel([
+      {
+        sessionID: "ses_child",
+        role: "assistant",
+        providerID: "provider",
+        modelID: "latest-model",
+        time: { updated: 30 },
+      },
+      {
+        sessionID: "ses_child",
+        role: "assistant",
+        providerID: "provider",
+        modelID: "old-model",
+        time: { updated: 10 },
+      },
+      {
+        sessionID: "ses_child",
+        role: "assistant",
+        providerID: "provider",
+        modelID: "middle-model",
+        time: { updated: 20 },
+      },
+    ]);
+    const sortCalls = sort.mock.calls.length;
+    sort.mockRestore();
+
+    expect(sortCalls).toBe(0);
+    expect(latest?.model).toEqual({
+      providerID: "provider",
+      modelID: "latest-model",
+    });
+  });
+
+  it("uses the later input assistant when activity timestamps tie", () => {
+    const latest = extractLatestAssistantModel([
+      {
+        sessionID: "ses_child",
+        role: "assistant",
+        providerID: "first-provider",
+        modelID: "first-model",
+        time: { completed: 40 },
+      },
+      {
+        sessionID: "ses_child",
+        role: "assistant",
+        providerID: "second-provider",
+        modelID: "second-model",
+        time: { completed: 40 },
+      },
+    ]);
+
+    expect(latest?.model).toEqual({
+      providerID: "second-provider",
+      modelID: "second-model",
+    });
+    expect(latest?.updatedAt).toBe("1970-01-01T00:00:00.040Z");
   });
 
   it("selects the latest assistant and applies message.updated to its child session", () => {

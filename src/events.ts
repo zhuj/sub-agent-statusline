@@ -1,6 +1,5 @@
 import type {
   ChildModelState,
-  ChildSessionState,
   ChildTokenState,
   StatuslineState,
 } from "./state.js";
@@ -104,7 +103,6 @@ import {
   createChildLookup,
   lookupChildren,
   refreshChildLookup,
-  setChildTarget,
   type ChildLookup,
 } from "./events-lookup.js";
 
@@ -136,18 +134,17 @@ export function extractLatestAssistantModel(
   input: unknown | readonly unknown[],
 ): { sessionID: string; model?: ChildModelState; updatedAt?: string } | undefined {
   const values = Array.isArray(input) ? input : [input];
-  const assistants = values
-    .map((value, index) => ({ message: normalizeMessage(value), index }))
-    .filter(
-      (entry): entry is { message: Record<string, unknown>; index: number } =>
-        entry.message?.role === "assistant",
-    )
-    .sort(
-      (left, right) =>
-        messageActivityMs(left.message) - messageActivityMs(right.message) ||
-        left.index - right.index,
-    );
-  const latest = assistants.at(-1)?.message;
+  let latest: Record<string, unknown> | undefined;
+  let latestActivity = Number.NEGATIVE_INFINITY;
+  for (const value of values) {
+    const message = normalizeMessage(value);
+    if (message?.role !== "assistant") continue;
+    const activity = messageActivityMs(message);
+    if (activity >= latestActivity) {
+      latest = message;
+      latestActivity = activity;
+    }
+  }
   if (!latest) return undefined;
   const sessionID = asString(latest.sessionID);
   if (!sessionID) return undefined;
@@ -917,6 +914,7 @@ export function applySubagentEventDetailed(
     changedChildIDs: [],
     mutationCategories: [],
   };
+  const recordedChildIDs = new Set<string>();
   const record = (
     changed: boolean,
     childIDs: readonly string[],
@@ -925,7 +923,8 @@ export function applySubagentEventDetailed(
     if (!changed) return;
     result.changed = true;
     for (const childID of childIDs) {
-      if (!result.changedChildIDs.includes(childID)) {
+      if (!recordedChildIDs.has(childID)) {
+        recordedChildIDs.add(childID);
         result.changedChildIDs.push(childID);
       }
       refreshChildLookup(lookup, state, childID);

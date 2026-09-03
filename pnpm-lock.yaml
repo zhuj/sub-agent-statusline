@@ -13,13 +13,13 @@ importers:
         version: 1.9.12
     devDependencies:
       '@opencode-ai/plugin':
-        specifier: 1.18.25
+        specifier: ^1.18.25 <2
         version: 1.18.25(@opentui/core@0.5.10(typescript@5.9.3)(web-tree-sitter@0.25.10))(@opentui/solid@0.5.10(solid-js@1.9.12)(typescript@5.9.3)(web-tree-sitter@0.25.10))
       '@opentui/core':
-        specifier: 0.5.10
+        specifier: ^0.5.10
         version: 0.5.10(typescript@5.9.3)(web-tree-sitter@0.25.10)
       '@opentui/solid':
-        specifier: 0.5.10
+        specifier: ^0.5.10
         version: 0.5.10(solid-js@1.9.12)(typescript@5.9.3)(web-tree-sitter@0.25.10)
       '@types/node':
         specifier: ^24.13.3
