@@ -8,12 +8,7 @@ Practical rule:
 
 ## Requirements
 
-According to `CONTRIBUTING.md`, the project expects:
-
-- Node.js 20+
-- pnpm 9+
-
-Note: PR CI uses pnpm 10, while contribution docs say pnpm 9+. For normal development, use pnpm 9+ and respect the lockfile.
+The package requires Node.js 24 or newer. Use the pnpm version declared in `package.json` and respect the lockfile.
 
 ## Local install
 
@@ -49,19 +44,17 @@ pnpm pack --dry-run
 
 ## Build outputs
 
-`tsup.config.ts` creates two main outputs:
+`tsup.config.ts` builds one TUI bundle:
 
 | Source | Output | Use |
 | --- | --- | --- |
-| `src/tui.tsx` | `dist/tui.js` + types | Main TUI plugin. |
-| `src/index.ts` | `dist/index.js` + types | Runtime file-based plugin. |
+| `src/tui.tsx` | `dist/tui.js` + `dist/tui.d.ts` | Supported TUI plugin. |
 
-Package entrypoints:
+Both supported package entrypoints resolve to that TUI output:
 
 ```txt
 opencode-subagent-statusline
 opencode-subagent-statusline/tui
-opencode-subagent-statusline/runtime
 ```
 
 ## TypeScript files
@@ -70,14 +63,13 @@ opencode-subagent-statusline/runtime
 | --- | --- |
 | `tsconfig.json` | Base source config. NodeNext, ES2022, strict, JSX for `@opentui/solid`. |
 | `tsconfig.test.json` | Test config for Vitest and setup files. |
-| `tsup.config.ts` | Runtime and TUI build config. |
+| `tsup.config.ts` | Single TUI build config. |
 
 ## Test strategy
 
-The project uses Vitest with two main layers:
+The project uses Vitest for deterministic unit tests and focused TUI integration seams. Pure projection, descendant discovery, and tree-row tests cover the nested-session behavior without launching a full OpenCode host.
 
-1. **Unit tests** for deterministic logic.
-2. **Runtime integration tests** for filesystem and OpenCode-style event handling.
+The current full-suite baseline is 351 passing tests across 17 files.
 
 Deep visual TUI E2E automation is intentionally deferred to avoid brittle host-driven tests.
 
@@ -90,10 +82,14 @@ Deep visual TUI E2E automation is intentionally deferred to avoid brittle host-d
 | `src/render.test.ts` | Text rendering, collapse, visibility, duration, tokens, color/no-color. |
 | `src/reconcile.test.ts` | Status normalization, stale-running, backoff, fail-closed behavior. |
 | `src/text-width.test.ts` | Terminal column width for CJK/full-width text, combining marks, and truncation. |
-| `src/tui.test.ts` | Command registration, `Alt+B` keybinding, legacy fallback. |
-| `test/index.integration.test.ts` | Runtime plugin, `state.json`, `status.txt`, preserve-state, filesystem failures. |
-| `test/helpers/runtime-harness.ts` | Helpers for temp dirs, fixtures, env vars, and fake time. |
+| `src/projection.test.ts` | Pure all-depth lineage projection, parent-before-child order, correlation, counters, and cycle safety. |
+| `src/tui-descendant-hydration.test.ts` | Iterative bounded descendant discovery, cancellation, fail-closed filtering, and one-batch updates. |
+| `src/tui-tree-row.test.ts` | Pure tree-row indentation, narrow-width clamping, labels, and nested navigation targets. |
+| `src/tui.test.ts` | TUI lifecycle, persistence, commands, `Alt+B`, keybindings, and integration seams. |
+| `src/persistence.test.ts` | Persistence coordination, coalescing, flush behavior, and metadata preservation. |
+| `test/helpers/test-harness.ts` | Helpers for isolated temp dirs, fixtures, filesystem checks, and fake time. |
 | `test/setup.ts` | Global cleanup for timers, mocks, env vars, and temp dirs. |
+| `test/package-contract.test.ts` | Root and `/tui` exports plus absence of removed source and build artifacts. |
 
 ## Coverage
 
@@ -112,25 +108,23 @@ Important:
 
 > `src/tui.tsx` is excluded from coverage. Do not claim the complete visual TUI is automatically covered.
 
-Coverage focuses on deterministic `.ts` modules: events, state, render, reconcile, text width helpers, commands, and runtime.
+Coverage focuses on deterministic `.ts` modules: events, state, projection, render, reconcile, text width helpers, commands, discovery, and tree rows.
 
 ## Arrange / Act / Assert
 
 Tests should follow this structure:
 
 ```ts
-it("persists a supported event", async () => {
+it("renders an empty summary", () => {
   // Arrange
-  const harness = await createRuntimeHarness();
-  const plugin = await SubagentStatusline({} as Parameters<typeof SubagentStatusline>[0]);
-  const event = await readJsonFixture("session-created");
+  const state = createEmptyState();
 
   // Act
-  await plugin.event?.({ event } as never);
+  const output = renderStatusline(state);
 
   // Assert
-  const state = await readRuntimeState(harness.statePath);
-  expect(state.children.ses_child_1.status).toBe("running");
+  expect(output).toContain("0 running");
+  expect(output).toContain("0 done");
 });
 ```
 
@@ -177,21 +171,18 @@ it("does not count tool wrappers", () => {
 });
 ```
 
-## Adding a runtime integration test
+## Adding an isolated filesystem test
 
-Integration tests live in `test/**/*.integration.test.ts`.
-
-Use the harness to isolate filesystem and env vars:
+Use `test/helpers/test-harness.ts` when a state or persistence test needs an isolated filesystem and environment:
 
 ```ts
-it("writes runtime output after an event", async () => {
-  const harness = await createRuntimeHarness();
-  const plugin = await SubagentStatusline({} as Parameters<typeof SubagentStatusline>[0]);
-  const event = await readJsonFixture("session-created");
+it("writes an isolated state snapshot", async () => {
+  const harness = await createFileHarness();
+  const state = createEmptyState();
 
-  await plugin.event?.({ event } as never);
+  await saveState(harness.statePath, state);
 
-  expect(await readStatusText(harness.textPath)).toContain("Review auth changes");
+  expect(await pathExists(harness.statePath)).toBe(true);
 });
 ```
 
@@ -199,10 +190,8 @@ Useful helpers:
 
 | Helper | Use |
 | --- | --- |
-| `createRuntimeHarness()` | Creates temp dir and isolated state. |
+| `createFileHarness()` | Creates a temp dir and isolated state/text paths. |
 | `readJsonFixture(name)` | Reads `test/fixtures/events/<name>.json`. |
-| `readRuntimeState(path)` | Reads `state.json`. |
-| `readStatusText(path)` | Reads `status.txt`. |
 | `pathExists(path)` | Checks existence without throwing. |
 | `useFrozenTime(iso)` | Freezes time with fake timers. |
 
@@ -269,7 +258,7 @@ When changing `src/tui.tsx`, `src/render.ts`, or visible behavior:
 
 3. Restart OpenCode.
 4. Run a delegation/subagent.
-5. Verify sidebar, statuses, and duration.
+5. Verify descendants at every depth, parent-before-child order, statuses, and duration.
 6. Test `Alt+B`, `j/k`, arrows, `Enter`, and `Esc`.
 7. If token/context data exists, confirm it does not break the row.
 8. Check logs if the plugin does not load.
@@ -303,7 +292,7 @@ From `CONTRIBUTING.md`:
 Example commits:
 
 ```txt
-feat: add runtime summary grouping
+feat: add nested session rows
 fix: handle missing token metadata
 docs: clarify local setup
 ```

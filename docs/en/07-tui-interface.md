@@ -68,6 +68,8 @@ When relevant activity exists, the plugin can show a compact home summary:
 
 This gives a quick signal without opening the sidebar.
 
+`Σ total` counts only observed real `ses_*` sessions. Synthetic `subtask:*` and `tool:*` rows may be visible or navigable after correlation, but they never increment the total.
+
 ## List focus
 
 The sidebar has a focus mode for keyboard navigation.
@@ -146,7 +148,7 @@ Preferences are stored through OpenCode `api.kv`:
 | `subagents.sidebar.expanded` | Remembers whether the section is expanded. |
 | `subagents.sidebar.enabled` | Remembers whether the section is enabled. |
 
-These preferences belong to the TUI environment, not the runtime plugin's `state.json`.
+OpenCode stores these interface preferences in `api.kv`. Separately, the TUI plugin owns `state.json` for retained subagent state and counters. Neither storage replaces the other.
 
 Completed history is bounded by state retention: terminal rows are retained for
 up to 3 days with a 1,500-row cap. Rows already pruned from state are not

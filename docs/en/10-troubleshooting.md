@@ -133,7 +133,7 @@ This can also be correct.
 | More internal entries than rows | Rendering collapsed duplicates. |
 | Total is larger than visible rows | Old `done` rows were hidden or pruned. |
 | A wrapper appears but does not increment | `source: "tool"` is evidence, not execution. |
-| A subtask and session count once | Counter reconciled toward the real session. |
+| A subtask and session produce one count | The synthetic subtask stays uncounted; the observed real `ses_*` session counts once. |
 
 ## Old subagents remain `running`
 
@@ -166,6 +166,8 @@ The plugin shows tokens/context only if it finds data in:
 - OpenCode events;
 - live TUI state;
 - the OpenCode `session.messages` API.
+
+Persisted snapshots, OpenCode's local database, and recent log files are not token-recovery sources.
 
 If OpenCode does not expose that information or the format changed, the row is shown without tokens.
 
@@ -236,13 +238,13 @@ Try:
 
 ## Tests fail because of state or filesystem
 
-Runtime tests use temp dirs and environment variables.
+Filesystem tests use temp dirs and environment variables.
 
 If a new env var is mutated in tests, restore it in `test/setup.ts`.
 
 For file-writing tests:
 
-- use `createRuntimeHarness()`;
+- use `createFileHarness()` from `test/helpers/test-harness.ts`;
 - do not hardcode global paths;
 - clean timers/mocks;
 - prefer small fixtures.
@@ -348,4 +350,4 @@ Caution: it can grow quickly and may include session data.
 | `src/reconcile.ts` | If an old `running` row does not close. |
 | `src/tui.tsx` | UI, hydration, or navigation problems. |
 | `src/tui-commands.ts` | Command or `Alt+B` problems. |
-| `test/helpers/runtime-harness.ts` | Filesystem/env test failures. |
+| `test/helpers/test-harness.ts` | Filesystem/env test failures. |
