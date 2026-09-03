@@ -11,7 +11,27 @@ import {
   type EventLike,
 } from "./events.js";
 import { createEmptyState, upsertRunningChild } from "./state.js";
-import { readJsonFixture } from "../test/helpers/runtime-harness.js";
+import { readJsonFixture } from "../test/helpers/test-harness.js";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseEventFixture(value: unknown): EventLike {
+  if (!isRecord(value)) throw new TypeError("Event fixture must be an object");
+  const properties = value.properties;
+  if (properties !== undefined && !isRecord(properties)) {
+    throw new TypeError("Event fixture properties must be an object");
+  }
+  if (
+    isRecord(properties) &&
+    properties.info !== undefined &&
+    !isRecord(properties.info)
+  ) {
+    throw new TypeError("Event fixture properties.info must be an object");
+  }
+  return value;
+}
 
 function upsertSubtask(
   state: ReturnType<typeof createEmptyState>,
@@ -38,6 +58,53 @@ function upsertSubtask(
 }
 
 describe("events", () => {
+  it.each(["__proto__", "constructor", "ses_"])(
+    "rejects malformed real-session event ID %s",
+    (sessionID) => {
+      // Given
+      const state = createEmptyState();
+
+      // When
+      const changed = applySubagentEvent(state, {
+        type: "session.created",
+        properties: {
+          sessionID,
+          info: {
+            id: sessionID,
+            title: "Malformed child",
+            parentID: "ses_parent",
+          },
+        },
+      });
+
+      // Then
+      expect(changed).toBe(false);
+      expect(Object.keys(state.children)).toEqual([]);
+    },
+  );
+
+  it("accepts a canonical real-session event ID", () => {
+    // Given
+    const state = createEmptyState();
+
+    // When
+    const changed = applySubagentEvent(state, {
+      type: "session.created",
+      properties: {
+        sessionID: "ses_child",
+        info: {
+          id: "ses_child",
+          title: "Valid child",
+          parentID: "ses_parent",
+        },
+      },
+    });
+
+    // Then
+    expect(changed).toBe(true);
+    expect(state.children.ses_child?.source).toBe("session");
+  });
+
   it("does not treat a non-session-id source session as a synthetic target", () => {
     const state = createEmptyState();
     upsertRunningChild(state, {
@@ -69,15 +136,11 @@ describe("events", () => {
 
   it("does not parent-only backfill beside a non-session-id source session sibling", () => {
     const state = createEmptyState();
-    applySubagentEvent(state, {
-      type: "session.created",
-      properties: {
-        info: {
-          id: "child_without_session_prefix",
-          parentID: "ses_parent",
-          title: "Existing real child",
-        },
-      },
+    upsertRunningChild(state, {
+      id: "child_without_session_prefix",
+      parentID: "ses_parent",
+      title: "Existing real child",
+      source: "session",
     });
     applySubagentEvent(state, {
       type: "message.part.updated",
@@ -266,7 +329,7 @@ describe("events", () => {
   });
 
   it("extracts useful tool details while replacing technical delegation titles", async () => {
-    const event = await readJsonFixture<EventLike>("tool-updated");
+    const event = parseEventFixture(await readJsonFixture("tool-updated"));
 
     expect(extractChildDetails(event)).toMatchObject({
       title: "Investigate flaky tests",

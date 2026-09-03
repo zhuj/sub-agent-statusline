@@ -8,6 +8,7 @@ import {
   deriveOpenCodeSessionStatus,
   hasStructuredErrorEvidence,
 } from "./reconcile.js";
+import { isRealSessionID } from "./subagent-classification.js";
 import {
   markChildStatus,
   parseTimestamp,
@@ -261,10 +262,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object";
 }
 
-function isSessionID(value: unknown): value is string {
-  return typeof value === "string" && value.startsWith("ses_");
-}
-
 function collectSessionIDs(
   input: unknown,
   target: Set<string>,
@@ -272,8 +269,9 @@ function collectSessionIDs(
 ): void {
   if (depth > 4 || !input) return;
 
-  if (isSessionID(input)) {
-    target.add(input);
+  const sessionID = asString(input);
+  if (isRealSessionID(sessionID)) {
+    target.add(sessionID);
     return;
   }
 
@@ -315,7 +313,9 @@ export function resolveSyntheticTargetSessionID(
   explicitCandidates: readonly string[] = [],
   lookup = createChildLookup(state),
 ): string | undefined {
-  const candidates = new Set<string>(explicitCandidates.filter(isSessionID));
+  const candidates = new Set<string>(
+    explicitCandidates.filter(isRealSessionID),
+  );
 
   const byMessage = lookupChildren(
     state,
@@ -350,7 +350,7 @@ export function resolveSyntheticTargetSessionID(
     parentID: synthetic.parentID,
     messageID: synthetic.messageID,
     candidateCount: candidates.size,
-    explicitCount: explicitCandidates.filter(isSessionID).length,
+    explicitCount: explicitCandidates.filter(isRealSessionID).length,
     byMessageCount: byMessage.length,
     byParentCount: byParent.length,
   });
@@ -831,7 +831,11 @@ export function extractChildDetails(event: EventLike): {
     tokenHints.total !== undefined &&
     tokenHints.contextPercent !== undefined;
 
-  const walk = (node: unknown, depth: number): void => {
+  const walk = (
+    node: unknown,
+    depth: number,
+    tokenContainer = false,
+  ): void => {
     if (!isRecord(node) || depth > 6) return;
     // Short-circuit once every token field is resolved; traversing further
     // only yields redundant matches and increases event-loop pressure during
@@ -850,7 +854,15 @@ export function extractChildDetails(event: EventLike): {
             : undefined;
 
       if (typeof asNumber === "number" && Number.isFinite(asNumber)) {
-        if (key.includes("context") && key.includes("percent")) {
+        if (tokenContainer && key === "input") {
+          tokenHints.input = asNumber;
+        } else if (tokenContainer && key === "output") {
+          tokenHints.output = asNumber;
+        } else if (tokenContainer && key === "total") {
+          tokenHints.total = asNumber;
+        } else if (tokenContainer && key === "contextpercent") {
+          tokenHints.contextPercent = normalizePercent(asNumber);
+        } else if (key.includes("context") && key.includes("percent")) {
           tokenHints.contextPercent = normalizePercent(asNumber);
         } else if (key.includes("context") && key.includes("usage")) {
           tokenHints.contextPercent = normalizePercent(asNumber);
@@ -872,7 +884,11 @@ export function extractChildDetails(event: EventLike): {
       }
 
       if (isRecord(rawValue)) {
-        walk(rawValue, depth + 1);
+        walk(
+          rawValue,
+          depth + 1,
+          tokenContainer || key === "tokens" || key === "token",
+        );
       }
     }
   };
@@ -894,8 +910,8 @@ export function extractChildDetails(event: EventLike): {
 export function applySubagentEventDetailed(
   state: StatuslineState,
   event: unknown,
+  lookup: ChildLookup = createChildLookup(state),
 ): SubagentEventTransaction {
-  const lookup = createChildLookup(state);
   const result: SubagentEventTransaction = {
     changed: false,
     changedChildIDs: [],
@@ -924,7 +940,7 @@ export function applySubagentEventDetailed(
 
   if (type === "session.created" || type === "session.updated") {
     const child = extractCreatedChild(e);
-    if (child) {
+    if (child && isRealSessionID(child.id)) {
       const details = extractChildDetails(e);
       const inserted = upsertRunningChild(state, {
         ...child,
@@ -987,7 +1003,7 @@ export function applySubagentEventDetailed(
 
   if (type === "session.idle") {
     const childID = extractSessionID(e);
-    if (!childID) return result;
+    if (!isRealSessionID(childID)) return result;
     const endedAt = extractEventTimestamp(e, [
       "completed",
       "end",
@@ -1021,7 +1037,7 @@ export function applySubagentEventDetailed(
 
   if (type === "session.error") {
     const childID = extractSessionID(e);
-    if (!childID) return result;
+    if (!isRealSessionID(childID)) return result;
     const endedAt = extractEventTimestamp(e, [
       "completed",
       "end",
@@ -1050,7 +1066,7 @@ export function applySubagentEventDetailed(
 
   if (type === "session.status") {
     const childID = extractSessionID(e);
-    if (!childID) return result;
+    if (!isRealSessionID(childID)) return result;
     const status = hasStructuredErrorEvidence(e.properties ?? e)
       ? "error"
       : deriveOpenCodeSessionStatus(
@@ -1243,6 +1259,7 @@ export function applySubagentEventDetailed(
 export function applySubagentEvent(
   state: StatuslineState,
   event: unknown,
+  lookup?: ChildLookup,
 ): boolean {
-  return applySubagentEventDetailed(state, event).changed;
+  return applySubagentEventDetailed(state, event, lookup).changed;
 }
