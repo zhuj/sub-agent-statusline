@@ -4,45 +4,46 @@ This project uses **Vitest** for automated tests and **@vitest/coverage-v8** for
 
 ## Strategy overview
 
-The suite has two layers:
+The suite uses deterministic unit tests and focused TUI integration seams:
 
-- **Unit tests** cover pure logic in `src/events.ts`, `src/state.ts`, `src/render.ts`, and focused helpers such as `src/text-width.ts`. These tests should be fast, table-friendly, and focused on behavior: parsed session data, state transitions, counters, formatting, terminal text width, and safe handling of malformed input.
-- **Runtime integration tests** cover `src/index.ts`, where the plugin touches the filesystem and OpenCode-style event handling. These tests instantiate the plugin against isolated temporary directories and assert persisted state/output.
+- **Pure core tests** cover events, state, projection, rendering, reconciliation, terminal text width, descendant discovery, and tree-row layout. They protect parsed session data, state transitions, all-depth parent-before-child ordering, counters, formatting, and malformed-input safety.
+- **Focused TUI tests** cover lifecycle, persistence coordination, event ownership, route-scoped behavior, and commands without launching a full OpenCode/OpenTUI host.
 
-Deep TUI and full OpenCode host end-to-end automation are intentionally deferred. The current priority is a reliable core runtime layer before adding expensive or brittle UI automation.
+Deep visual TUI and full OpenCode host end-to-end automation are intentionally deferred. The current baseline is 351 passing tests across 17 files.
 
 ## Test file map
 
-| File                              | What it validates                                                                                                                                                  |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `src/events.test.ts`              | Event parsing, session ID extraction, event-to-state updates, details/token normalization, and malformed event safety.                                             |
-| `src/state.test.ts`               | State invariants, counters, transitions, pruning, persistence helpers, environment path resolution, and detail merging.                                            |
-| `src/render.test.ts`              | Statusline rendering, visibility rules, collapse behavior, duration/token formatting, and color/no-color output semantics.                                         |
-| `src/text-width.test.ts`          | Terminal column width helpers for CJK/full-width text, combining marks, and truncation within display budgets.                                                     |
-| `test/index.integration.test.ts`  | Runtime plugin initialization, event handling, `state.json` persistence, `status.txt` writes, preserve-state behavior, malformed events, and write-failure safety. |
-| `test/helpers/runtime-harness.ts` | Reusable helpers for temp dirs, env overrides, fixtures, filesystem assertions, and fake-time setup.                                                               |
-| `test/setup.ts`                   | Global cleanup after each test: timers, mocks, selected env vars, and registered temp directories.                                                                 |
-| `test/fixtures/events/*.json`     | Canonical valid and malformed event payloads used by tests.                                                                                                        |
+| File | What it validates |
+| --- | --- |
+| `src/events.test.ts` | Event parsing, session ID extraction, event-to-state updates, details/token normalization, and malformed event safety. |
+| `src/state.test.ts` | State invariants, counters, transitions, pruning, persistence helpers, environment path resolution, and detail merging. |
+| `src/projection.test.ts` | Pure all-depth lineage projection, parent-before-child order, correlation, counters, and cycle safety. |
+| `src/tui-descendant-hydration.test.ts` | Iterative bounded descendant discovery, cancellation, fail-closed filtering, and one-batch updates. |
+| `src/tui-tree-row.test.ts` | Pure tree-row indentation, narrow-width clamping, labels, and nested navigation targets. |
+| `src/render.test.ts` | Statusline rendering, visibility rules, collapse behavior, duration/token formatting, and color/no-color output semantics. |
+| `src/text-width.test.ts` | Terminal column width helpers for CJK/full-width text, combining marks, and truncation within display budgets. |
+| `src/persistence.test.ts` | Persistence coordination, coalescing, flush behavior, and metadata preservation. |
+| `src/tui.test.ts` | TUI lifecycle, persistence, commands, keybindings, and integration seams. |
+| `test/package-contract.test.ts` | Root and `/tui` exports plus absence of removed source and build artifacts. |
+| `test/helpers/test-harness.ts` | Reusable helpers for isolated temp dirs, env overrides, fixtures, filesystem assertions, and fake-time setup. |
+| `test/setup.ts` | Global cleanup after each test: timers, mocks, selected env vars, and registered temp directories. |
+| `test/fixtures/events/*.json` | Canonical valid and malformed event payloads used by tests. |
 
 ## Arrange / Act / Assert
 
 Use the **Arrange / Act / Assert** pattern to keep tests readable:
 
 ```ts
-it("persists a supported event", async () => {
+it("renders an empty summary", () => {
   // Arrange
-  const harness = await createRuntimeHarness();
-  const plugin = await SubagentStatusline(
-    {} as Parameters<typeof SubagentStatusline>[0],
-  );
-  const event = await readJsonFixture("session-created");
+  const state = createEmptyState();
 
   // Act
-  await plugin.event?.({ event } as never);
+  const output = renderStatusline(state);
 
   // Assert
-  const state = await readRuntimeState(harness.statePath);
-  expect(state.children.ses_child_1.status).toBe("running");
+  expect(output).toContain("0 running");
+  expect(output).toContain("0 done");
 });
 ```
 
@@ -101,36 +102,27 @@ it("renders an empty summary", () => {
 });
 ```
 
-If a case depends on time, use `useFrozenTime(...)` from `test/helpers/runtime-harness.ts` or Vitest fake timers directly, and let `test/setup.ts` restore real timers after the test.
+If a case depends on time, use `useFrozenTime(...)` from `test/helpers/test-harness.ts` or Vitest fake timers directly, and let `test/setup.ts` restore real timers after the test.
 
-## Adding a runtime integration test
+## Adding an isolated filesystem test
 
-Runtime integration tests should live in `test/index.integration.test.ts` or another `test/*.integration.test.ts` file.
-
-Use the harness so each test gets isolated filesystem state:
+Use `test/helpers/test-harness.ts` when a state or persistence test needs an isolated filesystem and environment:
 
 ```ts
-it("writes runtime output after an event", async () => {
-  const harness = await createRuntimeHarness();
-  const plugin = await SubagentStatusline(
-    {} as Parameters<typeof SubagentStatusline>[0],
-  );
-  const event = await readJsonFixture("session-created");
+it("writes an isolated state snapshot", async () => {
+  const harness = await createFileHarness();
+  const state = createEmptyState();
 
-  await plugin.event?.({ event } as never);
+  await saveState(harness.statePath, state);
 
-  expect(await readStatusText(harness.textPath)).toContain(
-    "Review auth changes",
-  );
+  expect(await pathExists(harness.statePath)).toBe(true);
 });
 ```
 
 Useful helpers:
 
-- `createRuntimeHarness({ preserveState?: boolean })` creates a temp directory and sets the plugin env vars for that test.
+- `createFileHarness()` creates a temp directory and isolated `state.json` and `status.txt` paths.
 - `readJsonFixture(name)` loads `test/fixtures/events/<name>.json`.
-- `readRuntimeState(path)` reads persisted `state.json`.
-- `readStatusText(path)` reads persisted status text.
 - `pathExists(path)` checks filesystem output without throwing.
 - `useFrozenTime(isoTimestamp)` enables fake timers and pins the current time.
 
@@ -138,12 +130,12 @@ Add new event fixtures under `test/fixtures/events/` when the same payload is us
 
 ## What not to test yet
 
-Do not add deep TUI/e2e automation for `src/tui.tsx` yet. Full OpenCode host automation, visual snapshots, and broad OpenTUI rendering assertions are deferred until the runtime layer and future TUI seams are stable.
+Do not add deep TUI/e2e automation for `src/tui.tsx` yet. Full OpenCode host automation, visual snapshots, and broad OpenTUI rendering assertions remain deferred.
 
 For now, prefer:
 
 - unit tests for pure formatting and state behavior;
-- integration tests for plugin runtime persistence and event handling;
+- focused tests for projection, descendant discovery, tree rows, persistence, and event handling;
 - manual smoke testing in OpenCode when changing the actual TUI surface.
 
 ## Troubleshooting and gotchas
@@ -154,7 +146,7 @@ If a test uses fake timers, make sure it is explicit in the Arrange step. `test/
 
 ### Temporary directories
 
-Use `createRuntimeHarness()` instead of hard-coded paths. It registers temp directories for cleanup and points `OPENCODE_SUBAGENT_STATUSLINE_STATE` at an isolated `state.json`.
+Use `createFileHarness()` instead of hard-coded paths. It registers temp directories for cleanup and points `OPENCODE_SUBAGENT_STATUSLINE_STATE` at an isolated `state.json`.
 
 ### Environment variables
 
@@ -173,4 +165,19 @@ Use snapshots only when the whole rendered shape is the behavior being protected
 
 ### Write failures
 
-Integration tests can simulate filesystem write failures by making the expected state path a directory. Keep these tests small and assert that plugin event handling does not throw.
+Filesystem tests can simulate write failures by making the expected state path a directory. Keep these tests small and assert the documented best-effort behavior.
+
+## Build and package gates
+
+The build has one output pair, `dist/tui.js` and `dist/tui.d.ts`. The root package export and `/tui` both resolve to that TUI bundle.
+
+Run these gates when build or package metadata changes:
+
+```sh
+pnpm typecheck
+pnpm test
+pnpm build
+pnpm pack --dry-run
+```
+
+For visible TUI changes, point OpenCode at the built `dist/tui.js`, restart it, run nested delegations, and verify all descendant depths, row order, navigation, status, duration, and optional token/context display.
