@@ -71,6 +71,7 @@ export function createTokenHydrationQueue(
     ) {
       const job = pending.pop();
       if (!job) break;
+      const key = jobKey(job);
       active += 1;
       void (async () => {
         try {
@@ -82,7 +83,7 @@ export function createTokenHydrationQueue(
           else throw error;
         } finally {
           active -= 1;
-          admitted.delete(jobKey(job));
+          admitted.delete(key);
           pump();
           resolveIdle();
         }
@@ -102,16 +103,17 @@ export function createTokenHydrationQueue(
 
   return {
     enqueue(job) {
+      const key = jobKey(job);
       if (
         closed ||
         job.signal?.aborted === true ||
         !(input.isValid?.(job) ?? true) ||
-        admitted.has(jobKey(job)) ||
+        admitted.has(key) ||
         admitted.size >= TOKEN_HYDRATION_ADMISSION_LIMIT
       ) {
         return false;
       }
-      admitted.add(jobKey(job));
+      admitted.add(key);
       pending.push(job);
       schedulePump();
       return true;
