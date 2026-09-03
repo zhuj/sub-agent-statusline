@@ -1,6 +1,6 @@
 /**
  * Shared number/duration/percent formatters used by both the TUI plugin and
- * the runtime renderer. Centralised to avoid drift between visual rendering
+ * status text formatting. Centralised to avoid drift between status text
  * (render.ts) and OpenTUI rendering (tui.tsx).
  */
 
