@@ -13,7 +13,14 @@ import type {
   ScrollBoxRenderable,
 } from "@opentui/core";
 import { useKeyboard } from "@opentui/solid";
-import { appendFileSync, mkdirSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  fchmodSync,
+  mkdirSync,
+  openSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import { dirname, join } from "node:path";
@@ -31,6 +38,7 @@ import {
   applySubagentEvent,
   applySubagentEventDetailed,
   createChildLookup,
+  refreshChildLookup,
   resolveSyntheticTargetSessionID,
   setChildTarget,
   type ChildLookup,
@@ -83,7 +91,6 @@ import {
 } from "./tui-row-window.js";
 import {
   createEmptyState,
-  CHANGED_CHILD_IDS,
   markChildStatus,
   isTerminalPruningDue,
   isTerminalPruningDueAt,
@@ -106,7 +113,16 @@ import {
   formatCompactPercentUsed,
   formatCompactTokenCount,
 } from "./format.js";
-import { buildSubagentProjectionFromChildren, filterVisibleFromCanonical } from "./projection.js";
+import {
+  buildSubagentProjectionFromChildren,
+  filterVisibleFromCanonical,
+  type SubagentTreeRow,
+} from "./projection.js";
+import {
+  buildCurrentRouteSubtreeProjection,
+  createCurrentRouteSubtreeCoordinator,
+  type CurrentRouteSubtreeProjection,
+} from "./tui-route-subtree.js";
 import {
   createPersistenceCoordinator,
   type PersistenceCoordinator,
@@ -118,16 +134,29 @@ import {
 } from "./tui-commands.js";
 import {
   HYDRATE_RETRY_MAX_ATTEMPTS,
-  ROUTE_CHILD_MESSAGE_ADMISSION_LIMIT,
   ROUTE_CHILD_MESSAGE_CONCURRENCY,
+  ROUTE_CHILD_MESSAGE_LIMIT,
   createTokenHydrationQueue,
   mapWithBoundedConcurrency,
   mergeFreshHydratedTokens,
+  raceRouteAbort,
   scheduleHydrateRetry,
   type TokenHydrationJob,
 } from "./tui-hydration.js";
+import {
+  discoverDescendantSessions,
+} from "./tui-descendant-hydration.js";
 import { createTuiEventOwnershipGate } from "./tui-event-ownership.js";
+import {
+  activateSubagentTreeRow,
+  resolveSubagentTreeRowTargetSessionID,
+  resolveTreeRowLayout,
+  SUBAGENT_TREE_ROW_PREFIX_COLUMNS,
+  treeRowsLayoutSignature,
+} from "./tui-tree-row.js";
 import { t } from "./i18n.js";
+
+export { activateSubagentTreeRow } from "./tui-tree-row.js";
 
 const TUI_PLUGIN_ID = "subagent-statusline.tui";
 const ELAPSED_TICK_MS = 1000;
@@ -152,7 +181,7 @@ const SUBAGENTS_RUNNING_ROW_HEIGHT = 3;
 const SUBAGENTS_TERMINAL_ROW_HEIGHT = 2;
 const SUBAGENTS_MODEL_ROW_HEIGHT = 1;
 const SUBAGENTS_ROW_GAP = 0;
-const SUBAGENTS_ROW_MARKER_WIDTH = 4;
+const SUBAGENTS_ROW_MARKER_WIDTH = SUBAGENT_TREE_ROW_PREFIX_COLUMNS;
 const SUBAGENTS_MAX_LIST_HEIGHT =
   SUBAGENTS_MAX_VISIBLE_ROWS *
     (SUBAGENTS_RUNNING_ROW_HEIGHT + SUBAGENTS_MODEL_ROW_HEIGHT) +
@@ -383,9 +412,17 @@ function debugLog(input: Record<string, unknown>): void {
       "opencode-subagent-statusline",
       "tui-events.log",
     );
-    mkdirSync(dirname(path), { recursive: true });
-    const line = JSON.stringify({ time: new Date().toISOString(), ...input });
-    appendFileSync(path, `${line}\n`, "utf8");
+    const directory = dirname(path);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    chmodSync(directory, 0o700);
+    const file = openSync(path, "a", 0o600);
+    try {
+      fchmodSync(file, 0o600);
+      const line = JSON.stringify({ time: new Date().toISOString(), ...input });
+      appendFileSync(file, `${line}\n`, "utf8");
+    } finally {
+      closeSync(file);
+    }
   } catch {
     // Debug logging must never crash the TUI.
   }
@@ -425,6 +462,171 @@ function cloneState(state: StatuslineState): StatuslineState {
       ]),
     ),
   };
+}
+
+function sameHydrationChild(
+  left: ChildSessionState | undefined,
+  right: ChildSessionState | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  return (
+    left.id === right.id &&
+    left.title === right.title &&
+    left.summary === right.summary &&
+    left.agentName === right.agentName &&
+    left.parentID === right.parentID &&
+    left.messageID === right.messageID &&
+    left.source === right.source &&
+    left.toolName === right.toolName &&
+    left.targetSessionID === right.targetSessionID &&
+    left.status === right.status &&
+    left.color === right.color &&
+    left.startedAt === right.startedAt &&
+    left.updatedAt === right.updatedAt &&
+    left.endedAt === right.endedAt &&
+    left.elapsedMs === right.elapsedMs &&
+    sameTokens(left.tokens, right.tokens) &&
+    JSON.stringify(left.model) === JSON.stringify(right.model)
+  );
+}
+
+function changedHydrationChildIDs(
+  before: StatuslineState,
+  after: StatuslineState,
+): string[] {
+  const childIDs = new Set([
+    ...Object.keys(before.children),
+    ...Object.keys(after.children),
+  ]);
+  return [...childIDs].filter(
+    (childID) =>
+      !sameHydrationChild(
+        before.children[childID],
+        after.children[childID],
+      ),
+  );
+}
+
+function sameChildModel(
+  left: ChildSessionState["model"],
+  right: ChildSessionState["model"],
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function preserveFreshHydrationEvidence(
+  hydrated: StatuslineState,
+  current: StatuslineState,
+  baseline: StatuslineState,
+): void {
+  for (const [childID, currentChild] of Object.entries(current.children)) {
+    const baselineChild = baseline.children[childID];
+    const statusChanged =
+      currentChild.status !== baselineChild?.status ||
+      currentChild.endedAt !== baselineChild?.endedAt;
+    const modelChanged = !sameChildModel(
+      currentChild.model,
+      baselineChild?.model,
+    );
+    const tokensChanged = !sameTokens(
+      currentChild.tokens,
+      baselineChild?.tokens,
+    );
+    const metadataChanged =
+      currentChild.title !== baselineChild?.title ||
+      currentChild.summary !== baselineChild?.summary ||
+      currentChild.agentName !== baselineChild?.agentName ||
+      currentChild.parentID !== baselineChild?.parentID ||
+      currentChild.messageID !== baselineChild?.messageID ||
+      currentChild.source !== baselineChild?.source ||
+      currentChild.toolName !== baselineChild?.toolName ||
+      currentChild.targetSessionID !== baselineChild?.targetSessionID ||
+      currentChild.startedAt !== baselineChild?.startedAt ||
+      currentChild.updatedAt !== baselineChild?.updatedAt;
+    let hydratedChild = hydrated.children[childID];
+
+    if (!hydratedChild) {
+      if (statusChanged || modelChanged || tokensChanged || metadataChanged) {
+        hydrated.children[childID] = {
+          ...currentChild,
+          tokens: currentChild.tokens ? { ...currentChild.tokens } : undefined,
+          model: currentChild.model ? { ...currentChild.model } : undefined,
+        };
+      }
+      continue;
+    }
+
+    hydratedChild = {
+      ...hydratedChild,
+      title:
+        currentChild.title !== baselineChild?.title
+          ? currentChild.title
+          : hydratedChild.title,
+      summary:
+        currentChild.summary !== baselineChild?.summary
+          ? currentChild.summary
+          : hydratedChild.summary,
+      agentName:
+        currentChild.agentName !== baselineChild?.agentName
+          ? currentChild.agentName
+          : hydratedChild.agentName,
+      parentID:
+        currentChild.parentID !== baselineChild?.parentID
+          ? currentChild.parentID
+          : hydratedChild.parentID,
+      messageID:
+        currentChild.messageID !== baselineChild?.messageID
+          ? currentChild.messageID
+          : hydratedChild.messageID,
+      source:
+        currentChild.source !== baselineChild?.source
+          ? currentChild.source
+          : hydratedChild.source,
+      toolName:
+        currentChild.toolName !== baselineChild?.toolName
+          ? currentChild.toolName
+          : hydratedChild.toolName,
+      targetSessionID:
+        currentChild.targetSessionID !== baselineChild?.targetSessionID
+          ? currentChild.targetSessionID
+          : hydratedChild.targetSessionID,
+      startedAt:
+        currentChild.startedAt !== baselineChild?.startedAt
+          ? currentChild.startedAt
+          : hydratedChild.startedAt,
+      updatedAt:
+        currentChild.updatedAt !== baselineChild?.updatedAt
+          ? currentChild.updatedAt
+          : hydratedChild.updatedAt,
+    };
+    if (statusChanged) {
+      hydratedChild = {
+        ...hydratedChild,
+        status: currentChild.status,
+        color: currentChild.color,
+        updatedAt: currentChild.updatedAt,
+        endedAt: currentChild.endedAt,
+        elapsedMs: currentChild.elapsedMs,
+      };
+    }
+    if (modelChanged) {
+      hydratedChild = {
+        ...hydratedChild,
+        model: currentChild.model ? { ...currentChild.model } : undefined,
+      };
+    }
+    if (hydratedChild.tokens) {
+      hydratedChild = {
+        ...hydratedChild,
+        tokens: mergeFreshHydratedTokens(
+          currentChild.tokens,
+          baselineChild?.tokens,
+          hydratedChild.tokens,
+        ),
+      };
+    }
+    hydrated.children[childID] = hydratedChild;
+  }
 }
 
 function hasTokenTotal(tokens: ChildTokenState | undefined): boolean {
@@ -542,28 +744,45 @@ async function hydrateChildTokensAsync(
   return signal?.aborted ? undefined : tokens;
 }
 
+export interface TuiPersistenceSnapshot {
+  readonly state: StatuslineState;
+  readonly changedChildIDs?: readonly string[];
+}
+
+export function combineTuiPersistenceSnapshots(
+  accumulated: TuiPersistenceSnapshot,
+  incoming: TuiPersistenceSnapshot,
+): TuiPersistenceSnapshot {
+  if (
+    accumulated.changedChildIDs === undefined ||
+    incoming.changedChildIDs === undefined
+  ) {
+    return { state: incoming.state };
+  }
+  return {
+    state: incoming.state,
+    changedChildIDs: [
+      ...new Set([
+        ...accumulated.changedChildIDs,
+        ...incoming.changedChildIDs,
+      ]),
+    ],
+  };
+}
+
 export function persistStateSnapshot(
-  persistence: PersistenceCoordinator<StatuslineState>,
+  persistence: PersistenceCoordinator<TuiPersistenceSnapshot>,
   state: StatuslineState,
   flush = false,
   changedChildIDs?: readonly string[],
 ): Promise<void> {
-  // No deep clone: all callers pass a freshly-produced state object (a `next`
-  // that was just built with `cloneState(current)` and then mutated). The
-  // writer's `JSON.stringify` consumes the structure into a string before any
-  // subsequent state churn could affect it. Skipping the clone saves N object
-  // spreads per persistence cycle (significant for the 1,500-child terminal cap).
-  //
-  // When the caller knows which children changed, attach them as a Symbol
-  // property on the snapshot. saveState reads it to do a differential refresh
-  // instead of re-deriving every child. JSON.stringify ignores Symbol keys.
-  if (changedChildIDs !== undefined) {
-    (state as unknown as Record<symbol, unknown>)[CHANGED_CHILD_IDS] =
-      changedChildIDs;
-  }
+  const snapshot: TuiPersistenceSnapshot = {
+    state: cloneState(state),
+    ...(changedChildIDs !== undefined ? { changedChildIDs } : {}),
+  };
   return flush
-    ? persistence.flush(state)
-    : persistence.request(state);
+    ? persistence.flush(snapshot)
+    : persistence.request(snapshot);
 }
 
 function refreshLiveState(state: StatuslineState): boolean {
@@ -723,15 +942,22 @@ function resolveSyntheticTargetFromHydratedState(
 export function backfillHydratedTargetSessionIDs(
   state: StatuslineState,
   parentSessionID: string,
+  options: {
+    readonly lookup?: ChildLookup;
+    readonly changedChildIDs?: Set<string>;
+  } = {},
 ): boolean {
   let changed = false;
-  const lookup = createChildLookup(state);
+  const lookup = options.lookup ?? createChildLookup(state);
 
   for (const child of Object.values(state.children)) {
     if (child.parentID !== parentSessionID) continue;
     if (resolveChildTargetSessionID(child)) continue;
     if (child.source === "session" || child.id.startsWith("ses_")) {
-      if (setChildTarget(state, child.id, child.id, lookup)) changed = true;
+      if (setChildTarget(state, child.id, child.id, lookup)) {
+        options.changedChildIDs?.add(child.id);
+        changed = true;
+      }
       continue;
     }
 
@@ -742,6 +968,7 @@ export function backfillHydratedTargetSessionIDs(
     );
     if (syntheticTarget) {
       if (setChildTarget(state, child.id, syntheticTarget, lookup)) {
+        options.changedChildIDs?.add(child.id);
         changed = true;
       }
     }
@@ -832,8 +1059,10 @@ function formatSecondaryLine(
   parenthetical: string | undefined,
   width: number,
 ): string | undefined {
-  if (!continuation) return parenthetical;
-  if (!parenthetical) return continuation;
+  if (!continuation) {
+    return parenthetical ? ellipsize(parenthetical, width) : undefined;
+  }
+  if (!parenthetical) return ellipsize(continuation, width);
 
   const parentheticalWidth = Math.min(textColumns(parenthetical), width);
   const continuationWidth = width - parentheticalWidth - 1;
@@ -921,9 +1150,23 @@ export function wrapCompactText(
   return lines;
 }
 
-function formatChildRowLine(input: {
+function resolveSubagentTreeRowLayout(input: {
+  readonly depth?: number;
+  readonly sidebarWidth?: number;
+  readonly reservedWidth?: number;
+}) {
+  return resolveTreeRowLayout({
+    depth: input.depth ?? 0,
+    rowWidth: rowWidthBudget(input.sidebarWidth),
+    fixedColumns: input.reservedWidth ?? 0,
+    minimumLabelWidth: MIN_LABEL_WIDTH,
+  });
+}
+
+export function formatChildRowLine(input: {
   child: ChildSessionState;
   nowMs: number;
+  depth?: number;
   sidebarWidth?: number;
   reservedWidth?: number;
 }): {
@@ -931,86 +1174,77 @@ function formatChildRowLine(input: {
   secondaryLine?: string;
   elapsed: string;
   meta: string;
+  detailLine: string;
+  labelWidth: number;
 } {
   const elapsed = formatDuration(elapsedMs(input.child, input.nowMs));
-  const width = Math.max(
-    MIN_ROW_WIDTH,
-    rowWidthBudget(input.sidebarWidth) - (input.reservedWidth ?? 0),
-  );
+  const { labelWidth } = resolveSubagentTreeRowLayout(input);
   const title = splitParentheticalTitle(childPrimaryText(input.child));
   const parenthetical = childParenthetical(input.child);
+  const labelLines = wrapCompactText(title.label, labelWidth, 2);
+  const meta =
+    contextVariants(input.child).find((candidate) => {
+      const detail = candidate
+        ? `↳ ${CLOCK_ICON} ${elapsed} ${TOKEN_ICON} ${candidate}`
+        : `↳ ${CLOCK_ICON} ${elapsed}`;
+      return textColumns(detail) <= labelWidth;
+    }) ?? "";
+  const detail = meta
+    ? `↳ ${CLOCK_ICON} ${elapsed} ${TOKEN_ICON} ${meta}`
+    : `↳ ${CLOCK_ICON} ${elapsed}`;
 
-  for (const meta of contextVariants(input.child)) {
-    const detailChars =
-      2 + textColumns(elapsed) + (meta ? 3 + textColumns(meta) : 0);
-    const labelBudget = Math.min(
-      width - 2,
-      width - Math.max(0, detailChars - width),
-    );
-    if (labelBudget >= MIN_LABEL_WIDTH || textColumns(meta) === 0) {
-      const labelLines = wrapCompactText(
-        title.label,
-        Math.max(1, labelBudget),
-        2,
-      );
-      return {
-        labelLines,
-        secondaryLine: formatSecondaryLine(
-          labelLines[1],
-          parenthetical,
-          Math.max(1, labelBudget),
-        ),
-        elapsed,
-        meta,
-      };
-    }
-  }
-
-  const labelLines = wrapCompactText(title.label, MIN_LABEL_WIDTH, 2);
   return {
     labelLines,
     secondaryLine: formatSecondaryLine(
       labelLines[1],
       parenthetical,
-      MIN_LABEL_WIDTH,
+      labelWidth,
     ),
     elapsed,
-    meta: "",
+    meta,
+    detailLine: ellipsize(detail, labelWidth),
+    labelWidth,
   };
 }
 
-function formatTerminalChildRowLine(input: {
+export function formatTerminalChildRowLine(input: {
   child: ChildSessionState;
   nowMs: number;
+  depth?: number;
   sidebarWidth?: number;
   reservedWidth?: number;
 }): {
   label: string;
-  meta: string;
+  detailLine: string;
 } {
   const elapsed = formatDuration(elapsedMs(input.child, input.nowMs));
-  const width = Math.max(MIN_ROW_WIDTH, rowWidthBudget(input.sidebarWidth));
+  const { labelWidth } = resolveSubagentTreeRowLayout(input);
   const title = splitParentheticalTitle(childPrimaryText(input.child));
   const parenthetical = childParenthetical(input.child);
   const labelSource = parenthetical
     ? `${title.label} ${parenthetical}`
     : title.label;
-  const context = contextVariants(input.child).find(
-    (variant) => variant.length > 0,
-  );
+  const context =
+    contextVariants(input.child).find((candidate) => {
+      const detail = candidate
+        ? `↳ ${CLOCK_ICON} ${elapsed} ${candidate}`
+        : `↳ ${CLOCK_ICON} ${elapsed}`;
+      return textColumns(detail) <= labelWidth;
+    }) ?? "";
+  const detail = context
+    ? `↳ ${CLOCK_ICON} ${elapsed} ${context}`
+    : `↳ ${CLOCK_ICON} ${elapsed}`;
 
   return {
-    label: ellipsize(
-      labelSource,
-      Math.max(1, width - (input.reservedWidth ?? 0)),
-    ),
-    meta: context ? `${elapsed} ${context}` : elapsed,
+    label: ellipsize(labelSource, labelWidth),
+    detailLine: ellipsize(detail, labelWidth),
   };
 }
 
 export function subagentRowHeight(input: {
   child: ChildSessionState;
   nowMs: number;
+  depth?: number;
   sidebarWidth?: number;
   reservedWidth?: number;
 }): number {
@@ -1043,74 +1277,75 @@ export function formatChildModelLine(
 }
 
 export interface TuiSubagentSnapshot {
-  visibleChildren: ChildSessionState[];
-  visibleCounts: StatusCounts;
-  totalExecuted: number;
-  showingOtherSessions: boolean;
+  readonly visibleRows: readonly SubagentTreeRow[];
+  readonly visibleCounts: StatusCounts;
+  readonly totalExecuted: number;
+  readonly showingOtherSessions: false;
+  readonly descendantSessionIDs: ReadonlySet<string>;
 }
 
 export function resolveTuiSubagentSnapshot(input: {
-  state: StatuslineState;
-  sessionID?: string;
-  nowMs?: number;
-  showCompletedHistory?: boolean;
+  readonly state: StatuslineState;
+  readonly sessionID?: string;
+  readonly nowMs?: number;
+  readonly showCompletedHistory?: boolean;
+  readonly currentRouteProjection?: CurrentRouteSubtreeProjection;
 }): TuiSubagentSnapshot {
-  const allChildren = Object.values(input.state.children);
   const options = { showCompletedHistory: input.showCompletedHistory };
   const nowMs = input.nowMs ?? Date.now();
-  // Preserve old behavior: scope raw children by parent session BEFORE
-  // correlation, so proxies from other parents cannot affect scoped results.
-  const scopedRawChildren = input.sessionID
-    ? allChildren.filter((child) => child.parentID === input.sessionID)
-    : allChildren;
-  const projection = buildSubagentProjectionFromChildren(scopedRawChildren);
-  const scopedCanonical = input.sessionID
-    ? projection.canonicalRows.filter(
-        (child) => child.parentID === input.sessionID,
-      )
-    : projection.canonicalRows;
-  const ownVisibleChildren = filterVisibleFromCanonical(
-    scopedCanonical,
+  if (input.sessionID) {
+    const subtree =
+      input.currentRouteProjection?.state === input.state &&
+      input.currentRouteProjection.sessionID === input.sessionID
+        ? input.currentRouteProjection.subtree
+        : buildCurrentRouteSubtreeProjection(input.state, input.sessionID).subtree;
+    const visibleChildren = new Set(
+      filterVisibleFromCanonical(
+        [...subtree.canonicalRows],
+        nowMs,
+        options,
+      ),
+    );
+    let totalExecuted = 0;
+    for (const executionID of subtree.executionIDs) {
+      if (input.state.countedChildIDs[executionID]) totalExecuted += 1;
+    }
+
+    return {
+      visibleRows: subtree.rows.filter(({ child }) => visibleChildren.has(child)),
+      visibleCounts: subtree.retainedCounts,
+      totalExecuted,
+      showingOtherSessions: false,
+      descendantSessionIDs: subtree.executionIDs,
+    };
+  }
+
+  const allChildren = Object.values(input.state.children);
+  const projection = buildSubagentProjectionFromChildren(allChildren);
+  const visibleChildren = filterVisibleFromCanonical(
+    projection.canonicalRows,
     nowMs,
     options,
   ).sort(byPriority);
-
-  let visibleCounts: StatusCounts;
-  let totalExecuted: number;
-  if (input.sessionID) {
-    const counts: StatusCounts = { running: 0, done: 0, error: 0 };
-    const seenExecutionIDs = new Set<string>();
-    let counted = 0;
-    for (const row of scopedCanonical) {
-      if (row.status === "running") counts.running += 1;
-      else if (row.status === "done") counts.done += 1;
-      else if (row.status === "error") counts.error += 1;
-      const executionID = row.targetSessionID ?? row.id;
-      if (!seenExecutionIDs.has(executionID)) {
-        seenExecutionIDs.add(executionID);
-        if (input.state.countedChildIDs[executionID]) counted += 1;
-      }
-    }
-    visibleCounts = counts;
-    totalExecuted = counted;
-  } else {
-    visibleCounts = projection.retainedCounts;
-    totalExecuted = projection.totalExecuted;
-  }
-
   return {
-    visibleChildren: ownVisibleChildren,
-    visibleCounts,
-    totalExecuted,
+    visibleRows: visibleChildren.map((child) => ({
+      child,
+      depth: 0,
+      parentSessionID: child.parentID,
+    })),
+    visibleCounts: projection.retainedCounts,
+    totalExecuted: projection.totalExecuted,
     showingOtherSessions: false,
+    descendantSessionIDs: new Set(projection.orderedExecutionIDs),
   };
 }
 
 export function resolveSidebarSubagentSnapshot(input: {
-  state: StatuslineState;
-  sessionID: string;
-  nowMs?: number;
-  showCompletedHistory?: boolean;
+  readonly state: StatuslineState;
+  readonly sessionID: string;
+  readonly nowMs?: number;
+  readonly showCompletedHistory?: boolean;
+  readonly currentRouteProjection?: CurrentRouteSubtreeProjection;
 }): TuiSubagentSnapshot {
   return resolveTuiSubagentSnapshot(input);
 }
@@ -1137,6 +1372,7 @@ function SidebarSubagents(props: {
     childRowID: string;
     showCompletedHistory: boolean;
   };
+  currentRouteProjection?: () => CurrentRouteSubtreeProjection | undefined;
 }) {
   const [showCompletedHistory, setShowCompletedHistory] = createSignal(
     props.restoreFromChild?.showCompletedHistory ?? false,
@@ -1144,23 +1380,25 @@ function SidebarSubagents(props: {
   const completedHistoryOptions = () => ({
     showCompletedHistory: showCompletedHistory(),
   });
-  const snapshot = createMemo(() =>
-    resolveSidebarSubagentSnapshot({
-      state: props.state(),
+  const snapshot = createMemo(() => {
+    const state = props.state();
+    return resolveSidebarSubagentSnapshot({
+      state,
       sessionID: props.sessionID,
       nowMs: props.nowMs(),
+      currentRouteProjection: props.currentRouteProjection?.(),
       ...completedHistoryOptions(),
-    }),
-  );
-  const visibleChildren = createMemo(() => snapshot().visibleChildren);
+    });
+  });
+  const visibleRows = createMemo(() => snapshot().visibleRows);
   const counts = createMemo(() => snapshot().visibleCounts);
   const totalExecuted = createMemo(() => snapshot().totalExecuted);
 
   const visibleChildIDs = createMemo(() =>
-    visibleChildren().map((child) => child.id),
+    visibleRows().map(({ child }) => child.id),
   );
   const visibleChildByID = createMemo(
-    () => new Map(visibleChildren().map((child) => [child.id, child])),
+    () => new Map(visibleRows().map((row) => [row.child.id, row])),
   );
   const [selectedChildID, setSelectedChildID] = createSignal<
     string | undefined
@@ -1173,30 +1411,18 @@ function SidebarSubagents(props: {
   const [listFocusModeActive, setListFocusModeActive] = createSignal(false);
 
   const visibleChildLayoutSignature = createMemo(() => {
-    // Cheap structural key — avoids JSON.stringify on every child per render.
-    let out = "";
-    for (const child of visibleChildren()) {
-      const tokens = child.tokens;
-      const model = child.model;
-      out +=
-        `${child.id}\u0001${child.status}\u0001${child.title}` +
-        `\u0001${child.summary ?? ""}\u0001${child.agentName ?? ""}` +
-        `\u0001${tokens?.input ?? ""}\u0001${tokens?.output ?? ""}` +
-        `\u0001${tokens?.total ?? ""}\u0001${tokens?.contextPercent ?? ""}` +
-        `\u0001${model?.providerID ?? ""}\u0001${model?.modelID ?? ""}` +
-        `\u0001${model?.variant ?? ""}|`;
-    }
-    return out;
+    return treeRowsLayoutSignature(visibleRows());
   });
 
   const rowLayoutIndex = createMemo(() => {
     const nowMs = props.nowMs();
     const sidebarWidth = props.sidebarWidth?.();
     return buildSidebarRowLayoutIndex(
-      visibleChildren().map((child) => ({
+      visibleRows().map(({ child, depth }) => ({
         id: child.id,
         height: subagentRowHeight({
           child,
+          depth,
           nowMs,
           sidebarWidth,
           reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
@@ -1395,34 +1621,26 @@ function SidebarSubagents(props: {
 
   const rowActivations = new Map<string, () => void>();
 
-  const resolveNavigableChildTargetSessionID = (
-    child: ChildSessionState,
-  ): string | undefined =>
-    resolveChildTargetSessionID(child) ??
-    resolveSyntheticTargetFromHydratedState(props.state(), child);
-
   const selectedTargetSessionID = (): string | undefined => {
     const selectedID = selectedChildID();
-    const selected = selectedID
+    const selectedRow = selectedID
       ? visibleChildByID().get(selectedID)
       : undefined;
-    return selected
-      ? resolveNavigableChildTargetSessionID(selected)
+    return selectedRow
+      ? resolveSubagentTreeRowTargetSessionID(selectedRow)
       : undefined;
   };
 
-  const activateChildTarget = (
-    childRowID: string,
-    targetSessionID: string,
-  ): void => {
-    props.onNavigateToChild({
-      parentSessionID: props.sessionID,
-      childSessionID: targetSessionID,
-      childRowID,
+  const activateRow = (row: SubagentTreeRow): void => {
+    activateSubagentTreeRow({
+      row,
       showCompletedHistory: showCompletedHistory(),
+      remember: props.onNavigateToChild,
+      navigate: (targetSessionID) => {
+        snapshotSidebarScrollOffsets();
+        navigateToSessionTarget(props.api, targetSessionID);
+      },
     });
-    snapshotSidebarScrollOffsets();
-    navigateToSessionTarget(props.api, targetSessionID);
   };
 
   const activateSelectedChild = (): void => {
@@ -1432,8 +1650,11 @@ function SidebarSubagents(props: {
       targetSessionID: selectedTargetSessionID(),
       navigate: (targetSessionID) => {
         const selectedID = selectedChildID();
-        if (selectedID && targetSessionID) {
-          activateChildTarget(selectedID, targetSessionID);
+        const selectedRow = selectedID
+          ? visibleChildByID().get(selectedID)
+          : undefined;
+        if (selectedRow) {
+          activateRow(selectedRow);
           return;
         }
         navigateToSessionTarget(props.api, targetSessionID);
@@ -1525,13 +1746,14 @@ function SidebarSubagents(props: {
   });
 
   const ChildRow = (rowProps: { childID: string }) => {
-    const child = createMemo(() => visibleChildByID().get(rowProps.childID));
+    const row = createMemo(() => visibleChildByID().get(rowProps.childID));
+    const child = createMemo(() => row()?.child);
     const [hovered, setHovered] = createSignal(false);
     const [focused, setFocused] = createSignal(false);
     const targetSessionID = createMemo(() => {
-      const currentChild = child();
-      return currentChild
-        ? resolveNavigableChildTargetSessionID(currentChild)
+      const currentRow = row();
+      return currentRow
+        ? resolveSubagentTreeRowTargetSessionID(currentRow)
         : undefined;
     });
     const clickable = createMemo(() => isSessionTarget(targetSessionID()));
@@ -1550,13 +1772,20 @@ function SidebarSubagents(props: {
     const rowOpacity = createMemo(() =>
       status() === "running" ? 1 : INACTIVE_SUBAGENT_OPACITY,
     );
-    const line = createMemo(() => {
+    const line = createMemo<ReturnType<typeof formatChildRowLine>>(() => {
       const currentChild = child();
       if (!currentChild) {
-        return { labelLines: [""], elapsed: "00:00", meta: "" };
+        return {
+          labelLines: [""],
+          elapsed: "00:00",
+          meta: "",
+          detailLine: "↳  00…",
+          labelWidth: MIN_LABEL_WIDTH,
+        };
       }
       return formatChildRowLine({
         child: currentChild,
+        depth: row()?.depth,
         nowMs: props.nowMs(),
         sidebarWidth: props.sidebarWidth?.(),
         reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
@@ -1564,9 +1793,10 @@ function SidebarSubagents(props: {
     });
     const terminalLine = createMemo(() => {
       const currentChild = child();
-      if (!currentChild) return { label: "", meta: "00:00" };
+      if (!currentChild) return { label: "", detailLine: "↳  00…" };
       return formatTerminalChildRowLine({
         child: currentChild,
+        depth: row()?.depth,
         nowMs: props.nowMs(),
         sidebarWidth: props.sidebarWidth?.(),
         reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
@@ -1577,6 +1807,7 @@ function SidebarSubagents(props: {
       if (!currentChild) return SUBAGENTS_TERMINAL_ROW_HEIGHT;
       return subagentRowHeight({
         child: currentChild,
+        depth: row()?.depth,
         nowMs: props.nowMs(),
         sidebarWidth: props.sidebarWidth?.(),
         reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
@@ -1588,12 +1819,16 @@ function SidebarSubagents(props: {
       return formatChildModelLine(
         currentChild,
         props.api.state.provider,
-        rowWidthBudget(props.sidebarWidth?.()) - SUBAGENTS_ROW_MARKER_WIDTH,
+        resolveSubagentTreeRowLayout({
+          depth: row()?.depth,
+          sidebarWidth: props.sidebarWidth?.(),
+          reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
+        }).labelWidth,
       );
     });
     const activate = () => {
-      const target = targetSessionID();
-      if (target) activateChildTarget(rowProps.childID, target);
+      const currentRow = row();
+      if (currentRow) activateRow(currentRow);
     };
     rowActivations.set(rowProps.childID, activate);
     onCleanup(() => {
@@ -1615,6 +1850,13 @@ function SidebarSubagents(props: {
         flexDirection="column"
         flexShrink={0}
         height={rowHeight()}
+        paddingLeft={
+          resolveSubagentTreeRowLayout({
+            depth: row()?.depth,
+            sidebarWidth: props.sidebarWidth?.(),
+            reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
+          }).indentColumns
+        }
         opacity={rowOpacity()}
         backgroundColor={selected() ? props.theme.backgroundElement : undefined}
         onMouseOver={clickable() ? () => setHovered(true) : undefined}
@@ -1676,10 +1918,12 @@ function SidebarSubagents(props: {
               </box>
               <text
                 fg={emphasized() ? props.theme.text : props.theme.textMuted}
-              >{`    ↳ ${CLOCK_ICON} ${terminalLine().meta}`}</text>
+              >{`${" ".repeat(SUBAGENTS_ROW_MARKER_WIDTH)}${terminalLine().detailLine}`}</text>
               <Show when={modelLine()}>
                 {(metadata: Accessor<string>) => (
-                  <text fg={props.theme.textMuted}>{`    ${metadata()}`}</text>
+                  <text
+                    fg={props.theme.textMuted}
+                  >{`${" ".repeat(SUBAGENTS_ROW_MARKER_WIDTH)}${metadata()}`}</text>
                 )}
               </Show>
             </box>
@@ -1709,22 +1953,22 @@ function SidebarSubagents(props: {
               {(secondaryLine: Accessor<string>) => (
                 <text
                   fg={muted() ? props.theme.textMuted : props.theme.text}
-                >{`    ${secondaryLine()}`}</text>
+                >{`${" ".repeat(SUBAGENTS_ROW_MARKER_WIDTH)}${secondaryLine()}`}</text>
               )}
             </Show>
-            <box flexDirection="row" paddingLeft={4}>
+            <box
+              flexDirection="row"
+              paddingLeft={SUBAGENTS_ROW_MARKER_WIDTH}
+            >
               <text
                 fg={emphasized() ? props.theme.text : props.theme.textMuted}
-              >{`↳ ${CLOCK_ICON} ${line().elapsed}`}</text>
-              <Show when={line().meta.length > 0}>
-                <text
-                  fg={emphasized() ? props.theme.text : props.theme.textMuted}
-                >{` ${TOKEN_ICON} ${line().meta}`}</text>
-              </Show>
+              >{line().detailLine}</text>
             </box>
             <Show when={modelLine()}>
               {(metadata: Accessor<string>) => (
-                <text fg={props.theme.textMuted}>{`    ${metadata()}`}</text>
+                <text
+                  fg={props.theme.textMuted}
+                >{`${" ".repeat(SUBAGENTS_ROW_MARKER_WIDTH)}${metadata()}`}</text>
               )}
             </Show>
           </box>
@@ -1869,123 +2113,230 @@ function HomeBottomStatus(props: {
   );
 }
 
+export interface RouteHydrationApi {
+  readonly state: { readonly path: { readonly directory: string } };
+  readonly client: {
+    readonly session?: {
+      readonly children?: (
+        input: { readonly sessionID: string; readonly directory: string },
+        options?: { readonly signal?: AbortSignal },
+      ) => Promise<{ readonly data?: unknown }>;
+      readonly messages?: (
+        input: {
+          readonly sessionID: string;
+          readonly directory: string;
+          readonly limit?: number;
+        },
+        options?: { readonly signal?: AbortSignal },
+      ) => Promise<{ readonly data?: unknown }>;
+      readonly status?: (
+        input: { readonly directory: string },
+        options?: { readonly signal?: AbortSignal },
+      ) => Promise<{ readonly data?: unknown }>;
+    };
+  };
+}
+
+export interface RouteHydrationOptions {
+  readonly signal?: AbortSignal;
+  readonly isValid?: () => boolean;
+  readonly getCurrentState?: () => StatuslineState;
+}
+
+export interface RouteHydrationRequest {
+  readonly api: RouteHydrationApi;
+  readonly currentSessionID: string;
+  readonly statePath: string;
+  readonly textPath: string;
+  readonly setState: (
+    update: (previous: StatuslineState) => StatuslineState,
+  ) => void;
+  readonly persistenceCoordinator?: PersistenceCoordinator<TuiPersistenceSnapshot>;
+  readonly options?: RouteHydrationOptions;
+}
+
+type RouteMessageEvidence = SessionMessageSummary & {
+  readonly messages: readonly unknown[];
+  readonly fetchFailed: boolean;
+  readonly model?: ReturnType<typeof extractLatestAssistantModel>;
+  readonly tokens?: ChildTokenState;
+};
+
+class RouteHydrationReadError extends Error {
+  readonly resource: "children";
+
+  constructor() {
+    super("Route hydration children response is unavailable or unsupported");
+    this.name = "RouteHydrationReadError";
+    this.resource = "children";
+  }
+}
+
 export async function hydratePreviousSubagents(
-  api: TuiPluginApi,
-  currentSessionID: string,
-  statePath: string,
-  textPath: string,
-  setState: (fn: (prev: StatuslineState) => StatuslineState) => void,
-  persistenceCoordinator?: PersistenceCoordinator<StatuslineState>,
-  options: {
-    readonly signal?: AbortSignal;
-    readonly isValid?: () => boolean;
-    readonly getCurrentState?: () => StatuslineState;
-  } = {},
+  request: RouteHydrationRequest,
 ): Promise<boolean> {
+  const {
+    api,
+    currentSessionID,
+    statePath,
+    textPath,
+    setState,
+    persistenceCoordinator,
+  } = request;
+  const options = request.options ?? {};
   if (!currentSessionID) return false;
-  const isValid = (): boolean =>
-    options.signal?.aborted !== true && (options.isValid?.() ?? true);
-  if (!isValid()) return false;
+
+  const routeController = new AbortController();
+  const abortRoute = (): void => routeController.abort();
+  options.signal?.addEventListener("abort", abortRoute, { once: true });
+  const isValid = (): boolean => {
+    if (
+      options.signal?.aborted === true ||
+      !(options.isValid?.() ?? true)
+    ) {
+      routeController.abort();
+    }
+    return !routeController.signal.aborted;
+  };
+  if (!isValid()) {
+    options.signal?.removeEventListener("abort", abortRoute);
+    return false;
+  }
 
   try {
     const persistence =
       persistenceCoordinator ??
-      createPersistenceCoordinator(async (snapshot) => {
-        await saveState(statePath, snapshot);
-        await saveStatusText(textPath, renderStatusLine(snapshot));
-      });
+      createPersistenceCoordinator<TuiPersistenceSnapshot>(
+        async ({ state, changedChildIDs }) => {
+          await saveState(statePath, state, {
+            ...(changedChildIDs !== undefined ? { changedChildIDs } : {}),
+          });
+          await saveStatusText(textPath, renderStatusLine(state));
+        },
+        { combineSnapshots: combineTuiPersistenceSnapshots },
+      );
     const directory = api.state.path.directory;
-    let stateToPersist: StatuslineState | undefined;
     const sessionClient = api.client.session;
-    let topLevelHydrationFailed = false;
-    let statusHydrationFailed = false;
-    let parentMessageHydrationFailed = false;
-
-    const [childrenResp, messagesResp, statusResp] = await Promise.all([
-      (async () => {
-        const response = await safeReadAsync(
-          () =>
-            sessionClient?.children?.(
-              {
-                sessionID: currentSessionID,
-                directory,
-              },
-              { signal: options.signal },
-            ) ?? Promise.resolve({ data: [] }),
-        );
-        if (!Array.isArray(response?.data)) topLevelHydrationFailed = true;
-        return response;
-      })(),
-      (async () => {
-        const response = await safeReadAsync(
-          () =>
-            sessionClient?.messages?.(
-              {
-                sessionID: currentSessionID,
-                directory,
-              },
-              { signal: options.signal },
-            ) ?? Promise.resolve({ data: [] }),
-        );
-        if (!Array.isArray(response?.data)) {
-          topLevelHydrationFailed = true;
-          parentMessageHydrationFailed = true;
-        }
-        return response;
-      })(),
-      (async () => {
-        const response = await safeReadAsync(
-          () =>
-            sessionClient?.status?.(
+    const currentState = options.getCurrentState?.();
+    const hydrationBaseline = currentState
+      ? cloneState(currentState)
+      : undefined;
+    const statusResultPromise = (async (): Promise<{
+      readonly statuses: Record<string, unknown>;
+      readonly failed: boolean;
+    }> => {
+      const readStatus = sessionClient?.status;
+      if (!readStatus) return { statuses: {}, failed: true };
+      const response = await raceRouteAbort(
+        () =>
+          safeReadAsync(() =>
+            readStatus(
               { directory },
-              { signal: options.signal },
-            ) ??
-            Promise.resolve({ data: {} }),
+              { signal: routeController.signal },
+            ),
+          ),
+        routeController.signal,
+      );
+      isValid();
+      const statuses = asRecord(response?.data);
+      return statuses && !Array.isArray(response?.data)
+        ? { statuses, failed: false }
+        : { statuses: {}, failed: !routeController.signal.aborted };
+    })();
+    const discovery = await discoverDescendantSessions({
+      rootSessionID: currentSessionID,
+      directory,
+      signal: routeController.signal,
+      readChildren: async (parentSessionID) => {
+        if (!isValid()) return [];
+        const readChildren = sessionClient?.children;
+        if (!readChildren) throw new RouteHydrationReadError();
+        const response = await raceRouteAbort(
+          () =>
+            safeReadAsync(() =>
+              readChildren(
+                { sessionID: parentSessionID, directory },
+                { signal: routeController.signal },
+              ),
+            ),
+          routeController.signal,
         );
-        if (!asRecord(response?.data) || Array.isArray(response?.data)) {
-          topLevelHydrationFailed = true;
-          statusHydrationFailed = true;
+        if (!isValid()) return [];
+        if (!Array.isArray(response?.data)) {
+          throw new RouteHydrationReadError();
         }
-        return response;
-      })(),
-    ]);
+        return response.data;
+      },
+    });
+    if (!isValid() || discovery.cancelled) return false;
+    const statusResult = await statusResultPromise;
     if (!isValid()) return false;
 
-    const children = Array.isArray(childrenResp?.data) ? childrenResp.data : [];
-    const messages = Array.isArray(messagesResp?.data) ? messagesResp.data : [];
-    const allStatuses = asRecord(statusResp?.data) ?? {};
-    const parentTaskEvidenceByChildID =
-      collectParentTaskEvidenceByChildSessionID(messages, currentSessionID);
-    type ChildMessageResult =
-      SessionMessageSummary & {
-        childID?: string;
-        fetchFailed: boolean;
-        model?: ReturnType<typeof extractLatestAssistantModel>;
-      };
-    const prioritizedChildren = children
-      .map((child, index) => {
-        const session = asRecord(child);
-        const childID =
-          typeof session?.id === "string" ? session.id : undefined;
-        const status = childID
-          ? deriveSessionChildStatus(allStatuses[childID])
-          : undefined;
-        const persistedRunning = childID
-          ? options.getCurrentState?.().children[childID]?.status === "running"
-          : false;
-        const updatedAt = session
-          ? (sessionTimestamp(session, "updated") ??
-            sessionTimestamp(session, "created"))
-          : undefined;
+    const messageEvidence = new Map<
+      string,
+      Promise<RouteMessageEvidence>
+    >();
+    const readMessages = (sessionID: string): Promise<RouteMessageEvidence> => {
+      const cached = messageEvidence.get(sessionID);
+      if (cached) return cached;
+      const pending = (async (): Promise<RouteMessageEvidence> => {
+        if (!isValid()) {
+          return { messages: [], fetchFailed: true };
+        }
+        const readSessionMessages = sessionClient?.messages;
+        if (!readSessionMessages) {
+          return { messages: [], fetchFailed: true };
+        }
+        const response = await raceRouteAbort(
+          () =>
+            safeReadAsync(() =>
+              readSessionMessages(
+                { sessionID, directory, limit: ROUTE_CHILD_MESSAGE_LIMIT },
+                { signal: routeController.signal },
+              ),
+            ),
+          routeController.signal,
+        );
+        const messages = Array.isArray(response?.data)
+          ? response.data.slice(0, ROUTE_CHILD_MESSAGE_LIMIT)
+          : [];
+        let tokens: ChildTokenState | undefined;
+        for (const message of messages) {
+          tokens = mergeTokens(
+            tokens,
+            extractChildDetails({
+              type: "message.updated",
+              properties: { part: message },
+            }).tokens,
+          );
+        }
+        const model = extractLatestAssistantModel(messages);
         return {
-          child,
-          index,
-          running:
-            status === "running" ||
-            (statusHydrationFailed && persistedRunning),
-          updatedAtMs: updatedAt ? Date.parse(updatedAt) : 0,
+          messages,
+          ...summarizeSessionMessages(messages),
+          fetchFailed: !Array.isArray(response?.data) || !isValid(),
+          ...(model ? { model } : {}),
+          ...(tokens ? { tokens } : {}),
         };
-      })
+      })();
+      messageEvidence.set(sessionID, pending);
+      return pending;
+    };
+
+    const prioritizedSessions = discovery.sessions
+      .map((session, index) => ({
+        session,
+        index,
+        running:
+          deriveSessionChildStatus(statusResult.statuses[session.id]) ===
+            "running" ||
+          (statusResult.failed &&
+            currentState?.children[session.id]?.status === "running"),
+        updatedAtMs:
+          timestampMillisFromUnknown(
+            session.time?.updated ?? session.time?.created,
+          ) ?? 0,
+      }))
       .sort((left, right) => {
         if (left.running !== right.running) return left.running ? -1 : 1;
         if (left.updatedAtMs !== right.updatedAtMs) {
@@ -1993,265 +2344,304 @@ export async function hydratePreviousSubagents(
         }
         return left.index - right.index;
       });
-    const admittedChildren = prioritizedChildren.slice(
-      0,
-      ROUTE_CHILD_MESSAGE_ADMISSION_LIMIT,
-    );
-    const hydratedChildResults = await mapWithBoundedConcurrency(
-      admittedChildren,
+    const messageSessionIDs = [
+      currentSessionID,
+      ...prioritizedSessions.map(({ session }) => session.id),
+    ];
+    const hydratedMessages = await mapWithBoundedConcurrency(
+      messageSessionIDs,
       ROUTE_CHILD_MESSAGE_CONCURRENCY,
-      async ({ child, index }): Promise<{
-        readonly index: number;
-        readonly result: ChildMessageResult;
-      }> => {
-        const session = asRecord(child);
-        const childID =
-          typeof session?.id === "string" ? session.id : undefined;
-        if (!childID || !isValid()) {
-          return {
-            index,
-            result: {
-              childID,
-              completedAt: undefined,
-              evidenceAt: undefined,
-              hasError: false,
-              fetchFailed: !isValid(),
-            },
-          };
-        }
-        const childMessagesResp = await safeReadAsync(
-          () =>
-            sessionClient?.messages?.(
-              {
-                sessionID: childID,
-                directory,
-                limit: 50,
-              },
-              { signal: options.signal },
-            ) ??
-            Promise.resolve({ data: [] }),
-        );
-        const fetchFailed =
-          !Array.isArray(childMessagesResp?.data) || !isValid();
-        const childMessages = Array.isArray(childMessagesResp?.data)
-          ? childMessagesResp.data
-          : [];
-        return {
-          index,
-          result: {
-            childID,
-            ...summarizeSessionMessages(childMessages),
-            model: extractLatestAssistantModel(childMessages),
-            fetchFailed,
-          },
-        };
-      },
+      readMessages,
     );
     if (!isValid()) return false;
-    const resultsByIndex = new Map(
-      hydratedChildResults.map(({ index, result }) => [index, result]),
-    );
-    const childMessageResults: ChildMessageResult[] = children.map(
-      (child, index) => {
-        const hydrated = resultsByIndex.get(index);
-        if (hydrated) return hydrated;
-        const session = asRecord(child);
-        return {
-          childID:
-            typeof session?.id === "string" ? session.id : undefined,
-          completedAt: undefined,
-          evidenceAt: undefined,
-          hasError: false,
-          fetchFailed: true,
-        };
-      },
-    );
-    const childHydrationFailed = hydratedChildResults.some(
-      ({ result }) => result.fetchFailed,
-    );
-    const childMessageSummaryByID = new Map(
-      childMessageResults
-        .filter((result) => result.childID)
-        .map((result) => [result.childID as string, result]),
-    );
 
-    if (!isValid()) return false;
+    const evidenceBySessionID = new Map(
+      messageSessionIDs.map((sessionID, index) => [
+        sessionID,
+        hydratedMessages[index] ?? { messages: [], fetchFailed: true },
+      ]),
+    );
+    const parentTaskEvidence = new Map<
+      string,
+      ReadonlyMap<string, ParentTaskEvidence>
+    >();
+    for (const sessionID of messageSessionIDs) {
+      const evidence = evidenceBySessionID.get(sessionID);
+      parentTaskEvidence.set(
+        sessionID,
+        collectParentTaskEvidenceByChildSessionID(
+          evidence?.messages ?? [],
+          sessionID,
+        ),
+      );
+    }
+
+    let stateToPersist: StatuslineState | undefined;
+    let changedChildIDsToPersist: readonly string[] | undefined;
     snapshotSidebarScrollOffsets();
     setState((current) => {
       if (!isValid()) return current;
       const next = cloneState(current);
+      const lookup = createChildLookup(next);
+      const changedChildIDs = new Set<string>();
       let changed = false;
+      const applyEvent = (event: unknown): void => {
+        const transaction = applySubagentEventDetailed(next, event, lookup);
+        changed = transaction.changed || changed;
+        for (const childID of transaction.changedChildIDs) {
+          changedChildIDs.add(childID);
+        }
+      };
+      const candidateIDs = (sessionID: string): readonly string[] => [
+        ...new Set([sessionID, ...(lookup.byTarget.get(sessionID) ?? [])]),
+      ];
+      const applyCandidateMutation = (
+        sessionID: string,
+        mutate: (candidates: readonly string[]) => boolean,
+      ): boolean => {
+        const candidates = candidateIDs(sessionID);
+        const before = new Map(
+          candidates.map((childID) => [childID, next.children[childID]]),
+        );
+        if (!mutate(candidates)) return false;
+        for (const childID of candidates) {
+          if (
+            !sameHydrationChild(before.get(childID), next.children[childID])
+          ) {
+            refreshChildLookup(lookup, next, childID);
+            changedChildIDs.add(childID);
+          }
+        }
+        changed = true;
+        return true;
+      };
 
-      for (const rawSession of children) {
-        const session = asRecord(rawSession);
-        if (!session || typeof session.id !== "string") continue;
-        const status = allStatuses[session.id];
-        const sessionStatus = deriveSessionChildStatus(status);
-        const childSummary = childMessageSummaryByID.get(session.id);
+      for (const session of discovery.sessions) {
+        const sessionStatus = deriveSessionChildStatus(
+          statusResult.statuses[session.id],
+        );
+        const childEvidence = evidenceBySessionID.get(session.id);
+        const parentEvidence = parentTaskEvidence
+          .get(session.parentID)
+          ?.get(session.id);
+        const parentEvidenceByChildID =
+          parentTaskEvidence.get(session.parentID) ?? new Map();
         const hasHydrationEvidence = shouldHydrateSessionChild({
           childID: session.id,
           sessionStatus,
-          childSummary,
-          parentTaskEvidenceByChildID,
+          childSummary: childEvidence,
+          parentTaskEvidenceByChildID: parentEvidenceByChildID,
         });
-        const parentTaskEvidence = parentTaskEvidenceByChildID.get(session.id);
-        const explicitCompletionEvidence =
-          !!childSummary &&
-          !childSummary.fetchFailed &&
-          (typeof childSummary.completedAt === "string" ||
-            childSummary.hasError);
-        const fallbackEndedAt =
-          childSummary?.completedAt ?? childSummary?.evidenceAt;
-        const statusEndedAt =
-          fallbackEndedAt ??
-          sessionTimestamp(session, "completed") ??
-          sessionTimestamp(session, "updated");
-        const shouldHydrateChildFromSession = hasHydrationEvidence;
 
-        if (!shouldHydrateChildFromSession) {
+        if (!hasHydrationEvidence) {
           const existing = next.children[session.id];
           if (
-            !statusHydrationFailed &&
-            !parentMessageHydrationFailed &&
-            !!childSummary &&
-            !childSummary.fetchFailed &&
-            existing?.parentID === currentSessionID &&
+            !statusResult.failed &&
+            evidenceBySessionID.get(session.parentID)?.fetchFailed !== true &&
+            childEvidence?.fetchFailed === false &&
+            existing?.parentID === session.parentID &&
             existing.source === "session" &&
             existing.status === "running"
           ) {
             delete next.children[session.id];
+            refreshChildLookup(lookup, next, session.id);
+            changedChildIDs.add(session.id);
             changed = true;
           }
           continue;
         }
 
-        const fakeEvent = {
+        applyEvent({
           type: "session.created",
-          properties: {
-            sessionID: session.id,
-            info: session,
-          },
-        };
-        if (applySubagentEvent(next, fakeEvent)) changed = true;
-        if (childSummary?.model) {
-          changed =
+          properties: { sessionID: session.id, info: session },
+        });
+        if (childEvidence?.model) {
+          const modelEvidence = childEvidence.model;
+          applyCandidateMutation(session.id, (candidates) =>
             setChildModel(
               next,
               session.id,
-              childSummary.model.model,
-              childSummary.model.updatedAt,
-            ) || changed;
+              modelEvidence.model,
+              modelEvidence.updatedAt,
+              candidates,
+            ),
+          );
+        }
+        if (
+          childEvidence?.tokens &&
+          upsertChildDetails(next, session.id, {
+            tokens: childEvidence.tokens,
+          })
+        ) {
+          changedChildIDs.add(session.id);
+          changed = true;
         }
 
         const resolvedStatus = resolveSessionStatusWithMessageSummary({
-          status: sessionStatus ?? parentTaskEvidence?.status,
-          summary: childSummary,
+          status: sessionStatus ?? parentEvidence?.status,
+          summary: childEvidence,
         });
-
+        const fallbackEndedAt =
+          childEvidence?.completedAt ?? childEvidence?.evidenceAt;
         if (
           resolvedStatus.status === "done" ||
           resolvedStatus.status === "error"
         ) {
-          if (
+          const terminalStatus = resolvedStatus.status;
+          applyCandidateMutation(session.id, (candidates) =>
             markChildStatus(
               next,
               session.id,
-              resolvedStatus.status,
+              terminalStatus,
               resolvedStatus.endedAt ??
-                parentTaskEvidence?.endedAt ??
-                statusEndedAt,
-            )
-          )
-            changed = true;
+                parentEvidence?.endedAt ??
+                fallbackEndedAt ??
+                timestampFromUnknown(
+                  session.time?.completed ?? session.time?.updated,
+                ),
+              candidates,
+            ),
+          );
           continue;
         }
-
         if (
           !sessionStatus &&
-          !statusHydrationFailed &&
-          explicitCompletionEvidence
+          !statusResult.failed &&
+          childEvidence?.fetchFailed === false &&
+          (typeof childEvidence.completedAt === "string" ||
+            childEvidence.hasError === true)
         ) {
-          const childStatus = childSummary?.hasError ? "error" : "done";
-          if (markChildStatus(next, session.id, childStatus, fallbackEndedAt))
-            changed = true;
+          const childStatus = childEvidence.hasError ? "error" : "done";
+          applyCandidateMutation(session.id, (candidates) =>
+            markChildStatus(
+              next,
+              session.id,
+              childStatus,
+              fallbackEndedAt,
+              candidates,
+            ),
+          );
         }
       }
 
-      for (const rawMessage of messages) {
-        const message = asRecord(rawMessage);
-        const info = asRecord(message?.info);
-        const parts = Array.isArray(message?.parts) ? message.parts : [];
-        const parentMessageID = messageIDOf(message);
-        const isAssistant = info?.role === "assistant";
-        const time = asRecord(info?.time);
-        const eventInfo = {
-          id: typeof info?.id === "string" ? info.id : undefined,
-          role: typeof info?.role === "string" ? info.role : undefined,
-          parentID:
-            typeof info?.parentID === "string" ? info.parentID : undefined,
-          time,
-        };
-        const completedAt = timestampFromUnknown(time?.completed);
-        const isCompleted = typeof completedAt === "string";
-        const hasError = !!info?.error;
-
-        for (const rawPart of parts) {
-          const part = asRecord(rawPart);
-          if (!part) continue;
-          const partWithMessageID =
-            typeof part.messageID === "string" && part.messageID.length > 0
-              ? part
-              : parentMessageID
-                ? { ...part, messageID: parentMessageID }
-                : part;
-          if (
-            part.type === "subtask" ||
-            (part.type === "tool" &&
-              (part.tool === "delegate" || part.tool === "task"))
-          ) {
-            const fakeEvent = {
+      for (const parentSessionID of messageSessionIDs) {
+        const messages = evidenceBySessionID.get(parentSessionID)?.messages ?? [];
+        for (const rawMessage of messages) {
+          const message = asRecord(rawMessage);
+          const info = asRecord(message?.info);
+          const parts = Array.isArray(message?.parts) ? message.parts : [];
+          const parentMessageID = messageIDOf(message);
+          const time = asRecord(info?.time);
+          const completedAt = timestampFromUnknown(time?.completed);
+          for (const rawPart of parts) {
+            const part = asRecord(rawPart);
+            if (!part) continue;
+            const partWithMessageID =
+              typeof part.messageID === "string" && part.messageID.length > 0
+                ? part
+                : parentMessageID
+                  ? { ...part, messageID: parentMessageID }
+                  : part;
+            if (
+              part.type !== "subtask" &&
+              !(
+                part.type === "tool" &&
+                (part.tool === "delegate" || part.tool === "task")
+              )
+            ) {
+              continue;
+            }
+            applyEvent({
               type: "message.part.updated",
               properties: {
-                sessionID: currentSessionID,
-                info: eventInfo,
+                sessionID: parentSessionID,
+                info: {
+                  id: typeof info?.id === "string" ? info.id : undefined,
+                  role:
+                    typeof info?.role === "string" ? info.role : undefined,
+                  parentID:
+                    typeof info?.parentID === "string"
+                      ? info.parentID
+                      : undefined,
+                  time,
+                },
                 part: partWithMessageID,
               },
-            };
-            if (applySubagentEvent(next, fakeEvent)) changed = true;
-
-            if (part.type === "subtask" && isAssistant && isCompleted) {
+            });
+            if (
+              part.type === "subtask" &&
+              info?.role === "assistant" &&
+              completedAt
+            ) {
               const childID = `subtask:${part.id}`;
-              const status = hasError ? "error" : "done";
-              if (markChildStatus(next, childID, status, completedAt))
+              const status = info.error ? "error" : "done";
+              if (markChildStatus(next, childID, status, completedAt)) {
+                refreshChildLookup(lookup, next, childID);
+                changedChildIDs.add(childID);
                 changed = true;
+              }
             }
           }
         }
       }
 
-      if (backfillHydratedTargetSessionIDs(next, currentSessionID)) {
-        changed = true;
+      const hydratedParentIDs = new Set(messageSessionIDs);
+      let targetChanged = false;
+      for (const child of Object.values(next.children)) {
+        if (!hydratedParentIDs.has(child.parentID)) continue;
+        if (resolveChildTargetSessionID(child)) continue;
+        const targetSessionID =
+          child.source === "session" || child.id.startsWith("ses_")
+            ? child.id
+            : resolveSyntheticTargetFromHydratedState(next, child, lookup);
+        if (
+          targetSessionID &&
+          setChildTarget(next, child.id, targetSessionID, lookup)
+        ) {
+          changedChildIDs.add(child.id);
+          targetChanged = true;
+          changed = true;
+        }
       }
+      if (targetChanged) next.updatedAt = new Date().toISOString();
 
+      if (hydrationBaseline) {
+        preserveFreshHydrationEvidence(next, current, hydrationBaseline);
+      }
       const refreshed = refreshLiveState(next);
-      if (!changed && !refreshed) return current;
+      const actuallyChangedChildIDs = changedHydrationChildIDs(current, next);
+      if (!changed && !refreshed && actuallyChangedChildIDs.length === 0) {
+        return current;
+      }
       stateToPersist = next;
+      changedChildIDsToPersist = refreshed
+        ? undefined
+        : actuallyChangedChildIDs;
       return next;
     });
     if (!isValid()) return false;
-    const terminalFlush = stateToPersist
-      ? persistStateSnapshot(persistence, stateToPersist, true)
-      : undefined;
-    await terminalFlush?.catch(() => undefined);
-    if (topLevelHydrationFailed || childHydrationFailed) return false;
-    return true;
-  } catch (err) {
+    if (stateToPersist) {
+      await persistStateSnapshot(
+        persistence,
+        stateToPersist,
+        true,
+        changedChildIDsToPersist,
+      ).catch(() => undefined);
+    }
+    return !(
+      discovery.hadFailure ||
+      statusResult.failed ||
+      hydratedMessages.some(({ fetchFailed }) => fetchFailed)
+    );
+  } catch (error) {
     debugLog({
       kind: "hydration.error",
       sessionID: currentSessionID,
-      error: String(err),
+      error: String(error),
     });
     return false;
+  } finally {
+    options.signal?.removeEventListener("abort", abortRoute);
   }
 }
 
@@ -2282,7 +2672,7 @@ type ParentTaskEvidence = {
 };
 
 function collectParentTaskEvidenceByChildSessionID(
-  messages: unknown[],
+  messages: readonly unknown[],
   parentSessionID: string,
 ): Map<string, ParentTaskEvidence> {
   const evidenceByID = new Map<string, ParentTaskEvidence>();
@@ -2395,13 +2785,37 @@ function resolveReconcileTargetSessionID(
   );
 }
 
+export function prioritizeTokenHydrationCandidates(
+  children: readonly ChildSessionState[],
+  currentRouteDescendantSessionIDs?: ReadonlySet<string>,
+): ChildSessionState[] {
+  return [...children].sort((left, right) => {
+    const leftCurrent = currentRouteDescendantSessionIDs?.has(
+      resolveChildTargetSessionID(left) ?? left.id,
+    )
+      ? 1
+      : 0;
+    const rightCurrent = currentRouteDescendantSessionIDs?.has(
+      resolveChildTargetSessionID(right) ?? right.id,
+    )
+      ? 1
+      : 0;
+    if (leftCurrent !== rightCurrent) return rightCurrent - leftCurrent;
+    const leftRunning = left.status === "running" ? 1 : 0;
+    const rightRunning = right.status === "running" ? 1 : 0;
+    if (leftRunning !== rightRunning) return rightRunning - leftRunning;
+    return Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
+  });
+}
+
 export function selectRunningReconcileCandidates(input: {
-  state: StatuslineState;
-  currentSessionID?: string;
-  hydratingSessionIDs?: ReadonlySet<string>;
-  nowMs: number;
-  maxCandidates: number;
-  lookup?: ChildLookup;
+  readonly state: StatuslineState;
+  readonly currentSessionID?: string;
+  readonly currentRouteDescendantSessionIDs?: ReadonlySet<string>;
+  readonly hydratingSessionIDs?: ReadonlySet<string>;
+  readonly nowMs: number;
+  readonly maxCandidates: number;
+  readonly lookup?: ChildLookup;
 }): RunningReconcileCandidate[] {
   const runningChildren = Object.values(input.state.children).filter(
     (child) =>
@@ -2415,9 +2829,18 @@ export function selectRunningReconcileCandidates(input: {
     runningChildren,
     input.nowMs,
   ).sort(byPriority);
-  const prioritizedForSession = prioritized.filter((child) =>
-    input.currentSessionID ? child.parentID === input.currentSessionID : true,
-  );
+  const currentRouteDescendantSessionIDs = input.currentSessionID
+    ? (input.currentRouteDescendantSessionIDs ??
+      buildCurrentRouteSubtreeProjection(input.state, input.currentSessionID)
+        .subtree.executionIDs)
+    : undefined;
+  const prioritizedForSession = currentRouteDescendantSessionIDs
+    ? prioritized.filter((child) =>
+        currentRouteDescendantSessionIDs.has(
+          resolveChildTargetSessionID(child) ?? child.id,
+        ),
+      )
+    : prioritized;
 
   // Single pass to collect very-old IDs AND remember per-child age so we
   // don't pay resolveRunningChildAgeMillis twice per child.
@@ -2435,7 +2858,7 @@ export function selectRunningReconcileCandidates(input: {
   }
 
   // Build the final order inline to avoid spreading + filtering twice.
-const ordered: typeof runningChildren = [];
+  const ordered: typeof runningChildren = [];
   const seen = new Set<string>();
   for (const child of prioritizedForSession) {
     if (seen.has(child.id)) continue;
@@ -2450,7 +2873,8 @@ const ordered: typeof runningChildren = [];
 
   const selected: RunningReconcileCandidate[] = [];
   for (const child of ordered) {
-    const age = ageByID.get(child.id)!;
+    const age = ageByID.get(child.id);
+    if (!age) continue;
     const targetSessionID = resolveReconcileTargetSessionID(
       input.state,
       child,
@@ -2666,19 +3090,24 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
   const statePath = resolveStatePath();
   const textPath = resolveTextPath(statePath);
   let lastStatusText = "";
-  const persistence = createPersistenceCoordinator<StatuslineState>(
-    async (snapshot) => {
-      await saveState(statePath, snapshot);
-      const nextText = renderStatusLine(snapshot);
+  const persistence = createPersistenceCoordinator<TuiPersistenceSnapshot>(
+    async ({ state, changedChildIDs }) => {
+      await saveState(statePath, state, {
+        ...(changedChildIDs !== undefined ? { changedChildIDs } : {}),
+      });
+      const nextText = renderStatusLine(state);
       // Skip status.txt write when the rendered summary is unchanged — the
       // aggregate text only changes on status/visibility transitions, which
       // are rare relative to detail-only event bursts.
       if (nextText !== lastStatusText) {
-        lastStatusText = nextText;
         await saveStatusText(textPath, nextText);
+        lastStatusText = nextText;
       }
     },
-    { settleDelayMs: 150 },
+    {
+      settleDelayMs: 150,
+      combineSnapshots: combineTuiPersistenceSnapshots,
+    },
   );
   const [state, setState] = createSignal<StatuslineState>(createEmptyState());
   const [nowMs, setNowMs] = createSignal(Date.now());
@@ -2712,6 +3141,16 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
     routeAbortController.signal,
   ]);
   let previousRouteSessionID: string | undefined;
+  const currentRouteSubtreeCoordinator =
+    createCurrentRouteSubtreeCoordinator();
+  const currentRouteProjection = createMemo(() => {
+    const currentState = state();
+    void api.route.current;
+    return currentRouteSubtreeCoordinator.read({
+      state: currentState,
+      sessionID: resolveRouteSessionID(api),
+    });
+  });
   let pendingSidebarRefocus: PendingSidebarRefocus | undefined;
   let pendingRefocusConsumed = false;
   let activePromptRef: TuiPromptRef | undefined;
@@ -2777,23 +3216,18 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
   ): void => {
     if (disposed || api.lifecycle.signal.aborted) return;
     const current = state();
-    const routeSessionID = resolveRouteSessionID(api);
+    const currentRouteDescendantSessionIDs =
+      currentRouteProjection()?.subtree.executionIDs;
     const ids = childIDs ?? Object.keys(current.children);
-    const candidates = [...new Set(ids)]
-      .map((childID) => current.children[childID])
-      .filter((child): child is ChildSessionState => child !== undefined)
-      .filter(
-        (child) => child.status === "running" || !hasTokenTotal(child.tokens),
-      )
-      .sort((left, right) => {
-        const leftCurrent = left.parentID === routeSessionID ? 1 : 0;
-        const rightCurrent = right.parentID === routeSessionID ? 1 : 0;
-        if (leftCurrent !== rightCurrent) return rightCurrent - leftCurrent;
-        const leftRunning = left.status === "running" ? 1 : 0;
-        const rightRunning = right.status === "running" ? 1 : 0;
-        if (leftRunning !== rightRunning) return rightRunning - leftRunning;
-        return Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
-      });
+    const candidates = prioritizeTokenHydrationCandidates(
+      [...new Set(ids)]
+        .map((childID) => current.children[childID])
+        .filter((child): child is ChildSessionState => child !== undefined)
+        .filter(
+          (child) => child.status === "running" || !hasTokenTotal(child.tokens),
+        ),
+      currentRouteDescendantSessionIDs,
+    );
 
     for (const child of candidates) {
       const updatedAtMs = Date.parse(child.updatedAt);
@@ -2803,7 +3237,11 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
         generation: routeGeneration,
         signal: routeHydrationSignal,
         priority:
-          (child.parentID === routeSessionID ? 2_000_000_000_000_000 : 0) +
+          (currentRouteDescendantSessionIDs?.has(
+            resolveChildTargetSessionID(child) ?? child.id,
+          )
+            ? 2_000_000_000_000_000
+            : 0) +
           (child.status === "running" ? 1_000_000_000_000_000 : 0) +
           (Number.isFinite(updatedAtMs) ? updatedAtMs : 0),
       });
@@ -3012,19 +3450,19 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
         });
       };
 
-      const hydrated = await hydratePreviousSubagents(
+      const hydrated = await hydratePreviousSubagents({
         api,
-        sessionID,
+        currentSessionID: sessionID,
         statePath,
         textPath,
         setState,
-        persistence,
-        {
+        persistenceCoordinator: persistence,
+        options: {
           signal: generationSignal,
           isValid: isCurrentHydration,
           getCurrentState: state,
         },
-      );
+      });
       if (!isCurrentHydration()) {
         clearHydrateRetryTimeout(sessionID);
         if (!disposed && !api.lifecycle.signal.aborted) finishHydrating();
@@ -3116,6 +3554,8 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
       const selected = selectRunningReconcileCandidates({
         state: snapshot,
         currentSessionID,
+        currentRouteDescendantSessionIDs:
+          currentRouteProjection()?.subtree.executionIDs,
         hydratingSessionIDs: hydratingSessions(),
         nowMs,
         maxCandidates: RUNNING_RECONCILE_MAX_CANDIDATES,
@@ -3556,6 +3996,7 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
               sidebarWidth={() => resolveSidebarWidth(ctx)}
               theme={ctx.theme.current}
               restoreFromChild={restoreFromChild}
+              currentRouteProjection={currentRouteProjection}
             />
           </Show>
         );
