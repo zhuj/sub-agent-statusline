@@ -217,6 +217,20 @@ export type PersistedStaleSubtaskMessageIndex = {
   >;
 };
 
+/**
+ * Per-process cache of {@link PersistedStaleSubtaskMessageIndex} instances,
+ * keyed by the messages array reference. The cache reuses an index for
+ * repeated `resolvePersistedStaleSubtaskFromParentMessages` calls against
+ * the same message snapshot.
+ *
+ * Contract: callers MUST treat the messages array as an immutable snapshot
+ * for the lifetime of the cached index. Mutating the array in place will
+ * leave the cached index stale and the next resolution will return wrong
+ * results. In practice, the TUI passes the response of
+ * `session.messages(id)` and OpenCode returns a fresh array per call, so
+ * the contract holds. If a caller needs to pass a mutable array, they
+ * should pass an explicit `index` built from a fresh snapshot.
+ */
 const staleSubtaskMessageIndexCache = new WeakMap<
   readonly unknown[],
   PersistedStaleSubtaskMessageIndex
