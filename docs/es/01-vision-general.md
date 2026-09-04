@@ -37,13 +37,13 @@ En la TUI, el plugin puede mostrar:
 
 El paquete publica dos entrypoints:
 
-| Entrypoint                             | Fuente         | Uso principal                                                                            |
-| -------------------------------------- | -------------- | ---------------------------------------------------------------------------------------- |
-| `opencode-subagent-statusline`         | `src/tui.tsx`  | Plugin TUI principal. Es el camino recomendado para usuarios.                            |
-| `opencode-subagent-statusline/tui`     | `src/tui.tsx`  | Alias explícito del plugin TUI.                                                          |
-| `opencode-subagent-statusline/runtime` | `src/index.ts` | Plugin runtime/file-based avanzado. Procesa eventos y escribe `state.json`/`status.txt`. |
+| Entrypoint                         | Fuente        | Uso principal                                        |
+| ---------------------------------- | ------------- | ---------------------------------------------------- |
+| `opencode-subagent-statusline`     | `src/tui.tsx` | Plugin TUI principal. Es el camino recomendado.      |
+| `opencode-subagent-statusline/tui` | `src/tui.tsx` | Alias explícito del plugin TUI.                      |
 
-El README actual se concentra en el modo TUI, que es la experiencia principal del paquete.
+El plugin TUI es el único canal de entrega. Trabaja en memoria y no escribe
+archivos fuera del contexto del plugin de OpenCode.
 
 ## Cómo funciona a alto nivel
 
@@ -54,8 +54,8 @@ OpenCode event
   -> src/events.ts
   -> src/state.ts
   -> src/render.ts
-  -> src/tui.tsx o src/index.ts
-  -> sidebar / home footer / status.txt
+  -> src/tui.tsx
+  -> sidebar / home footer
 ```
 
 Paso por paso:
@@ -119,7 +119,7 @@ El núcleo determinístico tiene buena cobertura de tests:
 - render textual;
 - reconciliación conservadora;
 - comandos/keybindings básicos;
-- persistencia del runtime plugin.
+- persistencia del plugin runtime.
 
 El límite actual es la UI visual completa dentro del host OpenCode/OpenTUI: no hay automatización E2E profunda de la TUI. Para cambios visuales, el proyecto recomienda smoke tests manuales además de los tests automatizados.
 

@@ -14,11 +14,8 @@ src/state.ts
         ↓
 src/render.ts
         ↓
-┌──────────────────────┬──────────────────────┐
-│ src/tui.tsx          │ src/index.ts          │
-│ Plugin TUI principal │ Plugin runtime        │
-│ Sidebar / footer     │ state.json/status.txt │
-└──────────────────────┴──────────────────────┘
+src/tui.tsx
+   Sidebar / footer
 ```
 
 ## Mapa de módulos
@@ -26,14 +23,12 @@ src/render.ts
 | Archivo                          | Responsabilidad                                                                                        |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `src/tui.tsx`                    | Plugin TUI principal: slots, sidebar, footer, hidratación, reconciliación, navegación y ciclo de vida. |
-| `src/index.ts`                   | Plugin runtime/file-based: escucha eventos, persiste estado y escribe `status.txt`.                    |
 | `src/events.ts`                  | Convierte eventos de OpenCode en mutaciones del estado interno.                                        |
-| `src/state.ts`                   | Define el modelo de datos, contadores, persistencia y helpers de mutación.                             |
+| `src/state.ts`                   | Define el modelo de datos, contadores y helpers de mutación. El estado vive solo en memoria.          |
 | `src/render.ts`                  | Formatea filas, colapsa duplicados, filtra visibilidad y arma el statusline textual.                   |
 | `src/reconcile.ts`               | Normaliza estados de OpenCode y ayuda a cerrar casos `running` viejos de forma segura.                 |
 | `src/tui-commands.ts`            | Registra comandos y keybindings, especialmente `Alt+B`.                                                |
 | `src/*.test.ts`                  | Tests unitarios del núcleo determinístico.                                                             |
-| `test/index.integration.test.ts` | Tests de integración del plugin runtime y persistencia en filesystem.                                  |
 
 ## Entrypoints
 
@@ -41,7 +36,7 @@ src/render.ts
 
 Fuente: `src/tui.tsx`
 
-Es el entrypoint principal del paquete:
+Es el único entrypoint del paquete:
 
 ```txt
 opencode-subagent-statusline
@@ -57,27 +52,10 @@ Responsabilidades principales:
 - renderizar un resumen inferior en home;
 - registrar comandos y atajos;
 - hidratar subagentes existentes al navegar entre sesiones;
-- reconciliar estados viejos que quedaron como `running`;
-- persistir snapshots auxiliares de estado.
+- reconciliar estados viejos que quedaron como `running`.
 
-### Runtime plugin
-
-Fuente: `src/index.ts`
-
-Se publica como:
-
-```txt
-opencode-subagent-statusline/runtime
-```
-
-Este modo es más bajo nivel. No renderiza la sidebar TUI. En cambio:
-
-1. inicializa rutas de estado;
-2. procesa eventos;
-3. guarda `state.json`;
-4. escribe `status.txt` con el render textual.
-
-Es útil para entender el núcleo del proyecto porque usa el mismo pipeline de eventos, estado y renderizado, pero sin la capa visual de `src/tui.tsx`.
+El estado se mantiene en memoria dentro del proceso de la TUI; el plugin no
+escribe nada a disco.
 
 ## Modelo interno
 
@@ -292,7 +270,7 @@ Límite actual: la UI visual completa de `src/tui.tsx` no tiene E2E profundo con
 | Archivo                         | Rol                                                             |
 | ------------------------------- | --------------------------------------------------------------- |
 | `package.json`                  | Nombre del paquete, exports, scripts, peers y semantic-release. |
-| `tsup.config.ts`                | Build dual: runtime y TUI.                                      |
+| `tsup.config.ts`                | Bundle del plugin TUI (ESM + DTS).                             |
 | `tsconfig.json`                 | TypeScript base para source.                                    |
 | `tsconfig.test.json`            | TypeScript para tests.                                          |
 | `vitest.config.ts`              | Vitest, coverage y setup.                                       |
