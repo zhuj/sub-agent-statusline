@@ -1,13 +1,8 @@
-import { afterEach } from "vitest";
-import { cleanupRegisteredTempDirs } from "./helpers/runtime-harness.js";
+import { afterEach, vi } from "vitest";
 
 const envKeys = [
   "NO_COLOR",
   "OPENCODE_SUBAGENT_STATUSLINE_COLOR",
-  "OPENCODE_SUBAGENT_STATUSLINE_INSTANCE",
-  "OPENCODE_SUBAGENT_STATUSLINE_PRESERVE_STATE",
-  "OPENCODE_SUBAGENT_STATUSLINE_STATE",
-  "XDG_RUNTIME_DIR",
 ];
 
 const originalEnv = new Map(
@@ -27,6 +22,4 @@ afterEach(async () => {
       process.env[key] = original;
     }
   }
-
-  await cleanupRegisteredTempDirs();
 });
