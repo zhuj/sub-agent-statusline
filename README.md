@@ -75,14 +75,12 @@ For 1.x releases, the stable user-facing contract is:
 - OpenCode `tui.json` plugin configuration;
 - visible sidebar and home/footer behavior;
 - command palette entry, `Alt+B`, and focused-list navigation;
-- local privacy and persistence behavior described in this README;
+- local privacy behavior described in this README;
 - Node, peer dependency, and install contract declared in `package.json`.
 
 Experimental or internal surfaces may change in 1.x without a SemVer-major bump:
 
-- `opencode-subagent-statusline/runtime`, intended for diagnostics and file-based runtime experiments;
-- diagnostic environment variables;
-- exact `state.json` schema and `status.txt` format;
+- diagnostic environment variables (`OPENCODE_SUBAGENT_STATUSLINE_COLOR`, `OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS`);
 - internal source modules and source-level exports.
 
 Use the TUI plugin entrypoints for normal OpenCode usage.
@@ -165,7 +163,6 @@ Package entrypoints:
 ```txt
 opencode-subagent-statusline          -> TUI plugin
 opencode-subagent-statusline/tui      -> TUI plugin
-opencode-subagent-statusline/runtime  -> experimental/diagnostic runtime mode
 ```
 
 Useful commands:
@@ -235,13 +232,11 @@ Then restart OpenCode.
 
 OpenCode event payloads can vary by version and by event type. The plugin shows token/context usage when it is available and safely omits it when it is not.
 
-## Local privacy and persistence
+## Local privacy
 
-The plugin persists a local JSON state file and `status.txt` snapshot under `XDG_RUNTIME_DIR` or the system temp directory by default. Those files can include OpenCode-derived subagent titles and summaries, which may contain short fragments derived from prompts or task descriptions. Files are written best-effort with owner-only permissions and atomic temp-file replacement where Node and the host filesystem support them.
+The plugin is in-memory only: subagent state lives inside the TUI runtime and is not persisted to disk by the plugin itself. There is no `state.json` or `status.txt` written under `XDG_RUNTIME_DIR`, and the plugin reads no files outside the standard OpenCode plugin context.
 
-`OPENCODE_SUBAGENT_STATUSLINE_STATE` overrides the state file path. Treat that environment variable as trusted local configuration because the plugin will write status data to the configured path.
-
-For token/context backfill, the TUI reads recent local OpenCode SQLite/log data only from the user's OpenCode data directory. Very large log files are skipped to avoid blocking the TUI.
+For diagnostics, set `OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS=1` to enable structured event logging through the OpenCode plugin API; this is purely observational and does not affect the rendered TUI.
 
 ---
 

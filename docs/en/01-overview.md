@@ -37,13 +37,13 @@ In the TUI, the plugin can show:
 
 The package exposes these entrypoints:
 
-| Entrypoint                             | Source         | Primary use                                                                                |
-| -------------------------------------- | -------------- | ------------------------------------------------------------------------------------------ |
-| `opencode-subagent-statusline`         | `src/tui.tsx`  | Main TUI plugin. Recommended path for users.                                               |
-| `opencode-subagent-statusline/tui`     | `src/tui.tsx`  | Explicit alias for the TUI plugin.                                                         |
-| `opencode-subagent-statusline/runtime` | `src/index.ts` | Advanced runtime/file-based plugin. Processes events and writes `state.json`/`status.txt`. |
+| Entrypoint                         | Source         | Primary use                                                  |
+| ---------------------------------- | -------------- | ------------------------------------------------------------ |
+| `opencode-subagent-statusline`     | `src/tui.tsx`  | Main TUI plugin. Recommended path for users.                 |
+| `opencode-subagent-statusline/tui` | `src/tui.tsx`  | Explicit alias for the TUI plugin.                           |
 
-The current README focuses on the TUI mode, which is the package's main experience.
+The TUI plugin is the only delivery channel. It is in-memory and does not write
+files outside the OpenCode plugin context.
 
 ## High-level flow
 
@@ -52,8 +52,8 @@ OpenCode event
   -> src/events.ts
   -> src/state.ts
   -> src/render.ts
-  -> src/tui.tsx or src/index.ts
-  -> sidebar / home footer / status.txt
+  -> src/tui.tsx
+  -> sidebar / home footer
 ```
 
 Step by step:
@@ -116,8 +116,7 @@ The deterministic core has strong test coverage for:
 - counters and deduplication;
 - text rendering;
 - conservative reconciliation;
-- basic command/keybinding registration;
-- runtime plugin persistence.
+- basic command/keybinding registration.
 
 The current boundary is the full visual UI inside the OpenCode/OpenTUI host: deep TUI E2E automation does not exist yet. For visual changes, the project recommends manual OpenCode smoke tests in addition to automated tests.
 

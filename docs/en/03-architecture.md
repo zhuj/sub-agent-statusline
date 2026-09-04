@@ -14,11 +14,8 @@ src/state.ts
         ↓
 src/render.ts
         ↓
-┌──────────────────────┬──────────────────────┐
-│ src/tui.tsx          │ src/index.ts          │
-│ Main TUI plugin      │ Runtime plugin        │
-│ Sidebar / footer     │ state.json/status.txt │
-└──────────────────────┴──────────────────────┘
+src/tui.tsx
+   Sidebar / footer
 ```
 
 ## Module map
@@ -26,14 +23,12 @@ src/render.ts
 | File | Responsibility |
 | --- | --- |
 | `src/tui.tsx` | Main TUI plugin: slots, sidebar, footer, hydration, reconciliation, navigation, and lifecycle. |
-| `src/index.ts` | Runtime/file-based plugin: listens to events, persists state, and writes `status.txt`. |
 | `src/events.ts` | Converts OpenCode events into internal state mutations. |
-| `src/state.ts` | Defines the data model, counters, persistence, and mutation helpers. |
+| `src/state.ts` | Defines the data model, counters, and mutation helpers. State is in-memory only. |
 | `src/render.ts` | Formats rows, collapses duplicates, filters visibility, and builds statusline text. |
 | `src/reconcile.ts` | Normalizes OpenCode statuses and safely closes stale `running` cases. |
 | `src/tui-commands.ts` | Registers commands and keybindings, especially `Alt+B`. |
 | `src/*.test.ts` | Unit tests for deterministic core behavior. |
-| `test/index.integration.test.ts` | Runtime plugin integration tests for filesystem persistence. |
 
 ## Entrypoints
 
@@ -41,7 +36,7 @@ src/render.ts
 
 Source: `src/tui.tsx`
 
-This is the package's main entrypoint:
+This is the package's only entrypoint:
 
 ```txt
 opencode-subagent-statusline
@@ -57,27 +52,10 @@ Main responsibilities:
 - render a bottom home summary;
 - register commands and shortcuts;
 - hydrate existing subagents when navigating between sessions;
-- reconcile stale `running` items;
-- persist auxiliary state snapshots.
+- reconcile stale `running` items.
 
-### Runtime plugin
-
-Source: `src/index.ts`
-
-Published as:
-
-```txt
-opencode-subagent-statusline/runtime
-```
-
-This is a lower-level mode. It does not render the TUI sidebar. Instead, it:
-
-1. initializes state paths;
-2. processes events;
-3. saves `state.json`;
-4. writes `status.txt` with text rendering.
-
-It is useful for understanding the project core because it uses the same event, state, and render pipeline without the visual `src/tui.tsx` layer.
+State is held in memory inside the TUI process; nothing is written to disk by
+the plugin itself.
 
 ## Internal model
 
@@ -237,7 +215,7 @@ Current boundary: the full visual UI in `src/tui.tsx` does not have deep E2E cov
 | File | Role |
 | --- | --- |
 | `package.json` | Package name, exports, scripts, peers, and semantic-release config. |
-| `tsup.config.ts` | Dual build: runtime and TUI. |
+| `tsup.config.ts` | TUI plugin bundle (ESM + DTS). |
 | `tsconfig.json` | Base TypeScript config for source. |
 | `tsconfig.test.json` | TypeScript config for tests. |
 | `vitest.config.ts` | Vitest, coverage, and setup. |
