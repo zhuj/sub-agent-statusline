@@ -49,19 +49,17 @@ pnpm pack --dry-run
 
 ## Build outputs
 
-`tsup.config.ts` creates two main outputs:
+`tsup.config.ts` creates one output:
 
 | Source | Output | Use |
 | --- | --- | --- |
 | `src/tui.tsx` | `dist/tui.js` + types | Main TUI plugin. |
-| `src/index.ts` | `dist/index.js` + types | Runtime file-based plugin. |
 
 Package entrypoints:
 
 ```txt
 opencode-subagent-statusline
 opencode-subagent-statusline/tui
-opencode-subagent-statusline/runtime
 ```
 
 ## TypeScript files
@@ -69,15 +67,13 @@ opencode-subagent-statusline/runtime
 | File | Role |
 | --- | --- |
 | `tsconfig.json` | Base source config. NodeNext, ES2022, strict, JSX for `@opentui/solid`. |
-| `tsconfig.test.json` | Test config for Vitest and setup files. |
-| `tsup.config.ts` | Runtime and TUI build config. |
+| `tsup.config.ts` | TUI build config. |
 
 ## Test strategy
 
-The project uses Vitest with two main layers:
+The project uses Vitest with one main layer:
 
 1. **Unit tests** for deterministic logic.
-2. **Runtime integration tests** for filesystem and OpenCode-style event handling.
 
 Deep visual TUI E2E automation is intentionally deferred to avoid brittle host-driven tests.
 
@@ -86,14 +82,12 @@ Deep visual TUI E2E automation is intentionally deferred to avoid brittle host-d
 | File | Validates |
 | --- | --- |
 | `src/events.test.ts` | Event parsing, ID extraction, correlation, malformed payload safety. |
-| `src/state.test.ts` | State, counters, transitions, pruning, persistence, normalization. |
+| `src/state.test.ts` | State, counters, transitions, pruning, and counter normalization. |
 | `src/render.test.ts` | Text rendering, collapse, visibility, duration, tokens, color/no-color. |
 | `src/reconcile.test.ts` | Status normalization, stale-running, backoff, fail-closed behavior. |
 | `src/text-width.test.ts` | Terminal column width for CJK/full-width text, combining marks, and truncation. |
 | `src/tui.test.ts` | Command registration, `Alt+B` keybinding, legacy fallback. |
-| `test/index.integration.test.ts` | Runtime plugin, `state.json`, `status.txt`, preserve-state, filesystem failures. |
-| `test/helpers/runtime-harness.ts` | Helpers for temp dirs, fixtures, env vars, and fake time. |
-| `test/setup.ts` | Global cleanup for timers, mocks, env vars, and temp dirs. |
+| `test/helpers/runtime-harness.ts` | Helpers for static event fixtures and fake time. |
 
 ## Coverage
 
@@ -112,25 +106,26 @@ Important:
 
 > `src/tui.tsx` is excluded from coverage. Do not claim the complete visual TUI is automatically covered.
 
-Coverage focuses on deterministic `.ts` modules: events, state, render, reconcile, text width helpers, commands, and runtime.
+Coverage focuses on deterministic `.ts` modules: events, state, render, reconcile, text width helpers, and commands.
 
 ## Arrange / Act / Assert
 
 Tests should follow this structure:
 
 ```ts
-it("persists a supported event", async () => {
+it("applies a session-created event as a running child", async () => {
   // Arrange
-  const harness = await createRuntimeHarness();
-  const plugin = await SubagentStatusline({} as Parameters<typeof SubagentStatusline>[0]);
+  const state = createEmptyState();
   const event = await readJsonFixture("session-created");
 
   // Act
-  await plugin.event?.({ event } as never);
+  expect(applySubagentEvent(state, event)).toBe(true);
 
   // Assert
-  const state = await readRuntimeState(harness.statePath);
-  expect(state.children.ses_child_1.status).toBe("running");
+  expect(state.children.ses_child_1).toMatchObject({
+    status: "running",
+    source: "session",
+  });
 });
 ```
 
@@ -139,14 +134,14 @@ Prefer semantic assertions over large snapshots.
 Good:
 
 ```ts
-expect(output).toContain("1 running");
-expect(output).toContain("Review auth changes");
+expect(state.totalExecuted).toBe(1);
+expect(state.children.ses_child_1.title).toBe("Review auth changes");
 ```
 
 More brittle:
 
 ```ts
-expect(output).toMatchSnapshot();
+expect(state).toMatchSnapshot();
 ```
 
 ## Adding a unit test
@@ -177,35 +172,6 @@ it("does not count tool wrappers", () => {
 });
 ```
 
-## Adding a runtime integration test
-
-Integration tests live in `test/**/*.integration.test.ts`.
-
-Use the harness to isolate filesystem and env vars:
-
-```ts
-it("writes runtime output after an event", async () => {
-  const harness = await createRuntimeHarness();
-  const plugin = await SubagentStatusline({} as Parameters<typeof SubagentStatusline>[0]);
-  const event = await readJsonFixture("session-created");
-
-  await plugin.event?.({ event } as never);
-
-  expect(await readStatusText(harness.textPath)).toContain("Review auth changes");
-});
-```
-
-Useful helpers:
-
-| Helper | Use |
-| --- | --- |
-| `createRuntimeHarness()` | Creates temp dir and isolated state. |
-| `readJsonFixture(name)` | Reads `test/fixtures/events/<name>.json`. |
-| `readRuntimeState(path)` | Reads `state.json`. |
-| `readStatusText(path)` | Reads `status.txt`. |
-| `pathExists(path)` | Checks existence without throwing. |
-| `useFrozenTime(iso)` | Freezes time with fake timers. |
-
 ## Fixtures
 
 Fixtures live in:
@@ -215,6 +181,13 @@ test/fixtures/events/
 ```
 
 Keep them small and representative. Avoid huge dumps unless payload size is part of the behavior under test.
+
+Useful helpers:
+
+| Helper | Use |
+| --- | --- |
+| `readJsonFixture(name)` | Reads `test/fixtures/events/<name>.json`. |
+| `useFrozenTime(iso)` | Freezes time with fake timers. |
 
 ## Fake timers
 

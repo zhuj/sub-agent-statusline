@@ -321,13 +321,11 @@ pnpm pack --dry-run
 OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS=1 opencode
 ```
 
-The log is written as JSONL under runtime/tmp, for example:
+The log is captured through the OpenCode plugin API when
+`OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS=1` is set. It is observational and
+does not affect the rendered TUI; no file is written by the plugin itself.
 
-```txt
-$XDG_RUNTIME_DIR/opencode-subagent-statusline/tui-events.log
-```
-
-Caution: it can grow quickly and may include session data.
+Caution: the log can grow quickly and may include session data.
 
 ## Quick checklist
 
@@ -355,4 +353,4 @@ Caution: it can grow quickly and may include session data.
 | `src/reconcile.ts` | If an old `running` row does not close. |
 | `src/tui.tsx` | UI, hydration, or navigation problems. |
 | `src/tui-commands.ts` | Command or `Alt+B` problems. |
-| `test/helpers/runtime-harness.ts` | Filesystem/env test failures. |
+| `test/helpers/runtime-harness.ts` | Static fixtures or fake-time test failures. |
