@@ -6,7 +6,7 @@ export default defineConfig({
     forbidOnly: true,
     globals: true,
     setupFiles: ["./test/setup.ts"],
-    include: ["src/**/*.test.ts", "test/**/*.integration.test.ts"],
+    include: ["src/**/*.test.ts"],
     coverage: {
       provider: "v8",
       reporter: ["text", "lcov"],

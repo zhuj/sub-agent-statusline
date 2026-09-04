@@ -1,14 +1,13 @@
 project:
   name: sub-agent-statusline
   package: opencode-subagent-statusline
-  description: OpenCode TUI/statusline plugin that monitors delegated subagent sessions, statuses, elapsed time, counters, and token/context usage when available.
+  description: OpenCode TUI plugin that monitors delegated subagent sessions, statuses, elapsed time, counters, and token/context usage when available. In-memory only.
   language: TypeScript
   module_system: ESM
   runtime: Node.js
   package_manager: pnpm
   entrypoints:
     plugin_tui: src/tui.tsx
-    runtime: src/index.ts
   core_modules:
     events: src/events.ts
     state: src/state.ts
@@ -27,10 +26,8 @@ testing:
     - test/setup.ts
   include:
     - src/**/*.test.ts
-    - test/**/*.integration.test.ts
   layers:
     unit: src/**/*.test.ts
-    integration: test/**/*.integration.test.ts
     e2e: unavailable
   quality:
     linter: unavailable
@@ -39,7 +36,6 @@ testing:
     - docs/testing.md
   guidance:
     - Prefer focused unit tests for event parsing, state transitions, counters, and rendering.
-    - Use runtime integration tests for filesystem persistence and OpenCode-style event handling.
     - Avoid deep TUI/e2e automation unless the TUI seam explicitly requires it.
 
 sdd:
@@ -79,10 +75,3 @@ sdd:
       rules:
         - Run pnpm test and pnpm typecheck unless scoped verification is explicitly accepted.
         - Confirm no pre-existing dirty files were unintentionally modified.
-
-change_context:
-  requested_change: Separate subagent tool calls from real subagent runs so zero-second call artifacts are not counted as executed subagents.
-  known_preexisting_dirty_files:
-    - .gitignore
-    - context.md
-  skill_registry: .atl/skill-registry.md

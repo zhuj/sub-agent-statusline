@@ -4,22 +4,6 @@ import { defineConfig } from "tsup";
 export default defineConfig([
   {
     entry: {
-      index: "src/index.ts",
-    },
-    format: ["esm"],
-    target: "node22",
-    dts: {
-      entry: {
-        index: "src/index.ts",
-      },
-    },
-    bundle: true,
-    splitting: false,
-    clean: true,
-    outDir: "dist",
-  },
-  {
-    entry: {
       tui: "src/tui.tsx",
     },
     format: ["esm"],
@@ -31,7 +15,7 @@ export default defineConfig([
     },
     bundle: true,
     splitting: false,
-    clean: false,
+    clean: true,
     outDir: "dist",
     external: [
       "@opencode-ai/plugin",
