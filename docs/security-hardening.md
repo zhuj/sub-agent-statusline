@@ -312,126 +312,68 @@ Parte de la seguridad de npm no vive en el código: vive en cuentas, permisos y 
 
 ---
 
-## 12. Escritura atómica de `state.json` y `status.txt`
+## 12. Sin persistencia local: el plugin es solo en memoria
 
 **Qué se hizo**
 
-`saveState` y `saveStatusText` ahora escriben así:
-
-1. crear directorio si hace falta;
-2. escribir un archivo temporal en el mismo directorio;
-3. hacer `rename` al archivo final;
-4. limpiar el temporal si falla.
+El plugin ya no escribe `state.json`, `status.txt`, ni ningún otro archivo
+fuera del contexto del plugin de OpenCode. El estado vive en memoria dentro
+del proceso de la TUI y se descarta al cerrar OpenCode.
 
 **Por qué**
 
-Antes se sobrescribía directamente el archivo final. Si el proceso se interrumpía durante la escritura, podía quedar un JSON corrupto o un status parcial.
+Antes, `saveState` y `saveStatusText` escribían a `XDG_RUNTIME_DIR` o
+`os.tmpdir()` con permisos `0o600` y reemplazo atómico vía temp-file +
+`rename`. Aunque esas garantías son buenas, mantener un archivo de estado
+descartable con títulos y resúmenes derivados de prompts amplía la
+superficie de privacidad innecesariamente.
 
 **Qué protege**
 
-- Reduce riesgo de archivos parcialmente escritos.
-- Hace la actualización casi atómica dentro del mismo filesystem.
-- Mejora resiliencia ante interrupciones o errores de I/O.
+- Reduce el riesgo de filtración de títulos/resúmenes a través de archivos
+  en disco.
+- Elimina la superficie de configuración de paths
+  (`OPENCODE_SUBAGENT_STATUSLINE_STATE`, `OPENCODE_SUBAGENT_STATUSLINE_INSTANCE`,
+  `OPENCODE_SUBAGENT_STATUSLINE_PRESERVE_STATE`) que podía ser manipulada por
+  un atacante local.
+- Quita la dependencia de `node:fs`, `node:os` y de un binario `sqlite3`
+  externo en el flujo del plugin.
 
 ---
 
-## 13. Permisos owner-only para estado local
+## 13. (Eliminado) Permisos owner-only para estado local
 
-**Qué se hizo**
+Las secciones 13–16 (atomic write de archivos, `randomUUID` para nombres
+temporales, `saveStatusText` helper y `readOpenCodeLogFileIfSmall`) ya no
+aplican: el plugin no escribe `state.json` ni `status.txt`, no crea
+directorios bajo `XDG_RUNTIME_DIR`, no hace `rename` atómico ni lee logs
+de OpenCode. Eliminar estas superficies reduce la complejidad del código
+y elimina una clase entera de riesgos vinculados a la persistencia
+discardable.
 
-Los directorios se crean con modo aproximado:
-
-```text
-0700
-```
-
-Los archivos de estado/status con:
-
-```text
-0600
-```
-
-**Por qué**
-
-El estado local puede incluir títulos o resúmenes derivados de prompts/tareas. Eso puede ser sensible.
-
-**Qué protege**
-
-- Evita que otros usuarios locales lean el estado, si el sistema respeta permisos POSIX.
-- Reduce exposición accidental de fragmentos de prompts.
-- Alinea persistencia local con una postura privacy-first.
-
-**Nota**
-
-Los permisos son best-effort: dependen del sistema operativo, filesystem y umask.
+Si en el futuro se reintroduce persistencia local, retomar las prácticas
+documentadas en los apartados históricos de este documento como guía.
 
 ---
 
-## 14. Nombre temporal con `randomUUID()`
+## 14. (Eliminado) Atomic write, randomUUID y `saveStatusText` helper
 
-**Qué se hizo**
-
-El archivo temporal incluye:
-
-- basename del archivo final;
-- PID;
-- timestamp;
-- `randomUUID()`.
-
-**Por qué**
-
-PID + timestamp puede colisionar en escrituras concurrentes muy rápidas. `randomUUID()` vuelve esa colisión prácticamente irrelevante.
-
-**Qué protege**
-
-- Evita que dos escrituras simultáneas pisen el mismo temp file.
-- Hace más segura la escritura atómica bajo concurrencia local.
+Ver sección 13. Las técnicas aplicadas a `state.json`/`status.txt` ya no son
+necesarias porque el plugin no escribe archivos.
 
 ---
 
-## 15. `saveStatusText` compartido
+## 15. (Eliminado) `saveStatusText` helper
 
-**Qué se hizo**
-
-Se reemplazaron escrituras directas de `status.txt` por un helper común:
-
-```ts
-saveStatusText(...)
-```
-
-**Por qué**
-
-Si `state.json` se escribía de forma segura pero `status.txt` seguía con `writeFile` directo, quedaba una brecha inconsistente.
-
-**Qué protege**
-
-- Aplica permisos y atomicidad también al snapshot de texto.
-- Evita duplicar lógica de filesystem.
-- Mantiene runtime y TUI con la misma política de escritura.
+Ver sección 13.
 
 ---
 
-## 16. Límite de lectura para logs de OpenCode
+## 16. (Eliminado) `readOpenCodeLogFileIfSmall` para backfill de tokens
 
-**Qué se hizo**
-
-Se agregó `src/logs.ts` con un helper que revisa tamaño antes de leer:
-
-```ts
-readOpenCodeLogFileIfSmall(...)
-```
-
-Si el log supera 1 MiB, se saltea.
-
-**Por qué**
-
-La TUI leía logs locales de forma síncrona para reconstruir tokens/contexto. Un log enorme podía bloquear la UI o consumir memoria innecesaria.
-
-**Qué protege**
-
-- Evita bloqueos por archivos muy grandes.
-- Reduce riesgo de degradación por logs locales anómalos.
-- Mantiene el backfill como best-effort: si el log es grande, se omite.
+Ver sección 13. La TUI ya no lee logs ni la base SQLite de OpenCode para
+rehidratar tokens; depende solo de los datos entregados por la API de
+eventos.
 
 ---
 
@@ -439,29 +381,27 @@ La TUI leía logs locales de forma síncrona para reconstruir tokens/contexto. U
 
 **Qué se documentó**
 
-En README se explicó que el plugin persiste:
+El README y la sección de troubleshooting indican ahora que el plugin es solo
+en memoria: no persiste `state.json`, `status.txt`, ni ningún otro archivo
+fuera del contexto del plugin de OpenCode. Los datos visibles en la sidebar
+derivan exclusivamente de los eventos entregados por la API de OpenCode y
+viven en memoria dentro del proceso de la TUI.
 
-- `state.json`;
-- `status.txt`;
-- títulos/resúmenes derivados de eventos, prompts o tareas.
-
-También se explicó que:
-
-```text
-OPENCODE_SUBAGENT_STATUSLINE_STATE
-```
-
-es una variable confiable porque permite elegir dónde escribir estado.
+Las variables de entorno asociadas a persistencia
+(`OPENCODE_SUBAGENT_STATUSLINE_STATE`, `OPENCODE_SUBAGENT_STATUSLINE_INSTANCE`,
+`OPENCODE_SUBAGENT_STATUSLINE_PRESERVE_STATE`) ya no existen en la API
+pública del plugin.
 
 **Por qué**
 
-La seguridad no es solo bloquear ataques: también es hacer visibles los límites de privacidad.
+La seguridad no es solo bloquear ataques: también es hacer visibles los
+límites de privacidad.
 
 **Qué protege**
 
 - Evita sorpresas sobre datos persistidos localmente.
-- Ayuda a usuarios a elegir rutas seguras.
-- Deja claro que la variable de entorno no debe venir de fuentes no confiables.
+- Deja claro que el plugin no requiere configuración de paths ni de
+  variables de entorno sensibles.
 
 ---
 
