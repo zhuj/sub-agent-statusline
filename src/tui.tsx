@@ -13,11 +13,6 @@ import type {
   ScrollBoxRenderable,
 } from "@opentui/core";
 import { useKeyboard } from "@opentui/solid";
-import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
-import { createRequire } from "node:module";
-import os from "node:os";
-import { dirname, join } from "node:path";
 import {
   For,
   Show,
@@ -34,11 +29,9 @@ import {
   extractLatestAssistantModel,
   extractTaskToolEvidence,
 } from "./events.js";
-import { readOpenCodeLogFileIfSmall } from "./logs.js";
 import {
   byPriority,
   formatDuration,
-  renderStatusLine,
   visibleSubagentWorkItems,
 } from "./render.js";
 import {
@@ -72,10 +65,6 @@ import {
   countRetainedSubagentStatuses,
   markChildStatus,
   refreshDerivedFields,
-  resolveStatePath,
-  resolveTextPath,
-  saveState,
-  saveStatusText,
   setChildModel,
   upsertChildDetails,
   type ChildTokenState,
@@ -90,27 +79,26 @@ import { t } from "./i18n.js";
 const TUI_PLUGIN_ID = "subagent-statusline.tui";
 const ELAPSED_TICK_MS = 1000;
 const FALLBACK_SIDEBAR_WIDTH = 34;
-const MIN_ROW_WIDTH = 24;
 const MIN_LABEL_WIDTH = 8;
-const DONE_TOKEN_REHYDRATE_THROTTLE_MS = 2000;
-const DONE_TOKEN_REHYDRATE_MAX_ATTEMPTS = 15;
-const MAINTENANCE_TICK_MS = DONE_TOKEN_REHYDRATE_THROTTLE_MS;
+const MAINTENANCE_TICK_MS = 2500;
 const HYDRATE_RETRY_BASE_DELAY_MS = 1000;
 const HYDRATE_RETRY_MAX_DELAY_MS = 30_000;
 const HYDRATE_RETRY_MAX_ATTEMPTS = 6;
+const HYDRATE_MAX_DESCENDANT_DEPTH = 32;
+const HYDRATE_MAX_DESCENDANT_SESSIONS = 1_500;
 const RUNNING_RECONCILE_MAINTENANCE_INTERVAL_MS = 10 * 60_000;
 const RUNNING_RECONCILE_MAX_CANDIDATES = 8;
 const RUNNING_RECONCILE_INITIAL_BACKOFF_MS = 15_000;
 const RUNNING_RECONCILE_MAX_BACKOFF_MS = 5 * 60_000;
 const RUNNING_RECONCILE_MESSAGE_AGE_GATE_MS = 60_000;
 const RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS = 5 * 60_000;
-const CLOCK_ICON = "";
-const TOKEN_ICON = "";
+const CLOCK_ICON = "⏱";
+const TOKEN_ICON = "⍄";
 const SIDEBAR_ARROW_EXPANDED = "▼";
 const SIDEBAR_ARROW_COLLAPSED = "▶";
 const SUBAGENTS_EXPANDED_KV_KEY = "subagents.sidebar.expanded";
 const SUBAGENTS_SECTION_ENABLED_KV_KEY = "subagents.sidebar.enabled";
-const SUBAGENTS_MAX_VISIBLE_ROWS = 5;
+const SUBAGENTS_MAX_VISIBLE_ROWS = 8;
 const SUBAGENTS_RUNNING_ROW_HEIGHT = 3;
 const SUBAGENTS_TERMINAL_ROW_HEIGHT = 2;
 const SUBAGENTS_MODEL_ROW_HEIGHT = 1;
@@ -121,23 +109,7 @@ const SUBAGENTS_MAX_LIST_HEIGHT =
     (SUBAGENTS_RUNNING_ROW_HEIGHT + SUBAGENTS_MODEL_ROW_HEIGHT) +
   (SUBAGENTS_MAX_VISIBLE_ROWS - 1) * SUBAGENTS_ROW_GAP;
 const INACTIVE_SUBAGENT_OPACITY = 0.65;
-const SIDEBAR_VERSION_OPACITY = 0.7;
 const SIDEBAR_FOCUS_INDICATOR = "●";
-
-const packageRequire = createRequire(import.meta.url);
-
-function readPluginVersion(): string | undefined {
-  try {
-    const metadata = packageRequire("../package.json") as { version?: unknown };
-    return typeof metadata.version === "string" && metadata.version.length > 0
-      ? metadata.version
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-const PLUGIN_VERSION = readPluginVersion();
 
 interface SidebarScrollRegistration {
   getScrollbox: () => ScrollBoxRenderable | undefined;
@@ -348,42 +320,6 @@ interface RunningReconcileCandidate {
   updatedMs: number;
 }
 
-const doneTokenCache = new Map<string, RehydratedTokenCacheEntry>();
-
-function debugLog(input: Record<string, unknown>): void {
-  if (!process.env.OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS) return;
-  try {
-    const path = join(
-      process.env.XDG_RUNTIME_DIR ?? os.tmpdir(),
-      "opencode-subagent-statusline",
-      "tui-events.log",
-    );
-    mkdirSync(dirname(path), { recursive: true });
-    const line = JSON.stringify({ time: new Date().toISOString(), ...input });
-    appendFileSync(path, `${line}\n`, "utf8");
-  } catch {
-    // Debug logging must never crash the TUI.
-  }
-}
-
-function debugEvent(event: unknown): void {
-  const e = event as {
-    type?: unknown;
-    properties?: { sessionID?: unknown; part?: unknown; info?: unknown };
-  };
-  const part = e.properties?.part as
-    | { type?: unknown; tool?: unknown; state?: { status?: unknown } }
-    | undefined;
-  debugLog({
-    kind: "event",
-    type: e.type,
-    sessionID: e.properties?.sessionID,
-    partType: part?.type,
-    tool: part?.tool,
-    toolStatus: part?.state?.status,
-  });
-}
-
 function cloneState(state: StatuslineState): StatuslineState {
   return {
     updatedAt: state.updatedAt,
@@ -430,134 +366,6 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object"
     ? (value as Record<string, unknown>)
     : undefined;
-}
-
-function tokenStateFromMessageData(data: string): ChildTokenState | undefined {
-  const parsed = safeRead(
-    () => JSON.parse(data) as { tokens?: ChildTokenState },
-  );
-  return parsed?.tokens;
-}
-
-function resolveOpenCodeDataDir(): string {
-  return join(
-    process.env.XDG_DATA_HOME ?? join(os.homedir(), ".local", "share"),
-    "opencode",
-  );
-}
-
-function resolveOpenCodeDbPath(): string {
-  return (
-    process.env.OPENCODE_SUBAGENT_STATUSLINE_OPENCODE_DB ??
-    join(resolveOpenCodeDataDir(), "opencode.db")
-  );
-}
-
-function escapeSqlString(value: string): string {
-  return value.replace(/'/g, "''");
-}
-
-function readDoneTokensFromOpenCodeDb(
-  sessionID: string,
-): ChildTokenState | undefined {
-  const dbPath = resolveOpenCodeDbPath();
-  if (!existsSync(dbPath)) return undefined;
-
-  // Keep JSON parsing in TypeScript instead of relying on sqlite JSON functions.
-  // Some sqlite3 builds, especially on WSL/Linux distributions, are compiled
-  // without JSON support and fail with `no such function json_extract`.
-  const output = safeRead(() =>
-    execFileSync(
-      "sqlite3",
-      [
-        dbPath,
-        `select data from message where session_id='${escapeSqlString(sessionID)}' order by time_created desc limit 50;`,
-      ],
-      { encoding: "utf8", timeout: 1000, maxBuffer: 1024 * 1024 },
-    ),
-  );
-  if (!output) return undefined;
-
-  let tokens: ChildTokenState | undefined;
-  for (const line of output.split("\n")) {
-    const hydrated = tokenStateFromMessageData(line.trim());
-    tokens = mergeTokenState(tokens, hydrated);
-    if (hasTokenTotal(tokens)) break;
-  }
-  return tokens;
-}
-
-function readDoneTokensFromOpenCodeLogs(
-  sessionID: string,
-): ChildTokenState | undefined {
-  const logDir = join(resolveOpenCodeDataDir(), "log");
-  if (!existsSync(logDir)) return undefined;
-
-  const files = safeRead(() =>
-    readdirSync(logDir)
-      .filter((file) => file.endsWith(".log"))
-      .sort()
-      .reverse()
-      .slice(0, 8),
-  );
-  if (!files) return undefined;
-
-  const tokenPattern = /"tokens"\s*:\s*(\{[^\n]*?\})/g;
-  let tokens: ChildTokenState | undefined;
-  for (const file of files) {
-    const contents = readOpenCodeLogFileIfSmall(join(logDir, file));
-    if (!contents || !contents.includes(sessionID)) continue;
-
-    for (const line of contents.split("\n")) {
-      if (!line.includes(sessionID) || !line.includes('"tokens"')) continue;
-      for (const match of line.matchAll(tokenPattern)) {
-        const hydrated = safeRead(
-          () => JSON.parse(match[1] ?? "{}") as ChildTokenState,
-        );
-        tokens = mergeTokenState(tokens, hydrated);
-        if (hasTokenTotal(tokens)) return tokens;
-      }
-    }
-  }
-  return tokens;
-}
-
-function rehydrateDoneChildTokens(
-  child: ChildSessionState,
-): ChildTokenState | undefined {
-  if (child.status !== "done") return undefined;
-  if (hasTokenTotal(child.tokens)) return undefined;
-  if (!child.id.startsWith("ses_")) return undefined;
-
-  const nowMs = Date.now();
-  const cached = doneTokenCache.get(child.id);
-  if (cached?.tokens) return cached.tokens;
-  if (cached && cached.attempts >= DONE_TOKEN_REHYDRATE_MAX_ATTEMPTS) {
-    return undefined;
-  }
-  if (cached && nowMs - cached.checkedAtMs < DONE_TOKEN_REHYDRATE_THROTTLE_MS) {
-    return undefined;
-  }
-
-  const tokens =
-    readDoneTokensFromOpenCodeDb(child.id) ??
-    readDoneTokensFromOpenCodeLogs(child.id);
-  doneTokenCache.set(child.id, {
-    attempts: (cached?.attempts ?? 0) + 1,
-    checkedAtMs: nowMs,
-    tokens,
-  });
-
-  if (tokens) {
-    debugLog({
-      kind: "state.tokens.rehydrated.done",
-      id: child.id,
-      title: child.title,
-      tokens,
-    });
-  }
-
-  return tokens;
 }
 
 function safeRead<Value>(read: () => Value): Value | undefined {
@@ -630,8 +438,6 @@ function hydrateChildTokensFromTuiState(
     );
   }
 
-  tokens = mergeTokenState(tokens, rehydrateDoneChildTokens(child));
-
   return tokens;
 }
 
@@ -652,35 +458,7 @@ function hydrateStateTokensFromTuiState(
     }
   }
 
-  if (changed) {
-    state.updatedAt = new Date().toISOString();
-    debugLog({
-      kind: "state.tokens.hydrated",
-      children: Object.values(state.children).map((child) => ({
-        id: child.id,
-        title: child.title,
-        tokens: child.tokens,
-      })),
-    });
-  }
-
   return changed;
-}
-
-function persistStateSnapshot(
-  statePath: string,
-  textPath: string,
-  state: StatuslineState,
-): void {
-  const snapshot = cloneState(state);
-  void (async () => {
-    try {
-      await saveState(statePath, snapshot);
-      await saveStatusText(textPath, renderStatusLine(snapshot));
-    } catch {
-      // Persistence is best-effort; TUI rendering must not fail because of files.
-    }
-  })();
 }
 
 function refreshLiveState(state: StatuslineState): boolean {
@@ -799,6 +577,29 @@ function resolveSyntheticTargetFromHydratedState(
   if (parentMatches.length === 1) return parentMatches[0].id;
 
   return undefined;
+}
+
+function resolveSubagentDepth(
+  state: StatuslineState,
+  child: ChildSessionState,
+  ancestorSessionID: string,
+): number {
+  let depth = 0;
+  let parentID = child.parentID;
+  const visited = new Set<string>();
+
+  while (parentID !== ancestorSessionID) {
+    if (depth >= HYDRATE_MAX_DESCENDANT_DEPTH || visited.has(parentID)) {
+      return depth;
+    }
+    visited.add(parentID);
+    const parent = state.children[parentID];
+    if (!parent) return depth;
+    depth += 1;
+    parentID = parent.parentID;
+  }
+
+  return depth;
 }
 
 export function backfillHydratedTargetSessionIDs(
@@ -969,10 +770,21 @@ function contextVariants(child: ChildSessionState): string[] {
   return [tokenPart || percentPart, ""];
 }
 
-function rowWidthBudget(sidebarWidth: number | undefined): number {
-  const width = sidebarWidth ?? FALLBACK_SIDEBAR_WIDTH;
-  const innerWidth = width - 4;
-  return Math.max(MIN_ROW_WIDTH, Math.min(innerWidth, 52));
+interface RowWidthBudgetInput {
+  readonly sidebarWidth?: number;
+  readonly indentationWidth?: number;
+  readonly reservedWidth?: number;
+}
+
+export function rowWidthBudget(input: RowWidthBudgetInput): number {
+  const width = input.sidebarWidth ?? FALLBACK_SIDEBAR_WIDTH;
+  const baseWidth = Math.min(width - 4, 52);
+  return Math.max(
+    1,
+    baseWidth -
+      (input.indentationWidth ?? 0) -
+      (input.reservedWidth ?? 0),
+  );
 }
 
 export function wrapCompactText(
@@ -1011,11 +823,12 @@ export function wrapCompactText(
   return lines;
 }
 
-function formatChildRowLine(input: {
+export function formatChildRowLine(input: {
   child: ChildSessionState;
   nowMs: number;
   sidebarWidth?: number;
   reservedWidth?: number;
+  indentationWidth?: number;
 }): {
   labelLines: string[];
   secondaryLine?: string;
@@ -1023,10 +836,7 @@ function formatChildRowLine(input: {
   meta: string;
 } {
   const elapsed = formatDuration(elapsedMs(input.child, input.nowMs));
-  const width = Math.max(
-    MIN_ROW_WIDTH,
-    rowWidthBudget(input.sidebarWidth) - (input.reservedWidth ?? 0),
-  );
+  const width = rowWidthBudget(input);
   const title = splitParentheticalTitle(childPrimaryText(input.child));
   const parenthetical = childParenthetical(input.child);
 
@@ -1069,17 +879,18 @@ function formatChildRowLine(input: {
   };
 }
 
-function formatTerminalChildRowLine(input: {
+export function formatTerminalChildRowLine(input: {
   child: ChildSessionState;
   nowMs: number;
   sidebarWidth?: number;
   reservedWidth?: number;
+  indentationWidth?: number;
 }): {
   label: string;
   meta: string;
 } {
   const elapsed = formatDuration(elapsedMs(input.child, input.nowMs));
-  const width = Math.max(MIN_ROW_WIDTH, rowWidthBudget(input.sidebarWidth));
+  const width = rowWidthBudget(input);
   const title = splitParentheticalTitle(childPrimaryText(input.child));
   const parenthetical = childParenthetical(input.child);
   const labelSource = parenthetical
@@ -1090,10 +901,7 @@ function formatTerminalChildRowLine(input: {
   );
 
   return {
-    label: ellipsize(
-      labelSource,
-      Math.max(1, width - (input.reservedWidth ?? 0)),
-    ),
+    label: ellipsize(labelSource, width),
     meta: context ? `${elapsed} ${context}` : elapsed,
   };
 }
@@ -1103,6 +911,7 @@ export function subagentRowHeight(input: {
   nowMs: number;
   sidebarWidth?: number;
   reservedWidth?: number;
+  indentationWidth?: number;
 }): number {
   const modelHeight = input.child.model?.variant
     ? SUBAGENTS_MODEL_ROW_HEIGHT
@@ -1139,6 +948,39 @@ export interface TuiSubagentSnapshot {
   showingOtherSessions: boolean;
 }
 
+function descendantChildren(
+  children: ChildSessionState[],
+  parentSessionID: string,
+): ChildSessionState[] {
+  const childrenByParent = new Map<string, ChildSessionState[]>();
+  for (const child of children) {
+    const siblings = childrenByParent.get(child.parentID) ?? [];
+    siblings.push(child);
+    childrenByParent.set(child.parentID, siblings);
+  }
+
+  const ordered: ChildSessionState[] = [];
+  const visited = new Set<string>();
+  const pending = [
+    ...(childrenByParent.get(parentSessionID) ?? [])
+      .sort(byPriority)
+      .reverse(),
+  ];
+
+  while (pending.length > 0 && ordered.length < HYDRATE_MAX_DESCENDANT_SESSIONS) {
+    const child = pending.pop();
+    if (!child || visited.has(child.id)) continue;
+    visited.add(child.id);
+    ordered.push(child);
+
+    const descendants = childrenByParent.get(child.id);
+    if (!descendants) continue;
+    pending.push(...[...descendants].sort(byPriority).reverse());
+  }
+
+  return ordered;
+}
+
 export function resolveTuiSubagentSnapshot(input: {
   state: StatuslineState;
   sessionID?: string;
@@ -1148,27 +990,29 @@ export function resolveTuiSubagentSnapshot(input: {
   const allChildren = Object.values(input.state.children);
   const options = { showCompletedHistory: input.showCompletedHistory };
   const nowMs = input.nowMs ?? Date.now();
-  const ownChildren = input.sessionID
-    ? allChildren.filter((child) => child.parentID === input.sessionID)
+  const scopedChildren = input.sessionID
+    ? descendantChildren(allChildren, input.sessionID)
     : allChildren;
-  const ownVisibleChildren = visibleSubagentWorkItems(
-    ownChildren,
+  const visibleChildren = visibleSubagentWorkItems(
+    scopedChildren,
     nowMs,
     options,
-  ).sort(byPriority);
+  );
+  const visibleChildIDs = new Set(visibleChildren.map((child) => child.id));
+  const ownVisibleChildren = input.sessionID
+    ? scopedChildren.filter((child) => visibleChildIDs.has(child.id))
+    : visibleChildren.sort(byPriority);
   const totalExecuted = input.sessionID
     ? countCountedSubagentExecutions({
-        children: allChildren,
+        children: scopedChildren,
         countedChildIDs: input.state.countedChildIDs,
-        parentSessionID: input.sessionID,
       })
     : countHistoricalSubagentExecutions({ children: allChildren });
 
   return {
     visibleChildren: ownVisibleChildren,
     visibleCounts: countRetainedSubagentStatuses({
-      children: allChildren,
-      parentSessionID: input.sessionID,
+      children: scopedChildren,
     }),
     totalExecuted,
     showingOtherSessions: false,
@@ -1591,6 +1435,13 @@ function SidebarSubagents(props: {
         ? resolveNavigableChildTargetSessionID(currentChild)
         : undefined;
     });
+    const childDepth = createMemo(() => {
+      const currentChild = child();
+      return currentChild
+        ? resolveSubagentDepth(props.state(), currentChild, props.sessionID)
+        : 0;
+    });
+    const indentationWidth = createMemo(() => childDepth() * 2);
     const clickable = createMemo(() => isSessionTarget(targetSessionID()));
     const selected = createMemo(
       () => listFocused() && selectedChildID() === rowProps.childID,
@@ -1617,6 +1468,7 @@ function SidebarSubagents(props: {
         nowMs: props.nowMs(),
         sidebarWidth: props.sidebarWidth?.(),
         reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
+        indentationWidth: indentationWidth(),
       });
     });
     const terminalLine = createMemo(() => {
@@ -1627,6 +1479,7 @@ function SidebarSubagents(props: {
         nowMs: props.nowMs(),
         sidebarWidth: props.sidebarWidth?.(),
         reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
+        indentationWidth: indentationWidth(),
       });
     });
     const rowHeight = createMemo(() => {
@@ -1637,6 +1490,7 @@ function SidebarSubagents(props: {
         nowMs: props.nowMs(),
         sidebarWidth: props.sidebarWidth?.(),
         reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
+        indentationWidth: indentationWidth(),
       });
     });
     const modelLine = createMemo(() => {
@@ -1645,14 +1499,19 @@ function SidebarSubagents(props: {
       return formatChildModelLine(
         currentChild,
         props.api.state.provider,
-        rowWidthBudget(props.sidebarWidth?.()) - SUBAGENTS_ROW_MARKER_WIDTH,
+        rowWidthBudget({
+          sidebarWidth: props.sidebarWidth?.(),
+          reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
+          indentationWidth: indentationWidth(),
+        }),
       );
     });
     const activate = () => {
+      const currentChild = child();
       const target = targetSessionID();
-      if (target) {
+      if (currentChild && target) {
         props.onNavigateToChild({
-          parentSessionID: props.sessionID,
+          parentSessionID: currentChild.parentID,
           childSessionID: target,
           childRowID: rowProps.childID,
           showCompletedHistory: showCompletedHistory(),
@@ -1679,6 +1538,7 @@ function SidebarSubagents(props: {
       <box
         flexDirection="column"
         height={rowHeight()}
+        paddingLeft={indentationWidth()}
         opacity={rowOpacity()}
         backgroundColor={selected() ? props.theme.backgroundElement : undefined}
         onMouseOver={clickable() ? () => setHovered(true) : undefined}
@@ -1835,24 +1695,12 @@ function SidebarSubagents(props: {
           selectable={false}
           onMouseDown={props.onToggleExpanded}
         >{`${props.expanded() ? SIDEBAR_ARROW_EXPANDED : SIDEBAR_ARROW_COLLAPSED} ${t("subagents")}`}</text>
-        <Show when={PLUGIN_VERSION}>
-          {(version: Accessor<string>) => (
-            <box flexDirection="row">
-              <text
-                fg={props.theme.textMuted}
-                opacity={SIDEBAR_VERSION_OPACITY}
-                selectable={false}
-                onMouseDown={props.onToggleExpanded}
-              >{` ${version()}`}</text>
-              <Show when={listFocused()}>
-                <text
-                  fg={props.theme.accent}
-                  selectable={false}
-                  onMouseDown={props.onToggleExpanded}
-                >{` ${SIDEBAR_FOCUS_INDICATOR}`}</text>
-              </Show>
-            </box>
-          )}
+        <Show when={listFocused()}>
+          <text
+            fg={props.theme.accent}
+            selectable={false}
+            onMouseDown={props.onToggleExpanded}
+          >{` ${SIDEBAR_FOCUS_INDICATOR}`}</text>
         </Show>
       </box>
       <AggregateBar />
@@ -1908,11 +1756,81 @@ function HomeBottomStatus(props: {
   );
 }
 
+interface HydratedSession {
+  info: Record<string, unknown>;
+  id: string;
+  parentID: string;
+}
+
+interface HydratedSessionTree {
+  sessions: HydratedSession[];
+  topLevelFailed: boolean;
+  descendantFailed: boolean;
+}
+
+async function collectHydratedSessionTree(
+  api: TuiPluginApi,
+  currentSessionID: string,
+  directory: string,
+): Promise<HydratedSessionTree> {
+  const sessionClient = api.client.session;
+  const pending: Array<{ sessionID: string; depth: number }> = [
+    { sessionID: currentSessionID, depth: 0 },
+  ];
+  const seenSessionIDs = new Set<string>([currentSessionID]);
+  const sessions: HydratedSession[] = [];
+  let topLevelFailed = false;
+  let descendantFailed = false;
+
+  for (
+    let index = 0;
+    index < pending.length && sessions.length < HYDRATE_MAX_DESCENDANT_SESSIONS;
+    index += 1
+  ) {
+    const request = pending[index];
+    if (!request) continue;
+
+    const response = await safeReadAsync(
+      () =>
+        sessionClient?.children?.({
+          sessionID: request.sessionID,
+          directory,
+        }) ?? Promise.resolve({ data: [] }),
+    );
+    if (!response) {
+      if (request.depth === 0) topLevelFailed = true;
+      else descendantFailed = true;
+      continue;
+    }
+
+    const rawChildren = Array.isArray(response.data) ? response.data : [];
+    if (request.depth >= HYDRATE_MAX_DESCENDANT_DEPTH) continue;
+
+    for (const rawChild of rawChildren) {
+      if (sessions.length >= HYDRATE_MAX_DESCENDANT_SESSIONS) break;
+      const info = asRecord(rawChild);
+      const id = info && isSessionTarget(info.id) ? info.id : undefined;
+      const parentID =
+        info && typeof info.parentID === "string" && info.parentID.length > 0
+          ? info.parentID
+          : undefined;
+      if (!info || !id || !parentID || seenSessionIDs.has(id)) continue;
+
+      seenSessionIDs.add(id);
+      sessions.push({ info, id, parentID });
+      pending.push({
+        sessionID: id,
+        depth: request.depth + 1,
+      });
+    }
+  }
+
+  return { sessions, topLevelFailed, descendantFailed };
+}
+
 export async function hydratePreviousSubagents(
   api: TuiPluginApi,
   currentSessionID: string,
-  statePath: string,
-  textPath: string,
   setState: (fn: (prev: StatuslineState) => StatuslineState) => void,
 ): Promise<boolean> {
   if (!currentSessionID) return false;
@@ -1920,79 +1838,37 @@ export async function hydratePreviousSubagents(
   try {
     const directory = api.state.path.directory;
     const sessionClient = api.client.session;
-    let topLevelHydrationFailed = false;
-    let statusHydrationFailed = false;
-    let parentMessageHydrationFailed = false;
-
-    const [childrenResp, messagesResp, statusResp] = await Promise.all([
-      (async () => {
-        const response = await safeReadAsync(
-          () =>
-            sessionClient?.children?.({
-              sessionID: currentSessionID,
-              directory,
-            }) ?? Promise.resolve({ data: [] }),
-        );
-        if (!response) topLevelHydrationFailed = true;
-        return response;
-      })(),
-      (async () => {
-        const response = await safeReadAsync(
-          () =>
-            sessionClient?.messages?.({
-              sessionID: currentSessionID,
-              directory,
-            }) ?? Promise.resolve({ data: [] }),
-        );
-        if (!response) {
-          topLevelHydrationFailed = true;
-          parentMessageHydrationFailed = true;
-        }
-        return response;
-      })(),
-      (async () => {
-        const response = await safeReadAsync(
-          () =>
-            sessionClient?.status?.({ directory }) ??
-            Promise.resolve({ data: {} }),
-        );
-        if (!response) {
-          topLevelHydrationFailed = true;
-          statusHydrationFailed = true;
-        }
-        return response;
-      })(),
+    const [sessionTree, messagesResp, statusResp] = await Promise.all([
+      collectHydratedSessionTree(api, currentSessionID, directory),
+      safeReadAsync(
+        () =>
+          sessionClient?.messages?.({
+            sessionID: currentSessionID,
+            directory,
+          }) ?? Promise.resolve({ data: [] }),
+      ),
+      safeReadAsync(
+        () =>
+          sessionClient?.status?.({ directory }) ??
+          Promise.resolve({ data: {} }),
+      ),
     ]);
 
-    const children = Array.isArray(childrenResp?.data) ? childrenResp.data : [];
+    const topLevelHydrationFailed =
+      sessionTree.topLevelFailed || !messagesResp || !statusResp;
+    const statusHydrationFailed = !statusResp;
+    const parentMessageHydrationFailed = !messagesResp;
     const messages = Array.isArray(messagesResp?.data) ? messagesResp.data : [];
     const allStatuses = asRecord(statusResp?.data) ?? {};
-    const parentTaskEvidenceByChildID =
-      collectParentTaskEvidenceByChildSessionID(messages, currentSessionID);
+    const parentMessagesBySession = new Map<string, unknown[]>([
+      [currentSessionID, messages],
+    ]);
     let childHydrationFailed = false;
-    const childMessageResults: Array<
-      SessionMessageSummary & {
-        childID?: string;
-        fetchFailed: boolean;
-        model?: ReturnType<typeof extractLatestAssistantModel>;
-      }
-    > = await Promise.all(
-      children.map(async (child) => {
-        const session = asRecord(child);
-        const childID =
-          typeof session?.id === "string" ? session.id : undefined;
-        if (!childID) {
-          return {
-            childID: undefined,
-            completedAt: undefined,
-            evidenceAt: undefined,
-            hasError: false,
-            fetchFailed: false,
-          };
-        }
+    const childMessageResults = await Promise.all(
+      sessionTree.sessions.map(async (session) => {
         const childMessagesResp = await safeReadAsync(
           () =>
-            sessionClient?.messages?.({ sessionID: childID, directory }) ??
+            sessionClient?.messages?.({ sessionID: session.id, directory }) ??
             Promise.resolve({ data: [] }),
         );
         let fetchFailed = false;
@@ -2003,8 +1879,9 @@ export async function hydratePreviousSubagents(
         const childMessages = Array.isArray(childMessagesResp?.data)
           ? childMessagesResp.data
           : [];
+        parentMessagesBySession.set(session.id, childMessages);
         return {
-          childID,
+          session,
           ...summarizeSessionMessages(childMessages),
           model: extractLatestAssistantModel(childMessages),
           fetchFailed,
@@ -2013,28 +1890,37 @@ export async function hydratePreviousSubagents(
     );
     const childMessageSummaryByID = new Map(
       childMessageResults
-        .filter((result) => result.childID)
-        .map((result) => [result.childID as string, result]),
+        .map((result) => [result.session.id, result]),
     );
+    const parentTaskEvidenceByChildID = new Map<string, ParentTaskEvidence>();
+    for (const [parentSessionID, parentMessages] of parentMessagesBySession) {
+      for (const [childID, evidence] of collectParentTaskEvidenceByChildSessionID(
+        parentMessages,
+        parentSessionID,
+      )) {
+        parentTaskEvidenceByChildID.set(childID, evidence);
+      }
+    }
 
     snapshotSidebarScrollOffsets();
     setState((current) => {
       const next = cloneState(current);
       let changed = false;
 
-      for (const rawSession of children) {
-        const session = asRecord(rawSession);
-        if (!session || typeof session.id !== "string") continue;
-        const status = allStatuses[session.id];
+      for (const hydratedSession of sessionTree.sessions) {
+        const session = hydratedSession.info;
+        const status = allStatuses[hydratedSession.id];
         const sessionStatus = deriveSessionChildStatus(status);
-        const childSummary = childMessageSummaryByID.get(session.id);
+        const childSummary = childMessageSummaryByID.get(hydratedSession.id);
         const hasHydrationEvidence = shouldHydrateSessionChild({
-          childID: session.id,
+          childID: hydratedSession.id,
           sessionStatus,
           childSummary,
           parentTaskEvidenceByChildID,
         });
-        const parentTaskEvidence = parentTaskEvidenceByChildID.get(session.id);
+        const parentTaskEvidence = parentTaskEvidenceByChildID.get(
+          hydratedSession.id,
+        );
         const explicitCompletionEvidence =
           !!childSummary &&
           !childSummary.fetchFailed &&
@@ -2049,17 +1935,17 @@ export async function hydratePreviousSubagents(
         const shouldHydrateChildFromSession = hasHydrationEvidence;
 
         if (!shouldHydrateChildFromSession) {
-          const existing = next.children[session.id];
+          const existing = next.children[hydratedSession.id];
           if (
             !statusHydrationFailed &&
             !parentMessageHydrationFailed &&
             !!childSummary &&
             !childSummary.fetchFailed &&
-            existing?.parentID === currentSessionID &&
+            existing?.parentID === hydratedSession.parentID &&
             existing.source === "session" &&
             existing.status === "running"
           ) {
-            delete next.children[session.id];
+            delete next.children[hydratedSession.id];
             changed = true;
           }
           continue;
@@ -2068,7 +1954,7 @@ export async function hydratePreviousSubagents(
         const fakeEvent = {
           type: "session.created",
           properties: {
-            sessionID: session.id,
+            sessionID: hydratedSession.id,
             info: session,
           },
         };
@@ -2077,7 +1963,7 @@ export async function hydratePreviousSubagents(
           changed =
             setChildModel(
               next,
-              session.id,
+              hydratedSession.id,
               childSummary.model.model,
               childSummary.model.updatedAt,
             ) || changed;
@@ -2095,7 +1981,7 @@ export async function hydratePreviousSubagents(
           if (
             markChildStatus(
               next,
-              session.id,
+              hydratedSession.id,
               resolvedStatus.status,
               resolvedStatus.endedAt ??
                 parentTaskEvidence?.endedAt ??
@@ -2112,12 +1998,20 @@ export async function hydratePreviousSubagents(
           explicitCompletionEvidence
         ) {
           const childStatus = childSummary?.hasError ? "error" : "done";
-          if (markChildStatus(next, session.id, childStatus, fallbackEndedAt))
+          if (
+            markChildStatus(
+              next,
+              hydratedSession.id,
+              childStatus,
+              fallbackEndedAt,
+            )
+          )
             changed = true;
         }
       }
 
-      for (const rawMessage of messages) {
+      for (const [parentSessionID, parentMessages] of parentMessagesBySession) {
+        for (const rawMessage of parentMessages) {
         const message = asRecord(rawMessage);
         const info = asRecord(message?.info);
         const parts = Array.isArray(message?.parts) ? message.parts : [];
@@ -2152,7 +2046,7 @@ export async function hydratePreviousSubagents(
             const fakeEvent = {
               type: "message.part.updated",
               properties: {
-                sessionID: currentSessionID,
+                sessionID: parentSessionID,
                 info: eventInfo,
                 part: partWithMessageID,
               },
@@ -2168,24 +2062,26 @@ export async function hydratePreviousSubagents(
           }
         }
       }
+      }
 
-      if (backfillHydratedTargetSessionIDs(next, currentSessionID)) {
-        changed = true;
+      for (const parentSessionID of parentMessagesBySession.keys()) {
+        if (backfillHydratedTargetSessionIDs(next, parentSessionID)) {
+          changed = true;
+        }
       }
 
       const refreshed = refreshLiveState(next);
       if (!changed && !refreshed) return current;
-      persistStateSnapshot(statePath, textPath, next);
       return next;
     });
-    if (topLevelHydrationFailed || childHydrationFailed) return false;
+    if (
+      topLevelHydrationFailed ||
+      sessionTree.descendantFailed ||
+      childHydrationFailed
+    )
+      return false;
     return true;
-  } catch (err) {
-    debugLog({
-      kind: "hydration.error",
-      sessionID: currentSessionID,
-      error: String(err),
-    });
+  } catch {
     return false;
   }
 }
@@ -2520,8 +2416,6 @@ export async function probeRunningEvidence(input: {
 }
 
 function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
-  const statePath = resolveStatePath();
-  const textPath = resolveTextPath(statePath);
   const [state, setState] = createSignal<StatuslineState>(createEmptyState());
   const [nowMs, setNowMs] = createSignal(Date.now());
   const [hydratedSessions, setHydratedSessions] = createSignal<Set<string>>(
@@ -2740,8 +2634,6 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
       const hydrated = await hydratePreviousSubagents(
         api,
         sessionID,
-        statePath,
-        textPath,
         setState,
       );
       if (disposed) {
@@ -3013,7 +2905,6 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
 
         const refreshed = refreshLiveState(next);
         if (!changed && !refreshed) return current;
-        persistStateSnapshot(statePath, textPath, next);
         return next;
       });
     } finally {
@@ -3039,7 +2930,6 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
         const next = runTuiStateMaintenance(api, current);
         if (next === current) return current;
         snapshotSidebarScrollOffsets();
-        persistStateSnapshot(statePath, textPath, next);
         return next;
       });
     },
@@ -3052,27 +2942,13 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
   });
 
   const applyEvent = (event: unknown): void => {
-    debugEvent(event);
     snapshotSidebarScrollOffsets();
     setState((current: StatuslineState) => {
       const next = cloneState(current);
       const changed = applySubagentEvent(next, event);
       const hydrated = hydrateStateTokensFromTuiState(api, next);
-      if (changed) {
-        debugLog({
-          kind: "state.changed",
-          children: Object.values(next.children).map((child) => ({
-            id: child.id,
-            parentID: child.parentID,
-            title: child.title,
-            status: child.status,
-            source: child.source,
-          })),
-        });
-      }
       const refreshed = refreshLiveState(next);
       if (!changed && !hydrated && !refreshed) return current;
-      persistStateSnapshot(statePath, textPath, next);
       return next;
     });
   };
@@ -3107,13 +2983,6 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
       sidebar_content(ctx: SidebarContentContext) {
         const routeSessionID = resolveRouteSessionID(api);
         const sessionID = ctx.session_id ?? routeSessionID ?? "";
-        debugLog({
-          kind: "slot.sidebar_content",
-          ctxSessionID: ctx.session_id,
-          resolvedSessionID: sessionID,
-          route: api.route.current,
-          childCount: Object.keys(state().children).length,
-        });
         const restoreFromChild = (() => {
           const pending = consumePendingSidebarRefocus();
           if (pending?.parentSessionID !== sessionID) return undefined;

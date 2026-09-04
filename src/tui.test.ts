@@ -1,18 +1,20 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import { describe, expect, it, vi } from "vitest";
-import { readOpenCodeLogFileIfSmall } from "./logs.js";
 import {
   backfillHydratedTargetSessionIDs,
   formatChildModelLine,
+  formatChildRowLine,
+  formatTerminalChildRowLine,
   hydratePreviousSubagents,
   preservedSidebarAnchorScrollTop,
   preservedSidebarScrollTop,
   resolveSidebarSubagentSnapshot,
   probeRunningEvidence,
   resolveTuiSubagentSnapshot,
+  rowWidthBudget,
   subagentRowHeight,
   wrapCompactText,
 } from "./tui.js";
@@ -57,23 +59,48 @@ function stateWith(
   };
 }
 
-async function hydrateState(input: {
+type HydrateStateInput = {
   children: unknown[];
+  childrenByParent?: Record<string, unknown[]>;
+  sessionID?: string;
   parentMessages?: unknown[];
   childMessages?: Record<string, unknown[]>;
   statuses?: Record<string, unknown>;
-}): Promise<StatuslineState> {
+  failChildrenFor?: string[];
+};
+
+type HydrateStateResult = {
+  state: StatuslineState;
+  hydrated: boolean;
+  childrenSessionIDs: string[];
+};
+
+async function hydrateStateWithResult(
+  input: HydrateStateInput,
+): Promise<HydrateStateResult> {
   let state = stateWith([]);
   const dir = await mkdtemp(join(tmpdir(), "subagent-statusline-hydrate-"));
+  const rootSessionID = input.sessionID ?? "ses_parent";
   const childMessages = input.childMessages ?? {};
+  const childrenSessionIDs: string[] = [];
   const api = {
     state: { path: { directory: dir } },
     client: {
       session: {
-        children: vi.fn(async () => ({ data: input.children })),
+        children: vi.fn(async ({ sessionID }: { sessionID: string }) => {
+          childrenSessionIDs.push(sessionID);
+          if (input.failChildrenFor?.includes(sessionID)) {
+            throw new Error(`failed to read children for ${sessionID}`);
+          }
+          return {
+            data: input.childrenByParent
+              ? (input.childrenByParent[sessionID] ?? [])
+              : input.children,
+          };
+        }),
         messages: vi.fn(async ({ sessionID }: { sessionID: string }) => ({
           data:
-            sessionID === "ses_parent"
+            sessionID === rootSessionID
               ? (input.parentMessages ?? [])
               : (childMessages[sessionID] ?? []),
         })),
@@ -82,17 +109,19 @@ async function hydrateState(input: {
     },
   } as unknown as TuiPluginApi;
 
-  await hydratePreviousSubagents(
+  const hydrated = await hydratePreviousSubagents(
     api,
-    "ses_parent",
-    join(dir, "state.json"),
-    join(dir, "status.txt"),
-    (update) => {
+    rootSessionID,
+    (update: (prev: StatuslineState) => StatuslineState) => {
       state = update(state);
     },
   );
 
-  return state;
+  return { state, hydrated, childrenSessionIDs };
+}
+
+async function hydrateState(input: HydrateStateInput): Promise<StatuslineState> {
+  return (await hydrateStateWithResult(input)).state;
 }
 
 describe("TUI subagent snapshots", () => {
@@ -167,6 +196,162 @@ describe("TUI subagent snapshots", () => {
         40,
       ),
     ).toBe("fallback-model · fast");
+  });
+
+  it("subtracts nested indentation from every child text budget", () => {
+    // Given: a long child row rendered at a wide sidebar width.
+    const nowMs = Date.parse("2026-04-30T10:20:00.000Z");
+    const modeledChild = child({
+      title: "A".repeat(80),
+      tokens: { total: 123_456, contextPercent: 78 },
+      model: { providerID: "openai", modelID: "long-model", variant: "high" },
+    });
+    const providers = [{
+      id: "openai",
+      models: { "long-model": { name: "M".repeat(80) } },
+    }] as unknown as TuiPluginApi["state"]["provider"];
+    const rootWidth = rowWidthBudget({
+      sidebarWidth: 52,
+      reservedWidth: 4,
+      indentationWidth: 0,
+    });
+    const nestedWidth = rowWidthBudget({
+      sidebarWidth: 52,
+      reservedWidth: 4,
+      indentationWidth: 8,
+    });
+
+    // When: the same row is formatted at depth zero and depth four.
+    const rootRunning = formatChildRowLine({
+      child: modeledChild,
+      nowMs,
+      sidebarWidth: 52,
+      reservedWidth: 4,
+      indentationWidth: 0,
+    });
+    const nestedRunning = formatChildRowLine({
+      child: modeledChild,
+      nowMs,
+      sidebarWidth: 52,
+      reservedWidth: 4,
+      indentationWidth: 8,
+    });
+    const rootTerminal = formatTerminalChildRowLine({
+      child: { ...modeledChild, status: "done" },
+      nowMs,
+      sidebarWidth: 52,
+      reservedWidth: 4,
+      indentationWidth: 0,
+    });
+    const nestedTerminal = formatTerminalChildRowLine({
+      child: { ...modeledChild, status: "done" },
+      nowMs,
+      sidebarWidth: 52,
+      reservedWidth: 4,
+      indentationWidth: 8,
+    });
+    const rootModel = formatChildModelLine(modeledChild, providers, rootWidth);
+    const nestedModel = formatChildModelLine(
+      modeledChild,
+      providers,
+      nestedWidth,
+    );
+
+    // Then: every formatted text path receives the smaller nested budget.
+    expect(nestedWidth).toBe(rootWidth - 8);
+    expect(textColumns(nestedRunning.labelLines[0] ?? "")).toBeLessThan(
+      textColumns(rootRunning.labelLines[0] ?? ""),
+    );
+    expect(textColumns(nestedRunning.labelLines[0] ?? "")).toBeLessThanOrEqual(
+      nestedWidth,
+    );
+    expect(textColumns(nestedRunning.secondaryLine ?? "")).toBeLessThanOrEqual(
+      nestedWidth,
+    );
+    expect(textColumns(nestedTerminal.label)).toBeLessThan(
+      textColumns(rootTerminal.label),
+    );
+    expect(textColumns(nestedTerminal.label)).toBeLessThanOrEqual(nestedWidth);
+    expect(textColumns(nestedModel ?? "")).toBeLessThan(
+      textColumns(rootModel ?? ""),
+    );
+    expect(textColumns(nestedModel ?? "")).toBeLessThanOrEqual(nestedWidth);
+  });
+
+  it("keeps a nested child within a narrow sidebar budget", () => {
+    // Given: an ancestor with a nested child in a narrow sidebar.
+    const nowMs = Date.parse("2026-04-30T10:20:00.000Z");
+    const ancestor = child({
+      id: "ses_ancestor",
+      parentID: "ses_parent",
+      targetSessionID: "ses_ancestor",
+      title: "Ancestor",
+    });
+    const nestedChild = child({
+      id: "ses_nested",
+      parentID: "ses_ancestor",
+      targetSessionID: "ses_nested",
+      title: "N".repeat(80),
+      agentName: "nested-reviewer",
+      tokens: { total: 123_456, contextPercent: 78 },
+      model: { providerID: "missing", modelID: "long-model", variant: "high" },
+    });
+    const snapshot = resolveTuiSubagentSnapshot({
+      state: stateWith([ancestor, nestedChild]),
+      sessionID: "ses_parent",
+      nowMs,
+    });
+    expect(snapshot.visibleChildren.map((item) => item.id)).toEqual([
+      "ses_ancestor",
+      "ses_nested",
+    ]);
+
+    const visibleNestedChild = snapshot.visibleChildren.find(
+      (item) => item.id === "ses_nested",
+    );
+    if (!visibleNestedChild) throw new Error("nested child was not projected");
+
+    const sidebarWidth = 16;
+    const indentationWidth = 2;
+    const reservedWidth = 4;
+    const availableWidth = rowWidthBudget({
+      sidebarWidth,
+      indentationWidth,
+      reservedWidth,
+    });
+    const providers: TuiPluginApi["state"]["provider"] = [];
+    const running = formatChildRowLine({
+      child: visibleNestedChild,
+      nowMs,
+      sidebarWidth,
+      indentationWidth,
+      reservedWidth,
+    });
+    const terminal = formatTerminalChildRowLine({
+      child: { ...visibleNestedChild, status: "done" },
+      nowMs,
+      sidebarWidth,
+      indentationWidth,
+      reservedWidth,
+    });
+    const model = formatChildModelLine(
+      visibleNestedChild,
+      providers,
+      availableWidth,
+    );
+
+    // When: the nested child is formatted with its computed indentation reserved.
+    // Then: every rendered text line fits the remaining six-column budget.
+    expect(availableWidth).toBe(6);
+    expect(textColumns(running.labelLines[0] ?? "")).toBeLessThanOrEqual(
+      availableWidth,
+    );
+    expect(running.secondaryLine).toBeDefined();
+    expect(textColumns(running.secondaryLine ?? "")).toBeLessThanOrEqual(
+      availableWidth,
+    );
+    expect(textColumns(terminal.label)).toBeLessThanOrEqual(availableWidth);
+    expect(textColumns(model ?? "")).toBeLessThanOrEqual(availableWidth);
   });
 
   it("preserves sidebar scroll with the visible row anchor first", () => {
@@ -901,6 +1086,228 @@ describe("hydratePreviousSubagents", () => {
     ).toEqual({ running: 1, done: 0, error: 0 });
   });
 
+  it("hydrates a grandchild session", async () => {
+    // Given: the root's direct child and that child's direct child are running.
+    // When: the previous subagents are hydrated from root session A.
+    const state = await hydrateState({
+      sessionID: "ses_A",
+      children: [],
+      childrenByParent: {
+        ses_A: [
+          {
+            id: "ses_B",
+            parentID: "ses_A",
+            title: "Child B",
+            time: { created: "2026-04-30T10:00:00.000Z" },
+          },
+        ],
+        ses_B: [
+          {
+            id: "ses_C",
+            parentID: "ses_B",
+            title: "Grandchild C",
+            time: { created: "2026-04-30T10:01:00.000Z" },
+          },
+        ],
+      },
+      childMessages: { ses_B: [], ses_C: [] },
+      statuses: {
+        ses_B: { status: "running" },
+        ses_C: { status: "running" },
+      },
+    });
+
+    // Then: both real executions retain their immediate parent and count.
+    expect(Object.keys(state.children)).toEqual(["ses_B", "ses_C"]);
+    expect(state.children.ses_B).toEqual(
+      expect.objectContaining({
+        id: "ses_B",
+        parentID: "ses_A",
+        status: "running",
+        targetSessionID: "ses_B",
+      }),
+    );
+    expect(state.children.ses_C).toEqual(
+      expect.objectContaining({
+        id: "ses_C",
+        parentID: "ses_B",
+        status: "running",
+        targetSessionID: "ses_C",
+      }),
+    );
+    expect(state.countedChildIDs).toEqual({ ses_B: true, ses_C: true });
+    expect(state.totalExecuted).toBe(2);
+  });
+
+  it("terminates and de-duplicates duplicate and cyclic direct-child responses", async () => {
+    // Given: each response contains direct children only, with duplicate rows
+    // and a cycle back to the already visited root session.
+    const result = await hydrateStateWithResult({
+      sessionID: "ses_A",
+      children: [],
+      childrenByParent: {
+        ses_A: [
+          { ...hydratedChild, id: "ses_B", parentID: "ses_A" },
+          { ...hydratedChild, id: "ses_B", parentID: "ses_A" },
+        ],
+        ses_B: [
+          { ...hydratedChild, id: "ses_C", parentID: "ses_B" },
+          { ...hydratedChild, id: "ses_C", parentID: "ses_B" },
+        ],
+        ses_C: [
+          { ...hydratedChild, id: "ses_A", parentID: "ses_C" },
+        ],
+      },
+      childMessages: { ses_B: [], ses_C: [] },
+      statuses: {
+        ses_B: { status: "running" },
+        ses_C: { status: "running" },
+      },
+    });
+
+    // When: hydration traverses the cyclic direct-child responses.
+    // Then: completion is bounded to the unique descendants and their lineage.
+    expect(result.hydrated).toBe(true);
+    expect(result.childrenSessionIDs).toHaveLength(3);
+    expect(result.childrenSessionIDs).toEqual(["ses_A", "ses_B", "ses_C"]);
+    const state = result.state;
+    const stateIDs = Object.keys(state.children);
+    expect(new Set(stateIDs).size).toBe(stateIDs.length);
+    expect(stateIDs).toEqual(["ses_B", "ses_C"]);
+    expect(
+      Object.values(state.children).map(({ id, parentID }) => ({ id, parentID })),
+    ).toEqual([
+      { id: "ses_B", parentID: "ses_A" },
+      { id: "ses_C", parentID: "ses_B" },
+    ]);
+    expect(state.countedChildIDs).toEqual({ ses_B: true, ses_C: true });
+    expect(state.totalExecuted).toBe(2);
+
+    const snapshot = resolveTuiSubagentSnapshot({
+      state,
+      sessionID: "ses_A",
+      nowMs: Date.parse("2026-04-30T10:20:00.000Z"),
+    });
+
+    expect(
+      snapshot.visibleChildren.map(({ id, parentID }) => ({ id, parentID })),
+    ).toEqual([
+      { id: "ses_B", parentID: "ses_A" },
+      { id: "ses_C", parentID: "ses_B" },
+    ]);
+    expect(snapshot.visibleCounts).toEqual({ running: 2, done: 0, error: 0 });
+    expect(snapshot.totalExecuted).toBe(2);
+  });
+
+  it("preserves stable ancestor-first projection order for nested branches", async () => {
+    // Given: direct-child responses arrive in reverse ID order for two branches.
+    const state = await hydrateState({
+      sessionID: "ses_A",
+      children: [],
+      childrenByParent: {
+        ses_A: [
+          { ...hydratedChild, id: "ses_D", parentID: "ses_A" },
+          { ...hydratedChild, id: "ses_B", parentID: "ses_A" },
+        ],
+        ses_B: [
+          { ...hydratedChild, id: "ses_C", parentID: "ses_B" },
+        ],
+        ses_D: [
+          { ...hydratedChild, id: "ses_E", parentID: "ses_D" },
+        ],
+      },
+      childMessages: { ses_B: [], ses_C: [], ses_D: [], ses_E: [] },
+      statuses: {
+        ses_B: { status: "running" },
+        ses_C: { status: "running" },
+        ses_D: { status: "running" },
+        ses_E: { status: "running" },
+      },
+    });
+
+    // When: hydration discovers the branches and projects the ancestor snapshot.
+    const snapshot = resolveTuiSubagentSnapshot({
+      state,
+      sessionID: "ses_A",
+      nowMs: Date.parse("2026-04-30T10:20:00.000Z"),
+    });
+
+    // Then: each ancestor precedes its descendant, independent of response order.
+    expect(
+      snapshot.visibleChildren.map(({ id, parentID }) => ({ id, parentID })),
+    ).toEqual([
+      { id: "ses_B", parentID: "ses_A" },
+      { id: "ses_C", parentID: "ses_B" },
+      { id: "ses_D", parentID: "ses_A" },
+      { id: "ses_E", parentID: "ses_D" },
+    ]);
+    expect(state.countedChildIDs).toEqual({
+      ses_B: true,
+      ses_C: true,
+      ses_D: true,
+      ses_E: true,
+    });
+    expect(state.totalExecuted).toBe(4);
+    expect(snapshot.visibleCounts).toEqual({ running: 4, done: 0, error: 0 });
+    expect(snapshot.totalExecuted).toBe(4);
+  });
+
+  it("returns failure after a descendant lookup while retaining earlier hydrated descendants", async () => {
+    // Given: the descendant tree is discovered through direct-only calls, but
+    // the deepest session's children lookup fails after B and C are found.
+    const result = await hydrateStateWithResult({
+      sessionID: "ses_A",
+      children: [],
+      childrenByParent: {
+        ses_A: [
+          { ...hydratedChild, id: "ses_B", parentID: "ses_A" },
+        ],
+        ses_B: [
+          { ...hydratedChild, id: "ses_C", parentID: "ses_B" },
+        ],
+      },
+      failChildrenFor: ["ses_C"],
+      childMessages: { ses_B: [], ses_C: [] },
+      statuses: {
+        ses_B: { status: "running" },
+        ses_C: { status: "running" },
+      },
+    });
+
+    // When: hydration completes with a descendant children failure.
+    // Then: it reports failure without discarding data fetched before it.
+    expect(result.hydrated).toBe(false);
+    expect(result.childrenSessionIDs).toEqual(["ses_A", "ses_B", "ses_C"]);
+    expect(Object.keys(result.state.children)).toEqual(["ses_B", "ses_C"]);
+    expect(
+      Object.values(result.state.children).map(({ id, parentID }) => ({
+        id,
+        parentID,
+      })),
+    ).toEqual([
+      { id: "ses_B", parentID: "ses_A" },
+      { id: "ses_C", parentID: "ses_B" },
+    ]);
+    expect(result.state.countedChildIDs).toEqual({
+      ses_B: true,
+      ses_C: true,
+    });
+    expect(result.state.totalExecuted).toBe(2);
+
+    const snapshot = resolveTuiSubagentSnapshot({
+      state: result.state,
+      sessionID: "ses_A",
+      nowMs: Date.parse("2026-04-30T10:20:00.000Z"),
+    });
+
+    expect(snapshot.visibleChildren.map((child) => child.id)).toEqual([
+      "ses_B",
+      "ses_C",
+    ]);
+    expect(snapshot.visibleCounts).toEqual({ running: 2, done: 0, error: 0 });
+    expect(snapshot.totalExecuted).toBe(2);
+  });
+
   it("hydrates model metadata from direct and enveloped child messages", async () => {
     const state = await hydrateState({
       children: [
@@ -1126,6 +1533,7 @@ describe("TUI subagent hydration", () => {
   async function hydrateWith(input: {
     initialChildren?: ChildSessionState[];
     children: unknown[];
+    childrenBySession?: Record<string, unknown[]>;
     statuses?: Record<string, unknown>;
     messagesBySession?: Record<string, unknown[]>;
     failMessagesFor?: string[];
@@ -1144,7 +1552,9 @@ describe("TUI subagent hydration", () => {
       },
       client: {
         session: {
-          children: vi.fn(async () => ({ data: input.children })),
+          children: vi.fn(async ({ sessionID }: { sessionID: string }) => ({
+            data: input.childrenBySession?.[sessionID] ?? input.children,
+          })),
           messages: vi.fn(async ({ sessionID }: { sessionID: string }) => {
             if (input.failMessagesFor?.includes(sessionID)) {
               throw new Error(`failed to read messages for ${sessionID}`);
@@ -1164,9 +1574,7 @@ describe("TUI subagent hydration", () => {
     await hydratePreviousSubagents(
       api as never,
       "ses_parent",
-      join(directory, "state.json"),
-      join(directory, "status.txt"),
-      (fn) => {
+      (fn: (prev: StatuslineState) => StatuslineState) => {
         state = fn(state);
       },
     );
@@ -1347,6 +1755,48 @@ describe("TUI subagent hydration", () => {
 
     expect(state.children.ses_child_done?.status).toBe("done");
     expect(state.children.ses_child_done?.endedAt).toBe(updatedAt);
+  });
+
+  it("hydrates the complete descendant subtree for an ancestor snapshot", async () => {
+    const state = await hydrateWith({
+      children: [],
+      childrenBySession: {
+        ses_parent: [
+          {
+            id: "ses_child",
+            parentID: "ses_parent",
+            title: "Child work",
+            time: { created: "2026-04-30T10:00:00.000Z" },
+          },
+        ],
+        ses_child: [
+          {
+            id: "ses_grandchild",
+            parentID: "ses_child",
+            title: "Grandchild work",
+            time: { created: "2026-04-30T10:00:00.000Z" },
+          },
+        ],
+      },
+      statuses: {
+        ses_child: { status: "busy" },
+        ses_grandchild: { status: "busy" },
+      },
+    });
+
+    const snapshot = resolveTuiSubagentSnapshot({
+      state,
+      sessionID: "ses_parent",
+      nowMs: Date.parse("2026-04-30T10:20:00.000Z"),
+    });
+
+    expect(
+      snapshot.visibleChildren.map(({ id, parentID }) => ({ id, parentID })),
+    ).toEqual([
+      { id: "ses_child", parentID: "ses_parent" },
+      { id: "ses_grandchild", parentID: "ses_child" },
+    ]);
+    expect(snapshot.totalExecuted).toBe(2);
   });
 });
 
@@ -1560,20 +2010,6 @@ describe("registerSubagentCommands", () => {
     result();
     expect(keymapDispose).toHaveBeenCalledOnce();
     expect(legacyDispose).toHaveBeenCalledOnce();
-  });
-});
-
-describe("readOpenCodeLogFileIfSmall", () => {
-  it("skips oversized OpenCode logs before reading them synchronously", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "subagent-statusline-logs-"));
-    const smallLog = join(dir, "small.log");
-    const hugeLog = join(dir, "huge.log");
-
-    await writeFile(smallLog, "small log", "utf8");
-    await writeFile(hugeLog, `${"x".repeat(1024 * 1024)}x`, "utf8");
-
-    expect(readOpenCodeLogFileIfSmall(smallLog)).toBe("small log");
-    expect(readOpenCodeLogFileIfSmall(hugeLog)).toBeUndefined();
   });
 });
 
