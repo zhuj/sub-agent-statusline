@@ -51,19 +51,17 @@ pnpm pack --dry-run
 
 ## Build
 
-El build usa `tsup.config.ts` y genera dos salidas principales:
+El build usa `tsup.config.ts` y genera una salida:
 
 | Fuente         | Salida                  | Uso                        |
 | -------------- | ----------------------- | -------------------------- |
 | `src/tui.tsx`  | `dist/tui.js` + tipos   | Plugin TUI principal.      |
-| `src/index.ts` | `dist/index.js` + tipos | Runtime plugin file-based. |
 
 El paquete publica estos entrypoints:
 
 ```txt
 opencode-subagent-statusline
 opencode-subagent-statusline/tui
-opencode-subagent-statusline/runtime
 ```
 
 ## TypeScript
@@ -73,17 +71,15 @@ Archivos relevantes:
 | Archivo              | Rol                                                                               |
 | -------------------- | --------------------------------------------------------------------------------- |
 | `tsconfig.json`      | Config base del source. Usa NodeNext, ES2022, strict y JSX para `@opentui/solid`. |
-| `tsconfig.test.json` | Config para tests, Vitest y archivos de setup.                                    |
-| `tsup.config.ts`     | Config de build para runtime y TUI.                                               |
+| `tsup.config.ts`     | Config de build del plugin TUI.                                                   |
 
 ## Estrategia de tests
 
 El proyecto usa Vitest.
 
-Hay dos capas principales:
+Hay una capa principal:
 
 1. **Unit tests** para lógica determinística.
-2. **Runtime integration tests** para filesystem y manejo de eventos estilo OpenCode.
 
 La UI visual completa se deja fuera de E2E profundo por ahora para evitar tests frágiles contra el host.
 
@@ -92,14 +88,12 @@ La UI visual completa se deja fuera de E2E profundo por ahora para evitar tests 
 | Archivo                           | Qué valida                                                                              |
 | --------------------------------- | --------------------------------------------------------------------------------------- |
 | `src/events.test.ts`              | Parsing de eventos, extracción de IDs, correlación y tolerancia a payloads malformados. |
-| `src/state.test.ts`               | Estado, contadores, transiciones, poda, persistencia y normalización.                   |
+| `src/state.test.ts`               | Estado, contadores, transiciones, poda y normalización.                                |
 | `src/render.test.ts`              | Render textual, collapse, visibilidad, duración, tokens y color/no-color.               |
 | `src/reconcile.test.ts`           | Normalización de estados, stale-running, backoff y fail-closed.                         |
 | `src/text-width.test.ts`          | Ancho de columnas para texto CJK/full-width, marcas combinantes y truncado.              |
 | `src/tui.test.ts`                 | Registro de comandos, keybinding `Alt+B` y fallback legacy.                             |
-| `test/index.integration.test.ts`  | Plugin runtime, `state.json`, `status.txt`, preserve-state y errores de filesystem.     |
-| `test/helpers/runtime-harness.ts` | Helpers para temp dirs, fixtures, env vars y fake time.                                 |
-| `test/setup.ts`                   | Limpieza global de timers, mocks, env vars y temp dirs.                                 |
+| `test/helpers/runtime-harness.ts` | Helpers para fixtures estáticas y fake time.                                            |
 
 ## Coverage
 
@@ -118,27 +112,23 @@ Punto importante:
 
 > `src/tui.tsx` está excluido de coverage. No digas que la TUI visual completa está cubierta por tests automáticos.
 
-La cobertura actual se enfoca en módulos `.ts` determinísticos: eventos, estado, render, reconcile, helpers de ancho textual, comandos y runtime.
+La cobertura actual se enfoca en módulos `.ts` determinísticos: eventos, estado, render, reconcile, helpers de ancho textual y comandos.
 
 ## Patrón Arrange / Act / Assert
 
 Los tests deberían seguir esta estructura:
 
 ```ts
-it("persists a supported event", async () => {
+it("aplica un evento session.created como child running", async () => {
   // Arrange
-  const harness = await createRuntimeHarness();
-  const plugin = await SubagentStatusline(
-    {} as Parameters<typeof SubagentStatusline>[0],
-  );
+  const state = createEmptyState();
   const event = await readJsonFixture("session-created");
 
   // Act
-  await plugin.event?.({ event } as never);
+  applySubagentEvent(state, event);
 
   // Assert
-  const state = await readRuntimeState(harness.statePath);
-  expect(state.children.ses_child_1.status).toBe("running");
+  expect(state.children.ses_child_1).toMatchObject({ status: "running" });
 });
 ```
 
@@ -185,39 +175,6 @@ it("does not count tool wrappers", () => {
 });
 ```
 
-## Cómo agregar un integration test runtime
-
-Los integration tests viven en `test/**/*.integration.test.ts`.
-
-Usá el harness para aislar filesystem y env vars:
-
-```ts
-it("writes runtime output after an event", async () => {
-  const harness = await createRuntimeHarness();
-  const plugin = await SubagentStatusline(
-    {} as Parameters<typeof SubagentStatusline>[0],
-  );
-  const event = await readJsonFixture("session-created");
-
-  await plugin.event?.({ event } as never);
-
-  expect(await readStatusText(harness.textPath)).toContain(
-    "Review auth changes",
-  );
-});
-```
-
-Helpers útiles:
-
-| Helper                   | Uso                                                 |
-| ------------------------ | --------------------------------------------------- |
-| `createRuntimeHarness()` | Crea temp dir y configura estado aislado.           |
-| `readJsonFixture(name)`  | Lee fixtures de `test/fixtures/events/<name>.json`. |
-| `readRuntimeState(path)` | Lee `state.json`.                                   |
-| `readStatusText(path)`   | Lee `status.txt`.                                   |
-| `pathExists(path)`       | Verifica existencia sin throw.                      |
-| `useFrozenTime(iso)`     | Congela tiempo con fake timers.                     |
-
 ## Fixtures
 
 Los fixtures viven en:
@@ -229,6 +186,13 @@ test/fixtures/events/
 Usalos cuando un payload se reutiliza o cuando conviene documentar una forma conocida de evento OpenCode.
 
 Mantenelos chicos y representativos. No metas dumps enormes salvo que el tamaño sea parte del comportamiento a proteger.
+
+Helpers útiles:
+
+| Helper                  | Uso                                                 |
+| ----------------------- | --------------------------------------------------- |
+| `readJsonFixture(name)` | Lee fixtures de `test/fixtures/events/<name>.json`. |
+| `useFrozenTime(iso)`    | Congela tiempo con fake timers.                     |
 
 ## Fake timers
 

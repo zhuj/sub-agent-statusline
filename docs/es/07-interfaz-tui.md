@@ -47,7 +47,8 @@ Subagentes
 
 La sidebar muestra subagentes relacionados con la sesión actual de OpenCode.
 
-No hace fallback a otras sesiones. El resumen de home, el statusline textual y `status.txt` siguen siendo globales entre sesiones.
+No hace fallback a otras sesiones. El resumen de home y la sidebar
+renderizada están limitados a la sesión actual.
 
 ## Estados visuales
 
@@ -150,7 +151,8 @@ El plugin guarda preferencias en `api.kv` de OpenCode:
 | `subagents.sidebar.expanded` | Recuerda si la sección está expandida.  |
 | `subagents.sidebar.enabled`  | Recuerda si la sección está habilitada. |
 
-Estas preferencias pertenecen al entorno TUI de OpenCode, no al archivo `state.json` del runtime plugin.
+Estas preferencias pertenecen al entorno TUI, no al estado en memoria
+del plugin.
 
 Completed history está limitado por la retención de estado: las filas terminales
 se conservan hasta 3 días con un límite de 1.500 filas. Las filas ya podadas del

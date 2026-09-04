@@ -224,28 +224,13 @@ El objetivo es mantener `totalExecuted` correcto y evitar duplicados.
 
 ## Persistencia
 
-El estado puede guardarse como JSON.
+El plugin es solo en memoria: el estado de los subagentes vive dentro del
+proceso de la TUI y el plugin no persiste nada a disco. No hay `state.json`,
+`status.txt` ni otros archivos generados por el plugin.
 
-Por defecto, las rutas se resuelven con:
-
-```txt
-$XDG_RUNTIME_DIR/opencode-subagent-statusline/<instance>/state.json
-```
-
-Si `XDG_RUNTIME_DIR` no existe, se usa el tempdir del sistema.
-
-También existe `status.txt` junto a `state.json` para el render textual del runtime plugin.
-
-Variables relevantes:
-
-| Variable                                        | Uso                                                |
-| ----------------------------------------------- | -------------------------------------------------- |
-| `OPENCODE_SUBAGENT_STATUSLINE_STATE`            | Sobrescribe la ruta de `state.json`.               |
-| `OPENCODE_SUBAGENT_STATUSLINE_INSTANCE`         | Define el nombre de instancia.                     |
-| `OPENCODE_SUBAGENT_STATUSLINE_PRESERVE_STATE=1` | Evita limpiar estado al iniciar el runtime plugin. |
-| `XDG_RUNTIME_DIR`                               | Base por defecto para estado runtime.              |
-
-La TUI también puede persistir snapshots auxiliares, pero su estado principal vive en memoria mientras el plugin está activo.
+La única superficie de diagnóstico es el log opcional habilitado por
+`OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS=1`, que es observacional y no
+afecta la TUI renderizada.
 
 ## Normalización al cargar estado
 
