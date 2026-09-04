@@ -1,5 +1,3 @@
-import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   createEmptyState,
@@ -7,24 +5,14 @@ import {
   countRetainedSubagentStatuses,
   getCounts,
   isVisibleSubagentCounterEligible,
-  loadState,
   markChildStatus,
   pruneTerminalChildren,
   refreshDerivedFields,
-  resolveStatePath,
-  resolveTextPath,
-  saveState,
-  saveStatusText,
-  shouldPreserveStateOnStartup,
   upsertChildDetails,
   upsertRunningChild,
   type ChildSessionState,
 } from "./state.js";
-import {
-  createRuntimeHarness,
-  readRuntimeState,
-  useFrozenTime,
-} from "../test/helpers/runtime-harness.js";
+import { useFrozenTime } from "../test/helpers/runtime-harness.js";
 
 function child(overrides: Partial<ChildSessionState> = {}): ChildSessionState {
   return {
@@ -445,181 +433,5 @@ describe("state", () => {
       "recentError",
       "running",
     ]);
-  });
-
-  it("resolves env paths and preserve-state flag", async () => {
-    const harness = await createRuntimeHarness({ preserveState: true });
-
-    expect(resolveStatePath()).toBe(harness.statePath);
-    expect(resolveTextPath(harness.statePath)).toBe(harness.textPath);
-    expect(shouldPreserveStateOnStartup()).toBe(true);
-  });
-
-  it("saves and loads state safely, falling back on invalid JSON", async () => {
-    const harness = await createRuntimeHarness();
-    const state = createEmptyState();
-    state.children.ses_child = child();
-    state.totalExecuted = 1;
-    state.countedChildIDs.ses_child = true;
-
-    await saveState(harness.statePath, state);
-    expect(await readRuntimeState(harness.statePath)).toMatchObject({
-      totalExecuted: 1,
-    });
-    expect(await loadState(harness.statePath)).toMatchObject({
-      totalExecuted: 1,
-    });
-
-    const badPath = join(harness.dir, "nested", "bad.json");
-    await mkdir(dirname(badPath), { recursive: true });
-    await writeFile(badPath, "not json", "utf8");
-    expect(await loadState(badPath)).toMatchObject({
-      children: {},
-      totalExecuted: 0,
-    });
-  });
-
-  it("writes state and text snapshots atomically with owner-only file modes", async () => {
-    const harness = await createRuntimeHarness();
-    const state = createEmptyState();
-    state.children.ses_child = child();
-    state.totalExecuted = 1;
-    state.countedChildIDs.ses_child = true;
-
-    await saveState(harness.statePath, state);
-    await saveStatusText(join(harness.dir, "status.txt"), "subagents: 1");
-
-    expect(await loadState(harness.statePath)).toMatchObject({
-      totalExecuted: 1,
-    });
-    expect((await stat(harness.dir)).mode & 0o777).toBe(0o700);
-    expect((await stat(harness.statePath)).mode & 0o777).toBe(0o600);
-    expect((await stat(join(harness.dir, "status.txt"))).mode & 0o777).toBe(
-      0o600,
-    );
-    expect(
-      (await readdir(harness.dir)).some((file) => file.endsWith(".tmp")),
-    ).toBe(false);
-  });
-
-  it("drops loaded tool wrapper counts because wrappers are not executions", async () => {
-    const harness = await createRuntimeHarness();
-    await writeFile(
-      harness.statePath,
-      JSON.stringify({
-        children: {
-          "tool:old": child({
-            id: "tool:old",
-            source: "tool",
-            targetSessionID: undefined,
-          }),
-          "tool:new": child({
-            id: "tool:new",
-            source: "tool",
-            targetSessionID: undefined,
-          }),
-        },
-        countedChildIDs: { "tool:old": true },
-        totalExecuted: 1,
-        updatedAt: "2026-04-30T10:00:00.000Z",
-      }),
-      "utf8",
-    );
-
-    const loaded = await loadState(harness.statePath);
-
-    expect(loaded.totalExecuted).toBe(0);
-    expect(loaded.countedChildIDs["tool:old"]).toBeUndefined();
-    expect(loaded.countedChildIDs["tool:new"]).toBeUndefined();
-  });
-
-  it("normalizes counters after loading missing counted ids", async () => {
-    const harness = await createRuntimeHarness();
-    await writeFile(
-      harness.statePath,
-      JSON.stringify({
-        children: {
-          ses_child: child({ id: "ses_child", source: "session" }),
-        },
-        countedChildIDs: {},
-        totalExecuted: 0,
-        updatedAt: "2026-04-30T10:00:00.000Z",
-      }),
-      "utf8",
-    );
-
-    const loaded = await loadState(harness.statePath);
-
-    expect(loaded.countedChildIDs.ses_child).toBe(true);
-    expect(loaded.totalExecuted).toBe(1);
-  });
-
-  it("drops historical counted subtask proxies when no real session row exists", async () => {
-    const harness = await createRuntimeHarness();
-    await writeFile(
-      harness.statePath,
-      JSON.stringify({
-        children: {
-          "subtask:old": child({
-            id: "subtask:old",
-            source: "subtask",
-            targetSessionID: "ses_child",
-          }),
-        },
-        countedChildIDs: { "subtask:old": true },
-        totalExecuted: 1,
-        updatedAt: "2026-04-30T10:00:00.000Z",
-      }),
-      "utf8",
-    );
-
-    const loaded = await loadState(harness.statePath);
-
-    expect(loaded.totalExecuted).toBe(0);
-    expect(loaded.countedChildIDs.ses_child).toBeUndefined();
-    expect(loaded.countedChildIDs["subtask:old"]).toBeUndefined();
-  });
-
-  it("drops historical subtask proxy counts even when target ids were persisted", async () => {
-    const harness = await createRuntimeHarness();
-    await writeFile(
-      harness.statePath,
-      JSON.stringify({
-        children: {
-          "subtask:old": child({
-            id: "subtask:old",
-            source: "subtask",
-            targetSessionID: "ses_child",
-          }),
-        },
-        countedChildIDs: { "subtask:old": true, ses_child: true },
-        totalExecuted: 2,
-        updatedAt: "2026-04-30T10:00:00.000Z",
-      }),
-      "utf8",
-    );
-
-    const loaded = await loadState(harness.statePath);
-
-    expect(loaded.totalExecuted).toBe(0);
-    expect(loaded.countedChildIDs.ses_child).toBeUndefined();
-    expect(loaded.countedChildIDs["subtask:old"]).toBeUndefined();
-  });
-
-  it("sanitizes and retains model metadata through persistence", async () => {
-    const harness = await createRuntimeHarness();
-    const state = createEmptyState();
-    state.children.ses_child = child({
-      model: { providerID: " openai ", modelID: " gpt-5.6 ", variant: " high " },
-    });
-
-    await saveState(harness.statePath, state);
-    const loaded = await loadState(harness.statePath);
-
-    expect(loaded.children.ses_child.model).toEqual({
-      providerID: "openai",
-      modelID: "gpt-5.6",
-      variant: "high",
-    });
   });
 });

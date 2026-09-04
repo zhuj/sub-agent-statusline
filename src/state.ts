@@ -1,7 +1,3 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
-import os from "node:os";
 import {
   classifySubagentWorkItem,
   correlateSubagentWorkItems,
@@ -409,31 +405,6 @@ export function refreshDerivedFields(
   }
 }
 
-const STATUS_DIRNAME = "opencode-subagent-statusline";
-const STATUS_FILENAME = "state.json";
-const STATUS_DIR_MODE = 0o700;
-const STATUS_FILE_MODE = 0o600;
-
-function sanitizeInstanceName(input: string): string {
-  return input.replace(/[^A-Za-z0-9._-]/g, "_");
-}
-
-function resolveDefaultInstanceName(): string {
-  const fromEnv = process.env.OPENCODE_SUBAGENT_STATUSLINE_INSTANCE;
-  if (typeof fromEnv === "string" && fromEnv.trim().length > 0) {
-    const safe = sanitizeInstanceName(fromEnv);
-    if (safe.length > 0) {
-      return safe;
-    }
-  }
-
-  return `pid-${process.pid}`;
-}
-
-export function shouldPreserveStateOnStartup(): boolean {
-  return process.env.OPENCODE_SUBAGENT_STATUSLINE_PRESERVE_STATE === "1";
-}
-
 export function createEmptyState(): StatuslineState {
   return {
     children: {},
@@ -441,120 +412,6 @@ export function createEmptyState(): StatuslineState {
     totalExecuted: 0,
     updatedAt: new Date().toISOString(),
   };
-}
-
-export function resolveStatePath(): string {
-  const fromEnv = process.env.OPENCODE_SUBAGENT_STATUSLINE_STATE;
-  if (typeof fromEnv === "string" && fromEnv.trim().length > 0) {
-    return fromEnv;
-  }
-
-  const runtimeDir = process.env.XDG_RUNTIME_DIR ?? os.tmpdir();
-  const instance = resolveDefaultInstanceName();
-  return join(runtimeDir, STATUS_DIRNAME, instance, STATUS_FILENAME);
-}
-
-export function resolveTextPath(statePath: string): string {
-  return join(dirname(statePath), "status.txt");
-}
-
-export async function loadState(statePath: string): Promise<StatuslineState> {
-  try {
-    const raw = await readFile(statePath, "utf8");
-    const parsed = JSON.parse(raw) as Partial<StatuslineState>;
-    if (!parsed || typeof parsed !== "object") {
-      return createEmptyState();
-    }
-
-    const children =
-      parsed.children && typeof parsed.children === "object"
-        ? parsed.children
-        : {};
-    const countedChildIDs = sanitizeCountedChildIDs(parsed.countedChildIDs);
-
-    const state: StatuslineState = {
-      children: children as Record<string, ChildSessionState>,
-      countedChildIDs,
-      totalExecuted: Math.max(
-        toNonNegativeInteger(parsed.totalExecuted) ?? 0,
-        Object.keys(countedChildIDs).length,
-      ),
-      updatedAt:
-        typeof parsed.updatedAt === "string"
-          ? parsed.updatedAt
-          : new Date().toISOString(),
-    };
-
-    for (const [id, child] of Object.entries(children)) {
-      const candidate = child as Partial<ChildSessionState>;
-      if (
-        typeof candidate.title !== "string" ||
-        typeof candidate.parentID !== "string"
-      ) {
-        continue;
-      }
-      const targetSessionID = sanitizeTargetSessionID(
-        candidate.targetSessionID,
-        id.startsWith("ses_") ? id : undefined,
-      );
-      const countIdentity = resolveExecutionCountIdentity({
-        id,
-        title: candidate.title,
-        parentID: candidate.parentID,
-        messageID: candidate.messageID,
-        source: candidate.source,
-        targetSessionID,
-      });
-      if (countIdentity) {
-        state.countedChildIDs[countIdentity] = true;
-      }
-    }
-
-    reconcileCountedExecutionsWithChildren(state);
-    refreshDerivedFields(state);
-    return state;
-  } catch {
-    return createEmptyState();
-  }
-}
-
-async function writeLocalStatusFile(
-  path: string,
-  contents: string,
-): Promise<void> {
-  const directory = dirname(path);
-  await mkdir(directory, { recursive: true, mode: STATUS_DIR_MODE });
-
-  const tempPath = join(
-    directory,
-    `.${basename(path)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`,
-  );
-
-  try {
-    await writeFile(tempPath, contents, {
-      encoding: "utf8",
-      mode: STATUS_FILE_MODE,
-    });
-    await rename(tempPath, path);
-  } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => undefined);
-    throw error;
-  }
-}
-
-export async function saveStatusText(
-  textPath: string,
-  contents: string,
-): Promise<void> {
-  await writeLocalStatusFile(textPath, contents);
-}
-
-export async function saveState(
-  statePath: string,
-  state: StatuslineState,
-): Promise<void> {
-  refreshDerivedFields(state);
-  await writeLocalStatusFile(statePath, JSON.stringify(state, null, 2));
 }
 
 export function upsertRunningChild(
