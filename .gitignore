@@ -11,3 +11,9 @@ coverage/
 *.tmp
 .DS_Store
 security-audit/
+
+.idea
+.codegraph
+.local
+.tmp
+dist
