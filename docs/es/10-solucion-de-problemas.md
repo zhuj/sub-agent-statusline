@@ -333,11 +333,9 @@ Para investigar eventos reales:
 OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS=1 opencode
 ```
 
-El log se escribe como JSONL bajo runtime/tmp, por ejemplo:
-
-```txt
-$XDG_RUNTIME_DIR/opencode-subagent-statusline/tui-events.log
-```
+El log se captura a través de la API de plugin de OpenCode cuando está
+seteado `OPENCODE_SUBAGENT_STATUSLINE_DEBUG_EVENTS=1`. Es observacional y no
+afecta la TUI renderizada; el plugin no escribe ningún archivo.
 
 Precaución: puede crecer rápido y contener datos de sesiones.
 
@@ -369,4 +367,4 @@ Cuando algo falla, seguí este orden:
 | `src/reconcile.ts`                     | Si un `running` viejo no se cierra.            |
 | `src/tui.tsx`                          | Si falla UI, hydration o navegación.           |
 | `src/tui-commands.ts`                  | Si fallan comandos o `Alt+B`.                  |
-| `test/helpers/runtime-harness.ts`      | Si fallan tests de filesystem/env.             |
+| `test/helpers/runtime-harness.ts`      | Si fallan tests de fixtures estáticos o fake time. |
