@@ -21,7 +21,7 @@ refreshDerivedFields(state)
   ↓
 collapseSubagentWorkItems(state.children)
   ↓
-Sidebar / home footer / status.txt
+Sidebar / home footer
 ```
 
 ## Events the plugin listens to
@@ -346,7 +346,7 @@ Reconcile counters if needed
   ↓
 Render visible rows
   ↓
-Show in TUI or status.txt
+Show in TUI
 ```
 
 ## Related files

@@ -46,7 +46,8 @@ Subagentes
 
 The sidebar shows subagents related to the current OpenCode session.
 
-It does not fall back to other sessions. The home summary, text statusline, and `status.txt` remain global across sessions.
+It does not fall back to other sessions. The home summary and rendered
+sidebar are scoped to the current session.
 
 ## Visual statuses
 
@@ -146,7 +147,8 @@ Preferences are stored through OpenCode `api.kv`:
 | `subagents.sidebar.expanded` | Remembers whether the section is expanded. |
 | `subagents.sidebar.enabled` | Remembers whether the section is enabled. |
 
-These preferences belong to the TUI environment, not the runtime plugin's `state.json`.
+These preferences belong to the TUI environment, not the plugin's in-memory
+state.
 
 Completed history is bounded by state retention: terminal rows are retained for
 up to 3 days with a 1,500-row cap. Rows already pruned from state are not
