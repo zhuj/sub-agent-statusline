@@ -9,6 +9,7 @@ import {
   markChildrenStatusByAnyID,
   pruneTerminalChildren,
   refreshDerivedFields,
+  setChildModel,
   upsertChildDetails,
   upsertRunningChild,
   type ChildSessionState,
@@ -31,6 +32,108 @@ function child(overrides: Partial<ChildSessionState> = {}): ChildSessionState {
 }
 
 describe("state", () => {
+  it("counts new executions without scanning previously counted identities", () => {
+    const state = createEmptyState();
+    state.totalExecuted = 1;
+    Object.defineProperty(state.countedChildIDs, "ses_previous", {
+      enumerable: true,
+      get() { throw new Error("unrelated execution identity was read"); },
+    });
+    const input = { id: "ses_new", parentID: "ses_root", title: "New child" };
+    upsertRunningChild(state, input);
+    expect(state.totalExecuted).toBe(2);
+    expect(state.countedChildIDs.ses_new).toBe(true);
+    upsertRunningChild(state, input);
+    expect(state.totalExecuted).toBe(2);
+  });
+
+  it("completes indexed aliases without scanning unrelated rows", () => {
+    const state = createEmptyState();
+    state.children.ses_real = child({ id: "ses_real", targetSessionID: "ses_real" });
+    state.children.alias = child({ id: "alias", targetSessionID: "ses_real" });
+    Object.defineProperty(state.children, "unrelated", {
+      enumerable: true,
+      get() { throw new Error("unrelated row read"); },
+    });
+    expect(markChildStatus(state, "ses_real", "done", undefined,
+      ["ses_real", "alias", "missing"])).toBe(true);
+    expect(state.children.ses_real?.status).toBe("done");
+    expect(state.children.alias?.status).toBe("done");
+  });
+
+  it("updates indexed session aliases without reading unrelated rows", () => {
+    const state = createEmptyState();
+    state.children.ses_real = child({ id: "ses_real", targetSessionID: "ses_real" });
+    state.children.alias = child({ id: "alias", targetSessionID: "ses_real" });
+    Object.defineProperty(state.children, "unrelated", {
+      enumerable: true,
+      get() { throw new Error("unrelated row read"); },
+    });
+    const model = { providerID: "openai", modelID: "test-model" };
+    expect(setChildModel(state, "ses_real", model, undefined,
+      ["ses_real", "alias", "missing"])).toBe(true);
+    expect(state.children.ses_real?.model).toEqual(model);
+    expect(state.children.alias?.model).toEqual(model);
+  });
+
+  it("preserves old ancestors until their active leaf completes", () => {
+    const state = createEmptyState();
+    for (const item of [
+      child({ id: "ses_parent", parentID: "ses_root", status: "done" }),
+      child({ id: "ses_middle", parentID: "ses_parent", status: "done" }),
+      child({ id: "ses_leaf", parentID: "ses_middle", status: "running" }),
+      child({ id: "ses_old", parentID: "ses_root", status: "done" }),
+    ]) state.children[item.id] = item;
+
+    const now = new Date("2030-01-01T00:00:00Z");
+    expect(pruneTerminalChildren(state, now)).toBe(1);
+    expect(Object.keys(state.children).sort()).toEqual([
+      "ses_leaf", "ses_middle", "ses_parent",
+    ]);
+    state.children.ses_leaf = child({
+      id: "ses_leaf", parentID: "ses_middle", status: "done",
+    });
+    expect(pruneTerminalChildren(state, now)).toBe(3);
+    expect(Object.keys(state.children)).toEqual([]);
+  });
+
+  it("preserves active ancestors beyond the terminal retention cap", () => {
+    const state = createEmptyState();
+    const recent = "2026-04-30T10:00:00.000Z";
+    const olderRecent = "2026-04-29T10:00:00.000Z";
+    for (const item of [
+      child({ id: "ses_root", parentID: "ses_missing", status: "done", endedAt: recent }),
+      child({ id: "ses_parent", parentID: "ses_root", status: "done", endedAt: recent }),
+      child({ id: "ses_leaf", parentID: "ses_parent", status: "running" }),
+    ]) state.children[item.id] = item;
+    for (let index = 0; index < 1_500; index += 1) {
+      const id = `ses_unrelated_${String(index).padStart(4, "0")}`;
+      state.children[id] = child({ id, parentID: "ses_other", status: "done", endedAt: recent });
+    }
+    state.children.ses_unrelated_excess = child({
+      id: "ses_unrelated_excess", parentID: "ses_other", status: "done", endedAt: olderRecent,
+    });
+    expect(pruneTerminalChildren(state, new Date("2026-04-30T10:00:01.000Z"))).toBe(1);
+    expect(state.children.ses_root).toBeDefined();
+    expect(state.children.ses_parent).toBeDefined();
+    expect(state.children.ses_leaf).toBeDefined();
+    expect(state.children.ses_unrelated_excess).toBeUndefined();
+    expect(Object.keys(state.children).filter((id) => id.startsWith("ses_unrelated_"))).toHaveLength(1_500);
+  });
+
+  it("terminates on cyclic ancestry while preserving reachable ancestors", () => {
+    const state = createEmptyState();
+    const old = "2026-04-26T08:00:00.000Z";
+    for (const item of [
+      child({ id: "ses_parent", parentID: "ses_middle", status: "done", endedAt: old }),
+      child({ id: "ses_middle", parentID: "ses_parent", status: "done", endedAt: old }),
+      child({ id: "ses_leaf", parentID: "ses_middle", status: "running" }),
+      child({ id: "ses_unrelated", parentID: "ses_other", status: "done", endedAt: old }),
+    ]) state.children[item.id] = item;
+    expect(pruneTerminalChildren(state, new Date("2026-04-30T10:00:01.000Z"))).toBe(1);
+    expect(Object.keys(state.children).sort()).toEqual(["ses_leaf", "ses_middle", "ses_parent"]);
+  });
+
   it("upserts tool wrappers without counting them and marks terminal statuses", () => {
     useFrozenTime("2026-04-30T10:05:00.000Z");
     const state = createEmptyState();

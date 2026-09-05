@@ -6,6 +6,7 @@ export type SyntheticTargetKey = {
 };
 
 export interface EventChildIndex {
+  matchingIDs(sessionID: string): readonly string[];
   upsert(child: ChildSessionState): void;
   remove(id: string): void;
   resolveSyntheticTarget(
@@ -46,6 +47,7 @@ export function createEventChildIndex(
   children: readonly ChildSessionState[],
 ): EventChildIndex {
   const byID = new Map<string, ChildSessionState>();
+  const aliasesByTarget = new Map<string, IDSet>();
   const runningSubtasksByParent = new Map<string, IDSet>();
   const targetlessByParent = new Map<string, IDSet>();
   const realSiblingsByParent = new Map<string, IDSet>();
@@ -77,6 +79,7 @@ export function createEventChildIndex(
   };
 
   const removeMemberships = (child: ChildSessionState): void => {
+    if (child.targetSessionID) removeFromBucket(aliasesByTarget, child.targetSessionID, child.id);
     if (isRunningSubtask(child)) {
       removeFromBucket(runningSubtasksByParent, child.parentID, child.id);
     }
@@ -101,6 +104,7 @@ export function createEventChildIndex(
   };
 
   const addMemberships = (child: ChildSessionState): void => {
+    if (child.targetSessionID) addToBucket(aliasesByTarget, child.targetSessionID, child.id);
     if (isRunningSubtask(child)) {
       addToBucket(runningSubtasksByParent, child.parentID, child.id);
     }
@@ -152,6 +156,9 @@ export function createEventChildIndex(
   for (const child of children) upsert(child);
 
   return {
+    matchingIDs(sessionID) {
+      return [...new Set([sessionID, ...(aliasesByTarget.get(sessionID) ?? [])])];
+    },
     upsert,
     remove,
     resolveSyntheticTarget(synthetic, explicitCandidates) {

@@ -16,6 +16,21 @@ function row(overrides: Partial<ChildSessionState>): ChildSessionState {
 }
 
 describe("event child index", () => {
+  it("tracks alias IDs through resolution, retargeting, and removal", () => {
+    const index = createEventChildIndex([
+      row({ id: "ses_a", targetSessionID: "ses_a" }),
+      row({ id: "tool:alias", source: "tool" }),
+    ]);
+    expect(index.matchingIDs("ses_a")).toEqual(["ses_a"]);
+    index.upsert(row({ id: "tool:alias", targetSessionID: "ses_a" }));
+    expect(index.matchingIDs("ses_a")).toEqual(["ses_a", "tool:alias"]);
+    index.upsert(row({ id: "tool:alias", targetSessionID: "ses_b" }));
+    expect(index.matchingIDs("ses_a")).toEqual(["ses_a"]);
+    expect(index.matchingIDs("ses_b")).toEqual(["ses_b", "tool:alias"]);
+    index.remove("tool:alias");
+    expect(index.matchingIDs("ses_b")).toEqual(["ses_b"]);
+  });
+
   it("updates same-event lookups and rejects ambiguous weak evidence", () => {
     const first = row({
       id: "ses_a",

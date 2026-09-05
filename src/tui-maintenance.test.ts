@@ -74,11 +74,11 @@ describe("TUI maintenance timers", () => {
     });
 
     timers.syncElapsedTimer(true);
-    vi.advanceTimersByTime(2_000);
+    vi.advanceTimersByTime(20_000);
     expect(elapsed).toHaveBeenCalledTimes(2);
 
     timers.syncElapsedTimer(false);
-    vi.advanceTimersByTime(2_000);
+    vi.advanceTimersByTime(20_000);
     expect(elapsed).toHaveBeenCalledTimes(2);
     timers.dispose();
   });
@@ -107,7 +107,7 @@ describe("TUI maintenance timers", () => {
     });
 
     timers.syncElapsedTimer(false);
-    vi.advanceTimersByTime(1_999);
+    vi.advanceTimersByTime(9_999);
 
     expect(reconcile).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);

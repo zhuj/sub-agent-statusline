@@ -14,6 +14,8 @@ import tuiPlugin, {
   preservedSidebarScrollTop,
   resolveSidebarSubagentSnapshot,
   probeRunningEvidence,
+  resumeKnownBusySessions,
+  discoverCachedBusyDescendants,
   resolveTuiSubagentSnapshot,
   rowWidthBudget,
   subagentRowHeight,
@@ -60,6 +62,163 @@ function stateWith(
     updatedAt: "2026-04-30T10:20:00.000Z",
   };
 }
+
+it.each(["busy", "retry"])("recovers known terminal sessions from %s polling evidence", (type) => {
+  const current = stateWith([
+    child({ id: "ses_parent", parentID: "ses_root", status: "done" }),
+    child({ id: "ses_leaf", parentID: "ses_parent", status: "done", tokens: { total: 42 } }),
+    child({ id: "tool:history", targetSessionID: "ses_leaf", status: "done" }),
+  ]);
+  const snapshot = { ...current, children: { ...current.children } };
+  expect(resumeKnownBusySessions(current, snapshot, {
+    ses_leaf: { type }, ses_unknown: { type }, "tool:history": { type },
+  })).toBe(true);
+  expect(current.children.ses_leaf).toMatchObject({ status: "running", tokens: { total: 42 } });
+  expect(current.children.ses_parent?.status).toBe("done");
+  expect(current.children["tool:history"]?.status).toBe("done");
+  expect(current.children.ses_unknown).toBeUndefined();
+  expect(current.totalExecuted).toBe(snapshot.totalExecuted);
+});
+
+it("rejects recovery based on an obsolete terminal revision", () => {
+  const snapshot = stateWith([child({ id: "ses_leaf", status: "done" })]);
+  const current = stateWith([child({
+    id: "ses_leaf", status: "done", updatedAt: "2026-04-30T11:00:00.000Z",
+  })]);
+  expect(resumeKnownBusySessions(current, snapshot, { ses_leaf: { type: "busy" } })).toBe(false);
+  expect(current.children.ses_leaf?.status).toBe("done");
+});
+
+it("recovers absent terminal ancestors without reading unrelated completed metadata", () => {
+  const state = stateWith([]);
+  const metadata: Record<string, unknown> = {
+    ses_leaf: { id: "ses_leaf", parentID: "ses_parent", title: "Leaf" },
+    ses_sibling: { id: "ses_sibling", parentID: "ses_parent", title: "Sibling" },
+    ses_parent: { id: "ses_parent", parentID: "ses_grandparent", title: "Parent" },
+    ses_grandparent: { id: "ses_grandparent", parentID: "ses_root", title: "Grandparent" },
+  };
+  const readSession = vi.fn((id: string) => metadata[id]);
+  const statuses = {
+    ses_leaf: { type: "busy" }, ses_sibling: { type: "retry" },
+    ses_parent: { type: "idle" }, ses_grandparent: { type: "idle" },
+    ses_unrelated: { type: "idle" },
+  };
+  expect(discoverCachedBusyDescendants(state, "ses_root", statuses, readSession)).toBe(true);
+  expect(state.children.ses_parent?.status).toBe("done");
+  expect(state.children.ses_grandparent?.status).toBe("done");
+  expect(state.children.ses_leaf?.status).toBe("running");
+  expect(state.children.ses_sibling?.status).toBe("running");
+  expect(readSession).toHaveBeenCalledTimes(4);
+  expect(readSession).not.toHaveBeenCalledWith("ses_unrelated");
+  const snapshot = resolveTuiSubagentSnapshot({ state, sessionID: "ses_root" });
+  expect(snapshot.visibleChildren.map((item) => item.id)).toEqual(expect.arrayContaining(["ses_leaf", "ses_sibling"]));
+  readSession.mockClear();
+  expect(discoverCachedBusyDescendants(state, "ses_root", statuses, readSession)).toBe(false);
+  expect(readSession).not.toHaveBeenCalled();
+});
+
+it("recovers missing completed ancestors without scanning unrelated terminal metadata", () => {
+  const state = stateWith([]);
+  const metadata: Record<string, unknown> = {
+    ses_leaf: { id: "ses_leaf", parentID: "ses_parent", title: "Leaf" },
+    ses_sibling: { id: "ses_sibling", parentID: "ses_parent", title: "Sibling" },
+    ses_parent: { id: "ses_parent", parentID: "ses_grandparent", title: "Parent" },
+    ses_grandparent: { id: "ses_grandparent", parentID: "ses_root", title: "Grandparent" },
+  };
+  const statuses = {
+    ses_leaf: { type: "busy" }, ses_sibling: { type: "retry" },
+    ses_parent: { type: "idle" }, ses_grandparent: { type: "error" },
+    ses_unrelated: { type: "idle" },
+  };
+  const readSession = vi.fn((id: string) => metadata[id]);
+  expect(discoverCachedBusyDescendants(state, "ses_root", statuses, readSession)).toBe(true);
+  expect(Object.keys(state.children)).toEqual(["ses_grandparent", "ses_parent", "ses_leaf", "ses_sibling"]);
+  expect(state.children.ses_grandparent?.status).toBe("error");
+  expect(state.children.ses_parent?.status).toBe("done");
+  expect(state.children.ses_leaf?.status).toBe("running");
+  expect(state.children.ses_sibling?.status).toBe("running");
+  expect(readSession).toHaveBeenCalledTimes(4);
+  readSession.mockClear();
+  expect(discoverCachedBusyDescendants(state, "ses_root", statuses, readSession)).toBe(false);
+  expect(readSession).not.toHaveBeenCalled();
+});
+
+it("does not guess an unknown ancestor's status", () => {
+  const state = stateWith([]);
+  const readSession = vi.fn((id: string) => ({ id, parentID: "ses_unknown" }));
+  expect(discoverCachedBusyDescendants(state, "ses_root", { ses_leaf: { type: "busy" } }, readSession)).toBe(false);
+  expect(readSession).toHaveBeenCalledExactlyOnceWith("ses_leaf");
+  expect(Object.keys(state.children)).toEqual([]);
+});
+
+it("discovers cached active descendants below completed parents in ancestry order", () => {
+  const state = stateWith([child({ id: "ses_parent", parentID: "ses_root", status: "done" })]);
+  const metadata: Record<string, unknown> = {
+    ses_leaf: { id: "ses_leaf", parentID: "ses_parent", title: "Leaf" },
+    ses_nested: { id: "ses_nested", parentID: "ses_leaf", title: "Nested" },
+    ses_unrelated: { id: "ses_unrelated", parentID: "ses_other_root", title: "Other" },
+  };
+  const readSession = vi.fn((id: string) => metadata[id]);
+  const statuses = {
+    ses_nested: { type: "retry" }, ses_leaf: { type: "busy" },
+    ses_unrelated: { type: "busy" }, ses_missing: { type: "busy" },
+    ses_idle: { type: "idle" }, ses_root: { type: "busy" },
+  };
+  expect(discoverCachedBusyDescendants(state, "ses_root", statuses, readSession)).toBe(true);
+  expect(state.children.ses_leaf?.status).toBe("running");
+  expect(state.children.ses_nested?.parentID).toBe("ses_leaf");
+  expect(state.children.ses_parent?.status).toBe("done");
+  expect(state.children.ses_unrelated).toBeUndefined();
+  expect(state.children.ses_missing).toBeUndefined();
+  expect(readSession).toHaveBeenCalledTimes(4);
+});
+
+it("caps cached discovery at 32 new rows and continues next cycle", () => {
+  const state = stateWith([]);
+  const statuses = Object.fromEntries(Array.from({ length: 40 }, (_, index) =>
+    [`ses_new_${index}`, { type: "busy" }],
+  ));
+  const readSession = vi.fn((id: string) => ({ id, parentID: "ses_root", title: "New" }));
+  expect(discoverCachedBusyDescendants(state, "ses_root", statuses, readSession)).toBe(true);
+  expect(Object.keys(state.children)).toHaveLength(32);
+  readSession.mockClear();
+  expect(discoverCachedBusyDescendants(state, "ses_root", statuses, readSession)).toBe(true);
+  expect(Object.keys(state.children)).toHaveLength(40);
+  expect(readSession).toHaveBeenCalledTimes(8);
+});
+
+it("discovers ten leaves among 190 completed ancestors without rereading their metadata", () => {
+  const state = stateWith(Array.from({ length: 190 }, (_, index) => child({
+    id: `ses_saved_${index}`,
+    parentID: index % 4 === 0 ? "ses_root" : `ses_saved_${index - 1}`,
+    status: "done",
+  })));
+  const metadata = new Map(Array.from({ length: 10 }, (_, index) => {
+    const id = `ses_new_${index}`;
+    return [id, { id, parentID: `ses_saved_${index * 4 + 3}`, title: "Active leaf" }];
+  }));
+  const statuses = Object.fromEntries([...metadata.keys()].map((id) => [id, { type: "busy" }]));
+  const readSession = vi.fn((id: string) => metadata.get(id));
+  expect(discoverCachedBusyDescendants(state, "ses_root", statuses, readSession)).toBe(true);
+  expect(readSession).toHaveBeenCalledTimes(10);
+  expect(Object.keys(state.children)).toHaveLength(200);
+  expect(Object.values(state.children).filter((item) => item.status === "running")).toHaveLength(10);
+  readSession.mockClear();
+  expect(discoverCachedBusyDescendants(state, "ses_root", statuses, readSession)).toBe(false);
+  expect(readSession).not.toHaveBeenCalled();
+});
+
+it("does not attach cycles or mismatched cached metadata to the current root", () => {
+  const state = stateWith([]);
+  const metadata: Record<string, unknown> = {
+    ses_a: { id: "ses_a", parentID: "ses_b" },
+    ses_b: { id: "ses_b", parentID: "ses_a" },
+    ses_bad: { id: "ses_different", parentID: "ses_root" },
+  };
+  const statuses = Object.fromEntries(Object.keys(metadata).map((id) => [id, { type: "busy" }]));
+  expect(discoverCachedBusyDescendants(state, "ses_root", statuses, (id) => metadata[id])).toBe(false);
+  expect(Object.keys(state.children)).toEqual([]);
+});
 
 type HydrateStateInput = {
   children: unknown[];
@@ -1198,6 +1357,97 @@ describe("TUI subagent snapshots", () => {
 });
 
 describe("hydratePreviousSubagents", () => {
+  it.each([
+    { phase: "before", expectedCalls: 0 },
+    { phase: "tree", expectedCalls: 1 },
+    { phase: "messages", expectedCalls: 9 },
+    { phase: "publication", expectedCalls: 201 },
+  ])("stops startup hydration after $phase cancellation", async ({ phase, expectedCalls }) => {
+    let active = phase !== "before";
+    const sessions = Array.from({ length: 200 }, (_, index) => ({
+      id: `ses_cancel_${index}`, parentID: "ses_root", title: "Child",
+    }));
+    const messages = vi.fn(async ({ sessionID }: { sessionID: string }) => {
+      if (phase === "messages" && sessionID !== "ses_root") active = false;
+      if (phase === "publication" && sessionID === "ses_cancel_199") active = false;
+      return { data: [] };
+    });
+    const children = vi.fn(async ({ sessionID }: { sessionID: string }) => {
+      if (phase === "tree") active = false;
+      return { data: sessionID === "ses_root" ? sessions : [] };
+    });
+    const api = {
+      state: { path: { directory: "/repo" } },
+      client: { session: {
+        children, messages,
+        status: vi.fn(async () => ({ data: Object.fromEntries(
+          sessions.map((session) => [session.id, { type: "busy" }]),
+        ) })),
+      } },
+    } as unknown as TuiPluginApi;
+    let current = stateWith([]);
+    const publish = vi.fn((update: (state: StatuslineState) => StatuslineState) => {
+      current = update(current);
+    });
+    expect(await hydratePreviousSubagents(api, "ses_root", publish, () => active)).toBe(false);
+    expect(publish).not.toHaveBeenCalled();
+    expect(messages).toHaveBeenCalledTimes(expectedCalls);
+    if (phase === "tree") expect(children).toHaveBeenCalledOnce();
+    if (phase === "before") expect(children).not.toHaveBeenCalled();
+    expect(Object.keys(current.children)).toEqual([]);
+  });
+
+  it("prioritizes ten active histories while bounding 200 startup requests to eight", async () => {
+    const sessions = Array.from({ length: 200 }, (_, index) => ({
+      id: `ses_startup_${index}`, parentID: "ses_root", title: "Child",
+    }));
+    let inFlight = 0;
+    let peak = 0;
+    let metadataInFlight = 0;
+    let metadataPeak = 0;
+    const children = vi.fn(async ({ sessionID }: { sessionID: string }) => {
+      metadataInFlight += 1;
+      metadataPeak = Math.max(metadataPeak, metadataInFlight);
+      await Promise.resolve();
+      metadataInFlight -= 1;
+      return { data: sessionID === "ses_root" ? sessions : [] };
+    });
+    const requestedIDs: string[] = [];
+    const messages = vi.fn(async ({ sessionID }: { sessionID: string }) => {
+      requestedIDs.push(sessionID);
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await Promise.resolve();
+      inFlight -= 1;
+      return { data: [] };
+    });
+    const api = {
+      state: { path: { directory: "/repo" } },
+      client: { session: {
+        children,
+        messages,
+        status: vi.fn(async () => ({ data: Object.fromEntries(
+          sessions.map((session, index) => [session.id, { type: index >= 190 ? "busy" : "idle" }]),
+        ) })),
+      } },
+    } as unknown as TuiPluginApi;
+    let current = stateWith([]);
+    expect(await hydratePreviousSubagents(api, "ses_root", (update) => {
+      current = update(current);
+    })).toBe(true);
+    expect(messages).toHaveBeenCalledTimes(201);
+    expect(requestedIDs).toEqual([
+      "ses_root",
+      ...sessions.slice(190).map((session) => session.id),
+      ...sessions.slice(0, 190).map((session) => session.id),
+    ]);
+    expect(peak).toBeLessThanOrEqual(8);
+    expect(metadataPeak).toBe(8);
+    expect(children).toHaveBeenCalledTimes(201);
+    expect(Object.keys(current.children)).toHaveLength(200);
+    expect(Object.values(current.children).filter((item) => item.status === "running")).toHaveLength(10);
+  });
+
   const hydratedChild = {
     id: "ses_child",
     parentID: "ses_parent",
@@ -1785,7 +2035,62 @@ describe("probeRunningEvidence", () => {
 });
 
 describe("persisted parent-message reconciliation", () => {
-  it("fetches and analyzes one parent response for sibling candidates", async () => {
+  it("discovers a cached busy child through polling without remote histories", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-30T12:30:00Z"));
+    let dispose: (() => void) | undefined;
+    const handlers = new Map<string, (event: unknown) => void>();
+    const api = {
+      state: {
+        path: { directory: "/repo" }, provider: [],
+        session: {
+          get: vi.fn((id: string) => id === "ses_new" ? { id, parentID: "ses_parent", title: "New child" } : undefined),
+          status: vi.fn(() => ({ type: "busy" })),
+          messages: vi.fn((_sessionID: string) => []),
+        },
+        part: vi.fn(() => []),
+      },
+      route: { current: { name: "session", params: { sessionID: "ses_root" } } },
+      kv: { get<Value>(_key: string, fallback: Value): Value { return fallback; }, set: vi.fn() },
+      client: { session: {
+        children: vi.fn(async () => ({ data: [] })),
+        messages: vi.fn(async () => ({ data: [] })),
+        status: vi.fn(async () => ({ data: { ses_new: { type: "busy" } } })),
+      } },
+      event: { on: vi.fn((name: string, handler: (event: unknown) => void) => {
+        handlers.set(name, handler); return vi.fn();
+      }) },
+      lifecycle: { onDispose: vi.fn((callback: () => void) => { dispose = callback; }) },
+      slots: { register: vi.fn() },
+      ui: { dialog: { clear: vi.fn() }, toast: vi.fn(), Prompt: vi.fn(), Slot: vi.fn() },
+    };
+    try {
+      await tuiPlugin.tui(api as never, undefined, {} as never);
+      await vi.advanceTimersByTimeAsync(0);
+      const statusBaseline = api.client.session.status.mock.calls.length;
+      const historiesBaseline = api.client.session.messages.mock.calls.length;
+      handlers.get("session.created")?.({ type: "session.created", properties: {
+        info: { id: "ses_parent", parentID: "ses_root", title: "Parent" },
+      } });
+      handlers.get("session.idle")?.({ type: "session.idle", properties: { sessionID: "ses_parent" } });
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(api.state.session.get).toHaveBeenCalledExactlyOnceWith("ses_new");
+      expect(api.client.session.status).toHaveBeenCalledTimes(statusBaseline + 1);
+      api.state.session.messages.mockClear();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(api.client.session.status).toHaveBeenCalledTimes(statusBaseline + 2);
+      expect(api.state.session.messages).toHaveBeenCalledWith("ses_new");
+      expect(api.state.session.messages).not.toHaveBeenCalledWith("ses_parent");
+      expect(api.state.session.get).toHaveBeenCalledExactlyOnceWith("ses_new");
+      expect(api.client.session.messages).toHaveBeenCalledTimes(historiesBaseline);
+    } finally {
+      dispose?.();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["queued-event", "dispose"])("shares parent analysis and rejects late recovery after %s", async (interruption) => {
     vi.useFakeTimers();
     vi.setSystemTime("2026-04-30T12:30:00.000Z");
     let dispose: (() => void) | undefined;
@@ -1847,9 +2152,9 @@ describe("persisted parent-message reconciliation", () => {
           provider: [],
           session: {
             status: vi.fn(),
-            messages: vi.fn(),
+            messages: vi.fn(() => []),
           },
-          part: vi.fn(),
+          part: vi.fn(() => []),
         },
         route: { current: { name: "home", params: {} } },
         kv: {
@@ -1887,6 +2192,7 @@ describe("persisted parent-message reconciliation", () => {
       await tuiPlugin.tui(api as never, undefined, {} as never);
       const applyPart = handlers.get("message.part.updated");
       expect(applyPart).toBeTypeOf("function");
+      let descriptionsRead = 0;
       applyPart?.({
         type: "message.part.updated",
         properties: {
@@ -1901,7 +2207,7 @@ describe("persisted parent-message reconciliation", () => {
             type: "subtask",
             sessionID: "ses_parent",
             messageID: "msg_a",
-            description: "A task",
+            get description() { descriptionsRead += 1; return "A task"; },
           },
         },
       });
@@ -1924,10 +2230,60 @@ describe("persisted parent-message reconciliation", () => {
         },
       });
 
-      await vi.advanceTimersByTimeAsync(2_500);
+      expect(descriptionsRead).toBe(0);
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(descriptionsRead).toBe(0);
+      expect(messages).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(501);
+      expect(descriptionsRead).toBeGreaterThan(0);
 
       expect(messages).toHaveBeenCalledOnce();
       expect(analysisRuns).toBe(1);
+      const created = handlers.get("session.created");
+      for (let index = 0; index < 10; index += 1) {
+        created?.({ type: "session.created", properties: { info: {
+          id: `ses_poll_${index}`, parentID: "ses_parent", title: "Polling child",
+        } } });
+      }
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(api.client.session.status).toHaveBeenCalledOnce();
+      const idle = handlers.get("session.idle");
+      for (let index = 0; index < 10; index += 1) {
+        idle?.({ type: "session.idle", properties: { sessionID: `ses_poll_${index}` } });
+      }
+      api.client.session.status.mockResolvedValue({ data: { ses_poll_0: { type: "busy" } } });
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(api.client.session.status).toHaveBeenCalledTimes(2);
+      api.state.session.messages.mockClear();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(api.client.session.status).toHaveBeenCalledTimes(3);
+      expect(api.state.session.messages).toHaveBeenCalledWith("ses_poll_0");
+      expect(api.state.session.messages).not.toHaveBeenCalledWith("ses_poll_1");
+      let lateRecoveryReads = 0;
+      const lateStatus = { data: {
+        get ses_poll_1() { lateRecoveryReads += 1; return { type: "busy" }; },
+      } };
+      let releaseStatus: (response: typeof lateStatus) => void = () => {
+        throw new Error("status request did not start");
+      };
+      api.client.session.status.mockImplementationOnce(() => new Promise<typeof lateStatus>((resolve) => {
+        releaseStatus = resolve;
+      }));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(api.client.session.status).toHaveBeenCalledTimes(4);
+      if (interruption === "queued-event") {
+        idle?.({ type: "session.idle", properties: { sessionID: "ses_poll_1" } });
+      } else {
+        dispose?.();
+      }
+      releaseStatus(lateStatus);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lateRecoveryReads).toBe(0);
+      let disposedReads = 0;
+      applyPart?.({ get type() { disposedReads += 1; return "message.part.updated"; } });
+      dispose?.();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(disposedReads).toBe(0);
     } finally {
       dispose?.();
       vi.clearAllTimers();

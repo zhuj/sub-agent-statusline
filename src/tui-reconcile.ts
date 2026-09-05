@@ -24,6 +24,7 @@ export type SelectRunningReconcileCandidatesInput = {
   readonly currentSessionID?: string;
   readonly nowMs: number;
   readonly maxCandidates: number;
+  readonly excludedTargetIDs?: ReadonlySet<string>;
   readonly oldCandidateAgeMs: number;
 };
 
@@ -51,6 +52,33 @@ function isOldCandidate(
 function directTargetSessionID(child: ChildSessionState): string | undefined {
   if (child.targetSessionID?.startsWith("ses_")) return child.targetSessionID;
   return child.id.startsWith("ses_") ? child.id : undefined;
+}
+
+export function descendantIDsFromChildren(
+  children: readonly ChildSessionState[],
+  rootID: string | undefined,
+): ReadonlySet<string> {
+  const descendants = new Set<string>();
+  if (!rootID) return descendants;
+  const byParent = new Map<string, string[]>();
+  for (const child of children) {
+    const siblings = byParent.get(child.parentID);
+    if (siblings) siblings.push(child.id);
+    else byParent.set(child.parentID, [child.id]);
+  }
+  const visited = new Set([rootID]);
+  const pending = [rootID];
+  while (pending.length > 0) {
+    const parentID = pending.pop();
+    if (parentID === undefined) continue;
+    for (const id of byParent.get(parentID) ?? []) {
+      if (visited.has(id)) continue;
+      visited.add(id);
+      descendants.add(id);
+      pending.push(id);
+    }
+  }
+  return descendants;
 }
 
 function toCandidate(
@@ -89,6 +117,29 @@ function insertBoundedByPriority(
   if (selected.length > maxCandidates) selected.pop();
 }
 
+export function createRunningReconcileSelector() {
+  const visited = new Set<string>();
+  return (input: SelectRunningReconcileCandidatesInput): RunningReconcileCandidate[] => {
+    const present = new Set<string>();
+    for (const child of input.children) {
+      present.add(child.id);
+      if (child.targetSessionID !== undefined) present.add(child.targetSessionID);
+    }
+    for (const key of visited) {
+      if (!present.has(key)) visited.delete(key);
+    }
+    const excluded = new Set(input.excludedTargetIDs ?? []);
+    for (const key of visited) excluded.add(key);
+    let result = selectRunningReconcileCandidates({ ...input, excludedTargetIDs: excluded });
+    if (result.length === 0 && visited.size > 0) {
+      visited.clear();
+      result = selectRunningReconcileCandidates(input);
+    }
+    for (const candidate of result) visited.add(candidate.targetSessionID ?? candidate.childID);
+    return result;
+  };
+}
+
 export function selectRunningReconcileCandidates(
   input: SelectRunningReconcileCandidatesInput,
 ): RunningReconcileCandidate[] {
@@ -98,6 +149,8 @@ export function selectRunningReconcileCandidates(
     (child) => child.status === "running",
   );
   if (runningChildren.length === 0) return [];
+
+  const descendantIDs = descendantIDsFromChildren(input.children, input.currentSessionID);
 
   const projected = projectCorrelatedSubagentWorkItems(
     correlateSubagentWorkItems(runningChildren),
@@ -113,6 +166,7 @@ export function selectRunningReconcileCandidates(
     child: ChildSessionState,
   ): RunningReconcileCandidate | undefined => {
     const targetSessionID = resolveTarget(child);
+    if (input.excludedTargetIDs?.has(targetSessionID ?? child.id)) return undefined;
     const canProbePersistedSubtask =
       child.source === "subtask" &&
       !targetSessionID &&
@@ -129,7 +183,7 @@ export function selectRunningReconcileCandidates(
   for (const child of projected) {
     if (
       input.currentSessionID &&
-      child.parentID !== input.currentSessionID
+      !descendantIDs.has(child.id)
     ) {
       continue;
     }

@@ -295,6 +295,17 @@ function syncIndexForIDs(
   for (const id of ids) syncIndex(index, state, id);
 }
 
+function matchingIDsForTargets(
+  index: EventChildIndex,
+  targetIDs: readonly string[],
+): Set<string> {
+  const matchingIDs = new Set<string>();
+  for (const targetID of targetIDs) {
+    for (const id of index.matchingIDs(targetID)) matchingIDs.add(id);
+  }
+  return matchingIDs;
+}
+
 function extractPartTargetSessionCandidates(event: EventLike): string[] {
   const part = isRecord(event.properties?.part)
     ? event.properties.part
@@ -874,10 +885,16 @@ export function applySubagentEvent(
           "ended",
           "updated",
         ]);
+        const candidateIDs = matchingIDsForTargets(index, [child.id]);
         changed =
-          markChildStatus(state, child.id, sessionStatusFromUpdate, endedAt) ||
-          changed;
-        syncIndex(index, state, child.id);
+          markChildStatus(
+            state,
+            child.id,
+            sessionStatusFromUpdate,
+            endedAt,
+            [...candidateIDs],
+          ) || changed;
+        syncIndexForIDs(index, state, candidateIDs);
       }
       return changed;
     }
@@ -899,8 +916,15 @@ export function applySubagentEvent(
       hasStructuredErrorEvidence(e.properties ?? e)
         ? "error"
         : "done";
-    let changed = markChildStatus(state, childID, status, endedAt);
-    syncIndex(index, state, childID);
+    const candidateIDs = matchingIDsForTargets(index, [childID]);
+    let changed = markChildStatus(
+      state,
+      childID,
+      status,
+      endedAt,
+      [...candidateIDs],
+    );
+    syncIndexForIDs(index, state, candidateIDs);
     changed = upsertChildDetails(state, childID, details) || changed;
     syncIndex(index, state, childID);
     return changed;
@@ -916,8 +940,15 @@ export function applySubagentEvent(
       "updated",
     ]);
     const details = extractChildDetails(e);
-    let changed = markChildStatus(state, childID, "error", endedAt);
-    syncIndex(index, state, childID);
+    const candidateIDs = matchingIDsForTargets(index, [childID]);
+    let changed = markChildStatus(
+      state,
+      childID,
+      "error",
+      endedAt,
+      [...candidateIDs],
+    );
+    syncIndexForIDs(index, state, candidateIDs);
     changed = upsertChildDetails(state, childID, details) || changed;
     syncIndex(index, state, childID);
     return changed;
@@ -943,11 +974,28 @@ export function applySubagentEvent(
         ? extractEventTimestamp(e, ["completed", "end", "ended", "updated"])
         : undefined;
     const details = extractChildDetails(e);
+    const candidateIDs = matchingIDsForTargets(index, [childID]);
     let changed =
       status === "running"
         ? false
-        : markChildStatus(state, childID, status, endedAt);
-    if (status !== "running") syncIndex(index, state, childID);
+        : markChildStatus(state, childID, status, endedAt, [...candidateIDs]);
+    if (status === "running" && childID.startsWith("ses_")) {
+      const existing = state.children[childID];
+      if (existing && existing.status !== "running") {
+        const updatedAt =
+          extractEventTimestamp(e, ["updated"]) ?? new Date().toISOString();
+        state.children[childID] = {
+          ...existing,
+          status: "running",
+          color: "yellow",
+          endedAt: undefined,
+          updatedAt,
+        };
+        state.updatedAt = updatedAt;
+        changed = true;
+      }
+    }
+    if (status !== "running") syncIndexForIDs(index, state, candidateIDs);
     changed = upsertChildDetails(state, childID, details) || changed;
     syncIndex(index, state, childID);
     return changed;
@@ -999,14 +1047,16 @@ export function applySubagentEvent(
       changed = childChanged || changed;
       syncIndex(index, state, tool.id);
       if (tool.status === "done" || tool.status === "error") {
+        const candidateIDs = matchingIDsForTargets(index, [tool.id]);
         changed =
           markChildStatus(
             state,
             tool.id,
             tool.status,
             tool.endedAt ?? tool.updatedAt,
+            [...candidateIDs],
           ) || changed;
-        syncIndex(index, state, tool.id);
+        syncIndexForIDs(index, state, candidateIDs);
 
         if (
           asString(
@@ -1031,14 +1081,16 @@ export function applySubagentEvent(
                 }) || changed;
               syncIndex(index, state, subtaskID);
             }
+            const candidateIDs = matchingIDsForTargets(index, [subtaskID]);
             changed =
               markChildStatus(
                 state,
                 subtaskID,
                 tool.status,
                 tool.endedAt ?? tool.updatedAt,
+                [...candidateIDs],
               ) || changed;
-            syncIndex(index, state, subtaskID);
+            syncIndexForIDs(index, state, candidateIDs);
           }
         }
       }
@@ -1048,14 +1100,16 @@ export function applySubagentEvent(
   if (type === "message.updated") {
     const assistantModel = extractLatestAssistantModel(e.properties?.info ?? e);
     if (assistantModel) {
+      const candidateIDs = matchingIDsForTargets(index, [assistantModel.sessionID]);
       changed =
         setChildModel(
           state,
           assistantModel.sessionID,
           assistantModel.model,
           assistantModel.updatedAt,
+          [...candidateIDs],
         ) || changed;
-      syncIndexForIDs(index, state, new Set([assistantModel.sessionID]));
+      syncIndexForIDs(index, state, candidateIDs);
     }
     const completed = extractCompletedAssistantMessage(e);
     if (completed) {
@@ -1066,12 +1120,14 @@ export function applySubagentEvent(
         }
       }
       if (matchingIDs.size > 0) {
+        const candidateIDs = matchingIDsForTargets(index, [...matchingIDs]);
         changed =
           markChildrenStatusByAnyID(state, {
+            candidateIDs: [...candidateIDs],
             childIDs: matchingIDs,
             status: "done",
           }) || changed;
-        syncIndexForIDs(index, state, matchingIDs);
+        syncIndexForIDs(index, state, candidateIDs);
       }
     }
   }

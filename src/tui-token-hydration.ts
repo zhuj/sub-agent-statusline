@@ -19,6 +19,7 @@ export interface HydrationReadContext {
   sessionMessages(sessionID: string): readonly unknown[] | undefined;
   messageParts(messageID: string): unknown | undefined;
   parentMessage(parentID: string, messageID: string): unknown | undefined;
+  cacheable(): boolean;
 }
 
 export function createHydrationReadContext(
@@ -28,6 +29,7 @@ export function createHydrationReadContext(
   const messagesCache = new Map<string, readonly unknown[] | undefined>();
   const partsCache = new Map<string, unknown>();
   const parentMessagesByID = new Map<string, ReadonlyMap<string, unknown>>();
+  let complete = true;
 
   const cached = <Value>(
     cache: Map<string, Value>,
@@ -40,6 +42,7 @@ export function createHydrationReadContext(
       cache.set(key, value);
       return value;
     } catch {
+      complete = false;
       return undefined;
     }
   };
@@ -47,11 +50,14 @@ export function createHydrationReadContext(
   const sessionMessages = (
     sessionID: string,
   ): readonly unknown[] | undefined =>
-    cached(messagesCache, sessionID, () =>
-      reader.session.messages(sessionID),
-    );
+    cached(messagesCache, sessionID, () => {
+      const messages = reader.session.messages(sessionID);
+      if (messages === undefined) complete = false;
+      return messages;
+    });
 
   return {
+    cacheable: () => complete,
     sessionStatus(sessionID) {
       return cached(statusCache, sessionID, () =>
         reader.session.status(sessionID),
@@ -59,7 +65,11 @@ export function createHydrationReadContext(
     },
     sessionMessages,
     messageParts(messageID) {
-      return cached(partsCache, messageID, () => reader.part(messageID));
+      return cached(partsCache, messageID, () => {
+        const parts = reader.part(messageID);
+        if (parts === undefined) complete = false;
+        return parts;
+      });
     },
     parentMessage(parentID, messageID) {
       if (!parentMessagesByID.has(parentID)) {
@@ -168,14 +178,30 @@ function hydrateChildTokens(
   return tokens;
 }
 
+const terminalCaches = new WeakMap<TuiPluginApi, Map<string, string>>();
+
+function terminalRevision(child: ChildSessionState): string {
+  return JSON.stringify([child.status, child.updatedAt, child.parentID, child.messageID, child.targetSessionID]);
+}
+
 export function hydrateStateTokensFromTuiState(
   api: TuiPluginApi,
   state: StatuslineState,
 ): boolean {
   const context = createHydrationReadContext(api.state);
+  let cache = terminalCaches.get(api);
+  if (!cache) {
+    cache = new Map();
+    terminalCaches.set(api, cache);
+  }
+  for (const id of cache.keys()) {
+    if (!Object.hasOwn(state.children, id)) cache.delete(id);
+  }
   let changed = false;
 
   for (const child of Object.values(state.children)) {
+    if (child.status === "running") cache.delete(child.id);
+    else if (cache.get(child.id) === terminalRevision(child)) continue;
     if (child.status !== "running" && hasTokenTotal(child.tokens)) continue;
     const hydrated = hydrateChildTokens(context, child);
     const nextTokens = mergeTokenState(child.tokens, hydrated);
@@ -186,6 +212,9 @@ export function hydrateStateTokensFromTuiState(
         updatedAt: new Date().toISOString(),
       };
       changed = true;
+    }
+    if (child.status !== "running" && context.cacheable()) {
+      cache.set(child.id, terminalRevision(state.children[child.id] ?? child));
     }
   }
 

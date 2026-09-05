@@ -7,7 +7,8 @@ import {
   extractTaskToolEvidence,
   type EventLike,
 } from "./events.js";
-import { createEmptyState } from "./state.js";
+import { createEventChildIndex } from "./event-child-index.js";
+import { createEmptyState, type ChildSessionState } from "./state.js";
 import { readJsonFixture } from "../test/helpers/runtime-harness.js";
 
 function upsertSubtask(
@@ -34,7 +35,53 @@ function upsertSubtask(
   });
 }
 
+function indexedChild(
+  overrides: Partial<ChildSessionState> = {},
+): ChildSessionState {
+  return {
+    id: "ses_child",
+    title: "Child work",
+    parentID: "ses_parent",
+    status: "running",
+    color: "yellow",
+    startedAt: "2026-04-30T10:00:00.000Z",
+    updatedAt: "2026-04-30T10:00:00.000Z",
+    ...overrides,
+  };
+}
+
 describe("events", () => {
+  it("resumes a real session on busy without reopening its historical aliases", () => {
+    const state = createEmptyState();
+    const endedAt = "2026-04-30T10:05:00.000Z";
+    state.children.ses_real = indexedChild({
+      id: "ses_real", status: "done", color: "green", endedAt,
+      model: { providerID: "openai", modelID: "test-model" },
+      tokens: { total: 42 },
+    });
+    state.children["tool:history"] = indexedChild({
+      id: "tool:history", source: "tool", targetSessionID: "ses_real",
+      status: "done", color: "green", endedAt,
+    });
+    const index = createEventChildIndex(Object.values(state.children));
+    const event = {
+      type: "session.status",
+      properties: { sessionID: "ses_real", status: { type: "busy" } },
+    };
+    expect(applySubagentEvent(state, event, index)).toBe(true);
+    expect(state.children.ses_real?.status).toBe("running");
+    expect(state.children.ses_real?.endedAt).toBeUndefined();
+    expect(state.children.ses_real).toMatchObject({
+      color: "yellow",
+      startedAt: "2026-04-30T10:00:00.000Z",
+      model: { providerID: "openai", modelID: "test-model" },
+      tokens: { total: 42 },
+    });
+    expect(state.children["tool:history"]?.status).toBe("done");
+    expect(state.totalExecuted).toBe(0);
+    expect(applySubagentEvent(state, event, index)).toBe(false);
+  });
+
   it("extracts session identifiers from supported event locations", () => {
     expect(extractSessionID({ properties: { sessionID: "ses_props" } })).toBe(
       "ses_props",
@@ -493,6 +540,99 @@ describe("events", () => {
     expect(state.children["subtask:a"]?.status).toBe("done");
     expect(state.children["subtask:b"]?.status).toBe("done");
     expect(state.children["subtask:c"]?.status).toBe("running");
+  });
+
+  it("updates every indexed session alias without reading unrelated rows", () => {
+    const state = createEmptyState();
+    state.children.ses_real = indexedChild({
+      id: "ses_real",
+      source: "session",
+      targetSessionID: "ses_real",
+    });
+    state.children["subtask:alias"] = indexedChild({
+      id: "subtask:alias",
+      source: "subtask",
+      targetSessionID: "ses_real",
+    });
+    const index = createEventChildIndex(Object.values(state.children));
+    Object.defineProperty(state.children, "unrelated", {
+      enumerable: true,
+      get() {
+        throw new Error("unrelated row read");
+      },
+    });
+
+    const changed = applySubagentEvent(
+      state,
+      {
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "msg_real",
+            sessionID: "ses_real",
+            role: "assistant",
+            providerID: "openai",
+            modelID: "gpt-5.6",
+            time: { created: 10 },
+          },
+        },
+      },
+      index,
+    );
+
+    expect(changed).toBe(true);
+    expect(state.children.ses_real?.model).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5.6",
+    });
+    expect(state.children["subtask:alias"]?.model).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5.6",
+    });
+    expect(index.runningSubtasks("ses_parent")[0]?.model).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5.6",
+    });
+  });
+
+  it("removes every indexed alias from running subtasks when its real session completes", () => {
+    const state = createEmptyState();
+    state.children.ses_real = indexedChild({
+      id: "ses_real",
+      source: "session",
+      targetSessionID: "ses_real",
+    });
+    state.children["subtask:alias"] = indexedChild({
+      id: "subtask:alias",
+      source: "subtask",
+      targetSessionID: "ses_real",
+    });
+    const index = createEventChildIndex(Object.values(state.children));
+
+    Object.defineProperty(state.children, "unrelated", {
+      enumerable: true,
+      get() {
+        throw new Error("unrelated row read");
+      },
+    });
+
+    const changed = applySubagentEvent(
+      state,
+      {
+        type: "session.status",
+        properties: {
+          sessionID: "ses_real",
+          status: "idle",
+          info: { time: { updated: "2026-05-10T10:15:00.000Z" } },
+        },
+      },
+      index,
+    );
+
+    expect(changed).toBe(true);
+    expect(state.children.ses_real?.status).toBe("done");
+    expect(state.children["subtask:alias"]?.status).toBe("done");
+    expect(index.runningSubtasks("ses_parent")).toEqual([]);
   });
 });
 

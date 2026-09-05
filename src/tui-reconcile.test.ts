@@ -1,9 +1,71 @@
 import { expect, it } from "vitest";
 import type { ChildSessionState } from "./state.js";
-import { selectRunningReconcileCandidates } from "./tui-reconcile.js";
+import { createRunningReconcileSelector, selectRunningReconcileCandidates } from "./tui-reconcile.js";
 
 const NOW_MS = Date.parse("2026-04-30T10:10:00.000Z");
 const OLD_CANDIDATE_AGE_MS = 300_000;
+
+it.each([10, 70, 200])("fairly schedules %i active sessions with a budget of 32", (count) => {
+  const children = Array.from({ length: count }, (_, index) => {
+    const id = `ses_fair_${String(index).padStart(3, "0")}`;
+    return child({ id, targetSessionID: id, parentID: "ses_current" });
+  });
+  const input = {
+    children, currentSessionID: "ses_current", nowMs: NOW_MS,
+    maxCandidates: 32, oldCandidateAgeMs: OLD_CANDIDATE_AGE_MS,
+  };
+  const schedule = createRunningReconcileSelector();
+  const seen = new Set<string>();
+  for (let cycle = 0; cycle < Math.ceil(count / 32); cycle += 1) {
+    const batch = schedule(input);
+    expect(batch).toHaveLength(Math.min(32, count - seen.size));
+    for (const candidate of batch) {
+      expect(seen.has(candidate.childID)).toBe(false);
+      seen.add(candidate.childID);
+    }
+  }
+  expect(seen.size).toBe(count);
+  expect(schedule(input)).toHaveLength(Math.min(count, 32));
+});
+
+it("keeps backoff exclusions when a scheduling round resets", () => {
+  const children = ["ses_a", "ses_b", "ses_c"].map((id) =>
+    child({ id, targetSessionID: id, parentID: "ses_current" }),
+  );
+  const schedule = createRunningReconcileSelector();
+  const input = {
+    children, currentSessionID: "ses_current", nowMs: NOW_MS, maxCandidates: 2,
+    oldCandidateAgeMs: OLD_CANDIDATE_AGE_MS, excludedTargetIDs: new Set(["ses_a"]),
+  };
+  for (let cycle = 0; cycle < 2; cycle += 1) {
+    expect(new Set(schedule(input).map((candidate) => candidate.childID))).toEqual(new Set(["ses_b", "ses_c"]));
+  }
+  expect(schedule({ ...input, excludedTargetIDs: new Set() }).map((candidate) => candidate.childID)).toEqual(["ses_a"]);
+});
+
+it("selects ten active nested leaves among 200 mostly completed sessions", () => {
+  const leaves: string[] = [];
+  const sessions: ChildSessionState[] = [];
+  for (let branch = 0; branch < 10; branch += 1) {
+    const depth = 2 + branch % 4;
+    for (let level = 0; level < depth; level += 1) {
+      const id = `ses_branch_${branch}_${level}`;
+      const running = level === depth - 1;
+      if (running) leaves.push(id);
+      sessions.push(child({ id, targetSessionID: id,
+        parentID: level === 0 ? "ses_current" : `ses_branch_${branch}_${level - 1}`,
+        status: running ? "running" : "done",
+        startedAt: "2026-04-30T10:09:59.000Z", updatedAt: "2026-04-30T10:09:59.000Z",
+      }));
+    }
+  }
+  while (sessions.length < 200) {
+    const id = `ses_other_${sessions.length}`;
+    sessions.push(child({ id, targetSessionID: id, status: "done" }));
+  }
+  expect(sessions.filter((item) => item.status === "running")).toHaveLength(10);
+  expect(new Set(select(sessions, "ses_current", 32).map((item) => item.childID))).toEqual(new Set(leaves));
+});
 
 function child(
   overrides: Partial<ChildSessionState> = {},
@@ -35,6 +97,17 @@ function select(
     oldCandidateAgeMs: OLD_CANDIDATE_AGE_MS,
   });
 }
+
+it("excludes backoff targets before filling the candidate budget", () => {
+  const candidates = ["ses_excluded", "ses_kept"].map((id) =>
+    child({ id, targetSessionID: id, parentID: "ses_current" }),
+  );
+  expect(selectRunningReconcileCandidates({
+    children: candidates, currentSessionID: "ses_current", nowMs: NOW_MS,
+    maxCandidates: 1, oldCandidateAgeMs: OLD_CANDIDATE_AGE_MS,
+    excludedTargetIDs: new Set(["ses_excluded"]),
+  }).map((item) => item.childID)).toEqual(["ses_kept"]);
+});
 
 it("applies eligibility before the cap and preserves current-session then old fallback order", () => {
   const ineligible = Array.from({ length: 8 }, (_, index) =>

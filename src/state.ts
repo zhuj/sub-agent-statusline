@@ -190,15 +190,11 @@ function countChildExecution(
   state: StatuslineState,
   child: CountableChildInput,
 ): boolean {
-  normalizeExecutionCounters(state);
   const countIdentity = resolveExecutionCountIdentity(child);
   if (!countIdentity) return false;
   if (state.countedChildIDs[countIdentity]) return false;
 
-  const previousTotal = Math.max(
-    toNonNegativeInteger(state.totalExecuted) ?? 0,
-    Object.keys(state.countedChildIDs).length,
-  );
+  const previousTotal = toNonNegativeInteger(state.totalExecuted) ?? 0;
   state.countedChildIDs[countIdentity] = true;
   state.totalExecuted = previousTotal + 1;
   return true;
@@ -335,9 +331,21 @@ export function pruneTerminalChildren(
   const nowMs = now.getTime();
   const terminalChildren: Array<{ id: string; referenceMs: number }> = [];
   let pruned = 0;
+  const protectedAncestors = new Set<string>();
+  for (const child of Object.values(state.children)) {
+    if (child.status !== "running") continue;
+    let current = child.parentID;
+    while (current !== undefined && !protectedAncestors.has(current)) {
+      protectedAncestors.add(current);
+      const parent = state.children[current];
+      if (!parent) break;
+      current = parent.parentID;
+    }
+  }
 
   for (const child of Object.values(state.children)) {
     if (child.status === "running") continue;
+    if (protectedAncestors.has(child.id)) continue;
 
     const referenceMs = terminalReferenceMs(child);
     if (nowMs - referenceMs > TERMINAL_CHILD_TTL_MS) {
@@ -538,6 +546,7 @@ export function upsertRunningChild(
 }
 
 export type MarkChildrenStatusInput = {
+  readonly candidateIDs?: readonly string[];
   readonly childIDs: ReadonlySet<string>;
   readonly status: Exclude<ChildStatus, "running">;
   readonly endedAt?: string;
@@ -553,7 +562,12 @@ export function markChildrenStatusByAnyID(
   let changed = false;
   let stateUpdatedAt = state.updatedAt;
 
-  for (const child of Object.values(state.children)) {
+  const candidates = input.candidateIDs === undefined
+    ? Object.values(state.children)
+    : input.candidateIDs.map((id) => state.children[id]).filter(
+        (child): child is ChildSessionState => child !== undefined,
+      );
+  for (const child of candidates) {
     if (
       !input.childIDs.has(child.id) &&
       !(child.targetSessionID && input.childIDs.has(child.targetSessionID))
@@ -600,8 +614,10 @@ export function markChildStatus(
   childID: string,
   status: Exclude<ChildStatus, "running">,
   endedAt?: string,
+  candidateIDs?: readonly string[],
 ): boolean {
   return markChildrenStatusByAnyID(state, {
+    candidateIDs,
     childIDs: new Set([childID]),
     status,
     endedAt,
@@ -668,8 +684,14 @@ export function setChildModel(
   sessionID: string,
   model: ChildModelState | undefined,
   updatedAt?: string,
+  candidateIDs?: readonly string[],
 ): boolean {
-  const matches = Object.values(state.children).filter(
+  const candidates = candidateIDs
+    ? candidateIDs.map((id) => state.children[id]).filter(
+        (child): child is ChildSessionState => child !== undefined,
+      )
+    : Object.values(state.children);
+  const matches = candidates.filter(
     (child) => child.id === sessionID || child.targetSessionID === sessionID,
   );
   if (matches.length === 0) return false;

@@ -175,6 +175,44 @@ describe("hydrateStateTokensFromTuiState", () => {
     expect(messages).toHaveBeenCalledTimes(2);
   });
 
+  it("caches unchanged terminal history and invalidates on resume", () => {
+    const { reader, messages } = makeReader();
+    messages.mockReturnValue([]);
+    const terminal = makeChild({ status: "done" });
+    const state = makeState([terminal]);
+    const api = apiWith(reader);
+    hydrateStateTokensFromTuiState(api, state);
+    hydrateStateTokensFromTuiState(api, state);
+    expect(messages).toHaveBeenCalledTimes(1);
+    state.children[terminal.id] = { ...terminal, status: "running" };
+    hydrateStateTokensFromTuiState(api, state);
+    expect(messages).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not cache failed or unavailable terminal reads", () => {
+    const { reader, messages } = makeReader();
+    messages.mockImplementationOnce(() => { throw new Error("unavailable"); })
+      .mockReturnValueOnce(undefined).mockReturnValue([]);
+    const state = makeState([makeChild({ status: "done" })]);
+    const api = apiWith(reader);
+    for (let i = 0; i < 4; i += 1) hydrateStateTokensFromTuiState(api, state);
+    expect(messages).toHaveBeenCalledTimes(3);
+  });
+
+  it("rereads only ten active histories after warming 200 retained sessions", () => {
+    const { reader, messages } = makeReader();
+    messages.mockReturnValue([]);
+    const state = makeState(Array.from({ length: 200 }, (_, index) =>
+      makeChild({ id: `ses_${index}`, status: index < 10 ? "running" : "done" }),
+    ));
+    const api = apiWith(reader);
+    hydrateStateTokensFromTuiState(api, state);
+    expect(messages).toHaveBeenCalledTimes(200);
+    messages.mockClear();
+    hydrateStateTokensFromTuiState(api, state);
+    expect(messages).toHaveBeenCalledTimes(10);
+  });
+
   it("performs zero reads for terminal-complete children", () => {
     const { reader, status, messages, part } = makeReader();
     const state = makeState([
