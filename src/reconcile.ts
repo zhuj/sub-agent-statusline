@@ -15,14 +15,14 @@ export type RunningReconcileEvidence = {
 export type OpenCodeSessionChildStatus = "running" | "done" | "error";
 
 export type SessionMessageSummary = {
-  completedAt?: string;
-  evidenceAt?: string;
-  hasError?: boolean;
-  fetchFailed?: boolean;
-  latestAssistantActivityAt?: string;
-  latestAssistantActivityAtMs?: number;
-  latestMessageActivityAt?: string;
-  latestMessageActivityAtMs?: number;
+  readonly completedAt?: string;
+  readonly evidenceAt?: string;
+  readonly hasError?: boolean;
+  readonly fetchFailed?: boolean;
+  readonly latestAssistantActivityAt?: string;
+  readonly latestAssistantActivityAtMs?: number;
+  readonly latestMessageActivityAt?: string;
+  readonly latestMessageActivityAtMs?: number;
 };
 
 const DEFAULT_STALE_RUNNING_THRESHOLD_MS = 10 * 60 * 60_000;
@@ -164,20 +164,27 @@ export type PersistedStaleSubtaskCandidate = {
 };
 
 export type PersistedStaleSubtaskResolution = {
-  status: "done" | "error";
-  endedAt?: string;
-  targetSessionID?: string;
+  readonly status: "done" | "error";
+  readonly endedAt?: string;
+  readonly targetSessionID?: string;
 };
 
-export function summarizeSessionMessages(messages: unknown[]): {
-  completedAt?: string;
-  evidenceAt?: string;
-  hasError: boolean;
-  latestAssistantActivityAt?: string;
-  latestAssistantActivityAtMs?: number;
-  latestMessageActivityAt?: string;
-  latestMessageActivityAtMs?: number;
-} {
+export type PersistedTaskEvidence = {
+  readonly assistantParentID?: string;
+  readonly title?: string;
+  readonly summary?: string;
+  readonly agentName?: string;
+  readonly resolution: PersistedStaleSubtaskResolution;
+};
+
+export type PersistedParentMessageAnalysis = {
+  readonly summary: SessionMessageSummary;
+  readonly taskEvidence: readonly PersistedTaskEvidence[];
+};
+
+function summarizeMessageInfos(
+  messageInfos: readonly (Record<string, unknown> | undefined)[],
+): SessionMessageSummary {
   let completedAt: string | undefined;
   let evidenceAt: string | undefined;
   let hasError = false;
@@ -185,9 +192,7 @@ export function summarizeSessionMessages(messages: unknown[]): {
   let latestAssistantActivityAtMs: number | undefined;
   let latestMessageActivityAt: string | undefined;
   let latestMessageActivityAtMs: number | undefined;
-  const messageInfos = messages
-    .map((rawMessage) => asRecord(rawMessage))
-    .map((message) => asRecord(message?.info));
+  let latestTerminalActivityAtMs: number | undefined;
 
   for (const info of messageInfos) {
     if (!info) continue;
@@ -200,21 +205,12 @@ export function summarizeSessionMessages(messages: unknown[]): {
       latestMessageActivityAtMs = activityMs;
       latestMessageActivityAt = new Date(activityMs).toISOString();
     }
-  }
-
-  const assistantMessages = messageInfos
-    .filter(
-      (info): info is Record<string, unknown> => info?.role === "assistant",
-    )
-    .sort((left, right) => messageTimeMillis(left) - messageTimeMillis(right));
-
-  for (const info of assistantMessages) {
+    if (info.role !== "assistant") continue;
     const time = asRecord(info.time);
-    const activityMs = messageTimeMillis(info);
     if (
       activityMs > 0 &&
       (latestAssistantActivityAtMs === undefined ||
-        activityMs > latestAssistantActivityAtMs)
+        activityMs >= latestAssistantActivityAtMs)
     ) {
       latestAssistantActivityAtMs = activityMs;
       latestAssistantActivityAt = new Date(activityMs).toISOString();
@@ -224,10 +220,20 @@ export function summarizeSessionMessages(messages: unknown[]): {
       timestampFromUnknown(time?.updated) ??
       timestampFromUnknown(time?.completed) ??
       timestampFromUnknown(time?.created);
-    if (info.error) {
+    if (
+      info.error &&
+      (latestTerminalActivityAtMs === undefined ||
+        activityMs >= latestTerminalActivityAtMs)
+    ) {
+      latestTerminalActivityAtMs = activityMs;
       hasError = true;
       evidenceAt = errorAt ?? evidenceAt;
-    } else if (candidate) {
+    } else if (
+      candidate &&
+      (latestTerminalActivityAtMs === undefined ||
+        activityMs >= latestTerminalActivityAtMs)
+    ) {
+      latestTerminalActivityAtMs = activityMs;
       completedAt = candidate;
       evidenceAt = candidate;
       hasError = false;
@@ -243,6 +249,16 @@ export function summarizeSessionMessages(messages: unknown[]): {
     latestMessageActivityAt,
     latestMessageActivityAtMs,
   };
+}
+
+export function summarizeSessionMessages(
+  messages: readonly unknown[],
+): SessionMessageSummary {
+  return summarizeMessageInfos(
+    messages
+      .map((rawMessage) => asRecord(rawMessage))
+      .map((message) => asRecord(message?.info)),
+  );
 }
 
 export function hasRecentMessageActivity(input: {
@@ -324,16 +340,16 @@ export function capCandidates<T>(candidates: T[], maxCandidates: number): T[] {
     : candidates.slice(0, maxCandidates);
 }
 
-export function resolvePersistedStaleSubtaskFromParentMessages(input: {
-  candidate: PersistedStaleSubtaskCandidate;
-  messages: unknown[];
-}): PersistedStaleSubtaskResolution | undefined {
-  type RankedMatch = PersistedStaleSubtaskResolution & { score: number };
-  const matches: RankedMatch[] = [];
+export function analyzePersistedParentMessages(
+  messages: readonly unknown[],
+): PersistedParentMessageAnalysis {
+  const messageInfos: Array<Record<string, unknown> | undefined> = [];
+  const taskEvidence: PersistedTaskEvidence[] = [];
 
-  for (const rawMessage of input.messages) {
+  for (const rawMessage of messages) {
     const message = asRecord(rawMessage);
     const info = asRecord(message?.info);
+    messageInfos.push(info);
     if (!info || info.role !== "assistant") continue;
 
     const assistantParentID = asString(
@@ -360,37 +376,16 @@ export function resolvePersistedStaleSubtaskFromParentMessages(input: {
         sessionIDFromUnknown(metadata?.sessionId) ??
         sessionIDFromUnknown(metadata?.sessionID) ??
         parseTaskSessionIDFromOutput(state?.output);
-
-      const partTitle =
+      const title =
         asString(state?.input && asRecord(state.input)?.description) ??
         asString(state?.title) ??
         asString(part.description);
-      const partSummary =
+      const summary =
         asString(state?.input && asRecord(state.input)?.prompt) ??
         asString(state?.description);
-      const partAgent =
+      const agentName =
         asString(state?.input && asRecord(state.input)?.subagent_type) ??
         asString(part.agent);
-
-      const parentMessageMatch =
-        assistantParentID !== undefined &&
-        assistantParentID === input.candidate.messageID;
-      const titleMatch = sameDisplayText(partTitle, input.candidate.title);
-      const summaryMatch = sameDisplayText(partSummary, input.candidate.summary);
-      const agentMatch = sameDisplayText(partAgent, input.candidate.agentName);
-
-      const metadataCompositeMatch =
-        summaryMatch || (titleMatch && agentMatch && !!input.candidate.summary);
-      if (!parentMessageMatch && !metadataCompositeMatch) {
-        continue;
-      }
-
-      const score =
-        (parentMessageMatch ? 100 : 0) +
-        (summaryMatch ? 40 : 0) +
-        (titleMatch ? 20 : 0) +
-        (agentMatch ? 10 : 0);
-
       const endedAt =
         timestampFromUnknown(
           asRecord(state?.time)?.end ??
@@ -398,38 +393,82 @@ export function resolvePersistedStaleSubtaskFromParentMessages(input: {
             asRecord(state?.time)?.updated,
         ) ??
         timestampFromUnknown(
-          asRecord(info?.time)?.completed ??
-            asRecord(info?.time)?.updated ??
-            asRecord(info?.time)?.created,
+          asRecord(info.time)?.completed ??
+            asRecord(info.time)?.updated ??
+            asRecord(info.time)?.created,
         );
 
-      matches.push({
-        status,
-        endedAt,
-        targetSessionID,
-        score,
+      taskEvidence.push({
+        assistantParentID,
+        title,
+        summary,
+        agentName,
+        resolution: { status, endedAt, targetSessionID },
       });
     }
   }
 
-  if (matches.length === 0) return undefined;
-  if (matches.length === 1) {
-    const [only] = matches;
-    return {
-      status: only.status,
-      endedAt: only.endedAt,
-      targetSessionID: only.targetSessionID,
-    };
+  return {
+    summary: summarizeMessageInfos(messageInfos),
+    taskEvidence,
+  };
+}
+
+export function resolvePersistedStaleSubtaskFromParentAnalysis(input: {
+  readonly candidate: PersistedStaleSubtaskCandidate;
+  readonly analysis: PersistedParentMessageAnalysis;
+}): PersistedStaleSubtaskResolution | undefined {
+  let best: PersistedStaleSubtaskResolution | undefined;
+  let bestScore = -1;
+  let bestCount = 0;
+
+  for (const evidence of input.analysis.taskEvidence) {
+    const parentMessageMatch =
+      evidence.assistantParentID !== undefined &&
+      evidence.assistantParentID === input.candidate.messageID;
+    const titleMatch = sameDisplayText(evidence.title, input.candidate.title);
+    const summaryMatch = sameDisplayText(
+      evidence.summary,
+      input.candidate.summary,
+    );
+    const agentMatch = sameDisplayText(
+      evidence.agentName,
+      input.candidate.agentName,
+    );
+    const metadataCompositeMatch =
+      summaryMatch || (titleMatch && agentMatch && !!input.candidate.summary);
+    if (!parentMessageMatch && !metadataCompositeMatch) continue;
+
+    const score =
+      (parentMessageMatch ? 100 : 0) +
+      (summaryMatch ? 40 : 0) +
+      (titleMatch ? 20 : 0) +
+      (agentMatch ? 10 : 0);
+    if (score > bestScore) {
+      best = evidence.resolution;
+      bestScore = score;
+      bestCount = 1;
+    } else if (score === bestScore) {
+      bestCount += 1;
+    }
   }
 
-  const ranked = [...matches].sort((left, right) => right.score - left.score);
-  const [best, second] = ranked;
-  if (!best || (second && best.score === second.score)) return undefined;
+  if (!best || bestCount !== 1) return undefined;
   return {
     status: best.status,
     endedAt: best.endedAt,
     targetSessionID: best.targetSessionID,
   };
+}
+
+export function resolvePersistedStaleSubtaskFromParentMessages(input: {
+  readonly candidate: PersistedStaleSubtaskCandidate;
+  readonly messages: readonly unknown[];
+}): PersistedStaleSubtaskResolution | undefined {
+  return resolvePersistedStaleSubtaskFromParentAnalysis({
+    candidate: input.candidate,
+    analysis: analyzePersistedParentMessages(input.messages),
+  });
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

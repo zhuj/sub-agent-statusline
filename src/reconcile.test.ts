@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  analyzePersistedParentMessages,
   canSafelyCloseNoTargetPersistedCandidate,
   capCandidates,
   defaultStaleRunningThresholdMs,
@@ -8,6 +9,7 @@ import {
   hasRecentMessageActivity,
   nextBackoffState,
   parseStaleRunningThresholdMs,
+  resolvePersistedStaleSubtaskFromParentAnalysis,
   resolvePersistedStaleSubtaskFromParentMessages,
   resolveSessionStatusWithMessageSummary,
   shouldApplyStaleRunningFallback,
@@ -264,6 +266,171 @@ describe("persisted stale subtask recovery evidence", () => {
     title: "Execute subtask",
   };
 
+  it("shares one immutable parent analysis across sibling candidates", () => {
+    const messages = [
+      {
+        info: {
+          role: "assistant",
+          parentID: "msg_a",
+          time: { completed: "2026-04-30T12:00:00.000Z" },
+        },
+        parts: [
+          {
+            type: "tool",
+            tool: "task",
+            state: {
+              status: "completed",
+              metadata: { sessionId: "ses_a" },
+            },
+          },
+        ],
+      },
+      {
+        info: {
+          role: "assistant",
+          parentID: "msg_other",
+          time: { completed: "2026-04-30T12:00:00.000Z" },
+        },
+        parts: [
+          {
+            type: "tool",
+            tool: "task",
+            state: {
+              status: "error",
+              input: { prompt: "B summary" },
+              metadata: { sessionId: "ses_b" },
+            },
+          },
+        ],
+      },
+    ];
+
+    const analysis = analyzePersistedParentMessages(messages);
+
+    expect(
+      resolvePersistedStaleSubtaskFromParentAnalysis({
+        candidate: {
+          childID: "subtask:a",
+          parentID: "ses_parent",
+          messageID: "msg_a",
+        },
+        analysis,
+      })?.targetSessionID,
+    ).toBe("ses_a");
+    expect(
+      resolvePersistedStaleSubtaskFromParentAnalysis({
+        candidate: {
+          childID: "subtask:b",
+          parentID: "ses_parent",
+          messageID: "msg_other",
+          summary: "B summary",
+        },
+        analysis,
+      })?.targetSessionID,
+    ).toBe("ses_b");
+    expect(analysis.summary.latestMessageActivityAtMs).toBe(
+      Date.parse("2026-04-30T12:00:00.000Z"),
+    );
+  });
+
+  it("normalizes terminal evidence in parent API order", () => {
+    const analysis = analyzePersistedParentMessages([
+      {
+        info: {
+          role: "assistant",
+          parentID: "msg_first",
+          time: { completed: "2026-04-30T12:02:00.000Z" },
+        },
+        parts: [
+          {
+            type: "tool",
+            tool: "task",
+            state: {
+              status: "error",
+              input: {
+                description: "First task",
+                prompt: "First summary",
+                subagent_type: "code",
+              },
+              metadata: { sessionID: "ses_from_metadata" },
+              output: "task_id: ses_ignored_output",
+              time: { updated: "2026-04-30T12:01:00.000Z" },
+            },
+          },
+          {
+            type: "tool",
+            tool: "task",
+            state: {
+              status: "completed",
+              title: "Second task",
+              description: "Second summary",
+              output: "task_id: ses_from-output_2",
+            },
+          },
+        ],
+      },
+    ]);
+
+    expect(analysis.taskEvidence).toEqual([
+      {
+        assistantParentID: "msg_first",
+        title: "First task",
+        summary: "First summary",
+        agentName: "code",
+        resolution: {
+          status: "error",
+          endedAt: "2026-04-30T12:01:00.000Z",
+          targetSessionID: "ses_from_metadata",
+        },
+      },
+      {
+        assistantParentID: "msg_first",
+        title: "Second task",
+        summary: "Second summary",
+        agentName: undefined,
+        resolution: {
+          status: "done",
+          endedAt: "2026-04-30T12:02:00.000Z",
+          targetSessionID: "ses_from-output_2",
+        },
+      },
+    ]);
+  });
+
+  it("accepts title and agent composite metadata when the candidate has a summary", () => {
+    const analysis = analyzePersistedParentMessages([
+      {
+        info: { role: "assistant", parentID: "msg_unrelated" },
+        parts: [
+          {
+            type: "tool",
+            tool: "task",
+            state: {
+              status: "completed",
+              input: {
+                description: "Execute subtask",
+                subagent_type: "code",
+              },
+              metadata: { sessionId: "ses_composite" },
+            },
+          },
+        ],
+      },
+    ]);
+
+    const result = resolvePersistedStaleSubtaskFromParentAnalysis({
+      candidate: {
+        ...stale,
+        messageID: "msg_other",
+        summary: "Candidate summary",
+        agentName: "code",
+      },
+      analysis,
+    });
+
+    expect(result?.targetSessionID).toBe("ses_composite");
+  });
+
   it("resolves terminal task evidence from parent assistant message parentID", () => {
     const result = resolvePersistedStaleSubtaskFromParentMessages({
       candidate: stale,
@@ -327,6 +494,40 @@ describe("persisted stale subtask recovery evidence", () => {
     });
 
     expect(result).toBeUndefined();
+  });
+
+  it("rejects two equal best normalized task matches", () => {
+    const analysis = analyzePersistedParentMessages([
+      {
+        info: { role: "assistant", parentID: "msg" },
+        parts: [
+          {
+            type: "tool",
+            tool: "task",
+            state: {
+              status: "completed",
+              metadata: { sessionId: "ses_a" },
+            },
+          },
+          {
+            type: "tool",
+            tool: "task",
+            state: { status: "error", metadata: { sessionId: "ses_b" } },
+          },
+        ],
+      },
+    ]);
+
+    expect(
+      resolvePersistedStaleSubtaskFromParentAnalysis({
+        candidate: {
+          childID: "subtask:x",
+          parentID: "ses_parent",
+          messageID: "msg",
+        },
+        analysis,
+      }),
+    ).toBeUndefined();
   });
 
   it("prefers parent-message linkage with metadata tie-breakers", () => {
