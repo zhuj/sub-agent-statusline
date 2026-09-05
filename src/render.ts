@@ -4,6 +4,7 @@ import {
   correlateSubagentWorkItems,
   mergeProxyMetadataWithRealExecution,
 } from "./subagent-classification.js";
+import type { CorrelatedSubagentExecution } from "./subagent-classification.js";
 
 const ansi = {
   reset: "\u001B[0m",
@@ -158,14 +159,22 @@ interface VisibleSubagentWorkItemsOptions {
   showCompletedHistory?: boolean;
 }
 
-export function collapseSubagentWorkItems(
-  children: ChildSessionState[],
+export function projectCorrelatedSubagentWorkItems(
+  executions: readonly CorrelatedSubagentExecution<ChildSessionState>[],
 ): ChildSessionState[] {
-  return correlateSubagentWorkItems(children).map(({ real, proxies }) =>
+  return executions.map(({ real, proxies }) =>
     proxies.reduce(
       (current, proxy) => mergeProxyMetadataWithRealExecution(current, proxy),
       real,
     ),
+  );
+}
+
+export function collapseSubagentWorkItems(
+  children: ChildSessionState[],
+): ChildSessionState[] {
+  return projectCorrelatedSubagentWorkItems(
+    correlateSubagentWorkItems(children),
   );
 }
 
@@ -183,15 +192,16 @@ export function isVisibleWorkItem(
   return nowMs - endedMs <= RECENT_TERMINAL_VISIBLE_MS;
 }
 
-export function visibleSubagentWorkItems(
-  children: ChildSessionState[],
+export function visibleProjectedSubagentWorkItems(
+  projectedChildren: ChildSessionState[],
   nowMs = Date.now(),
   options: VisibleSubagentWorkItemsOptions = {},
 ): ChildSessionState[] {
-  const collapsed = collapseSubagentWorkItems(children);
-  if (options.showCompletedHistory) return collapsed;
+  if (options.showCompletedHistory) return projectedChildren;
 
-  const visible = collapsed.filter((child) => isVisibleWorkItem(child, nowMs));
+  const visible = projectedChildren.filter((child) =>
+    isVisibleWorkItem(child, nowMs),
+  );
   const hasRunning = visible.some((child) => child.status === "running");
   const activeMessageIDs = new Set(
     visible
@@ -206,6 +216,18 @@ export function visibleSubagentWorkItems(
     if (!child.messageID) return false;
     return activeMessageIDs.has(child.messageID);
   });
+}
+
+export function visibleSubagentWorkItems(
+  children: ChildSessionState[],
+  nowMs = Date.now(),
+  options: VisibleSubagentWorkItemsOptions = {},
+): ChildSessionState[] {
+  return visibleProjectedSubagentWorkItems(
+    collapseSubagentWorkItems(children),
+    nowMs,
+    options,
+  );
 }
 
 export function renderStatusLine(state: StatuslineState): string {

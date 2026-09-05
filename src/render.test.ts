@@ -6,9 +6,11 @@ import {
   formatContextCompact,
   formatContextDetails,
   formatDuration,
+  projectCorrelatedSubagentWorkItems,
   renderStatusLine,
   visibleSubagentWorkItems,
 } from "./render.js";
+import type { CorrelatedSubagentExecution } from "./subagent-classification.js";
 import type { ChildSessionState, StatuslineState } from "./state.js";
 
 function child(overrides: Partial<ChildSessionState> = {}): ChildSessionState {
@@ -69,6 +71,66 @@ describe("render", () => {
         elapsedMs: 240000,
       }),
     ]);
+  });
+
+  it("projects correlated executions in real order with proxy metadata precedence", () => {
+    // Given: correlated executions whose proxies carry metadata in input order.
+    const firstReal = child({
+      id: "ses_first",
+      targetSessionID: "ses_first",
+      title: "Generated title",
+      summary: "Real summary",
+      agentName: "real-agent",
+      messageID: "msg_real",
+    });
+    const secondReal = child({
+      id: "ses_second",
+      targetSessionID: "ses_second",
+      title: "Second real",
+    });
+    const executions: readonly CorrelatedSubagentExecution<ChildSessionState>[] = [
+      {
+        executionID: "ses_first",
+        real: firstReal,
+        proxies: [
+          child({
+            id: "tool:first",
+            source: "tool",
+            targetSessionID: "ses_first",
+            title: "First proxy title",
+            summary: "Proxy summary",
+            agentName: "first-proxy-agent",
+            messageID: "msg_proxy",
+          }),
+          child({
+            id: "tool:second",
+            source: "tool",
+            targetSessionID: "ses_first",
+            title: "Second proxy title",
+            agentName: "second-proxy-agent",
+          }),
+        ],
+      },
+      { executionID: "ses_second", real: secondReal, proxies: [] },
+    ];
+
+    // When: the already-correlated executions are projected into display rows.
+    const projected = projectCorrelatedSubagentWorkItems(executions);
+
+    // Then: real order is stable and later proxies win only mergeable metadata.
+    expect(projected.map((item) => item.id)).toEqual([
+      "ses_first",
+      "ses_second",
+    ]);
+    expect(projected[0]).toMatchObject({
+      id: "ses_first",
+      source: "session",
+      targetSessionID: "ses_first",
+      title: "Second proxy title",
+      summary: "Proxy summary",
+      agentName: "second-proxy-agent",
+      messageID: "msg_real",
+    });
   });
 
   it("hides a targetless generic task wrapper while keeping the real session", () => {
