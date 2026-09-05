@@ -208,6 +208,7 @@ describe("events", () => {
         },
       },
     });
+    const running = state.children.ses_child_status;
 
     const changed = applySubagentEvent(state, {
       type: "session.status",
@@ -219,6 +220,8 @@ describe("events", () => {
     });
 
     expect(changed).toBe(true);
+    expect(state.children.ses_child_status).not.toBe(running);
+    expect(running.status).toBe("running");
     expect(state.children.ses_child_status).toMatchObject({
       status: "done",
       endedAt: "2026-05-10T10:15:00.000Z",
@@ -453,6 +456,44 @@ describe("events", () => {
       endedAt: "2026-05-10T10:20:00.000Z",
     });
   });
+
+  it("completes every matching subtask from one assistant completion event", () => {
+    const state = createEmptyState();
+    upsertSubtask(state, {
+      partID: "a",
+      parentID: "ses_parent",
+      messageID: "msg_done",
+      description: "A",
+    });
+    upsertSubtask(state, {
+      partID: "b",
+      parentID: "ses_parent",
+      messageID: "msg_done",
+      description: "B",
+    });
+    upsertSubtask(state, {
+      partID: "c",
+      parentID: "ses_parent",
+      messageID: "msg_other",
+      description: "C",
+    });
+
+    applySubagentEvent(state, {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg_done",
+          sessionID: "ses_parent",
+          role: "assistant",
+          time: { completed: 1_777_777_777_000 },
+        },
+      },
+    });
+
+    expect(state.children["subtask:a"]?.status).toBe("done");
+    expect(state.children["subtask:b"]?.status).toBe("done");
+    expect(state.children["subtask:c"]?.status).toBe("running");
+  });
 });
 
 describe("assistant model metadata", () => {
@@ -477,6 +518,28 @@ describe("assistant model metadata", () => {
       modelID: "gpt-5.6",
       variant: "high",
     });
+  });
+
+  it("selects the later original assistant when timestamps are equal", () => {
+    const result = extractLatestAssistantModel([
+      {
+        sessionID: "ses_first",
+        role: "assistant",
+        providerID: "p",
+        modelID: "first",
+        time: { created: 10 },
+      },
+      {
+        sessionID: "ses_second",
+        role: "assistant",
+        providerID: "p",
+        modelID: "second",
+        time: { created: 10 },
+      },
+    ]);
+
+    expect(result?.sessionID).toBe("ses_second");
+    expect(result?.model?.modelID).toBe("second");
   });
 
   it("selects the latest assistant and applies message.updated to its child session", () => {

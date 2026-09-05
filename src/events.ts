@@ -9,10 +9,13 @@ import {
 } from "./reconcile.js";
 import {
   markChildStatus,
+  markChildrenStatusByAnyID,
   setChildModel,
   upsertChildDetails,
   upsertRunningChild,
 } from "./state.js";
+import type { EventChildIndex } from "./event-child-index.js";
+import { createEventChildIndex } from "./event-child-index.js";
 
 export type EventLike = {
   type?: unknown;
@@ -108,18 +111,17 @@ export function extractLatestAssistantModel(
   input: unknown | readonly unknown[],
 ): { sessionID: string; model?: ChildModelState; updatedAt?: string } | undefined {
   const values = Array.isArray(input) ? input : [input];
-  const assistants = values
-    .map((value, index) => ({ message: normalizeMessage(value), index }))
-    .filter(
-      (entry): entry is { message: Record<string, unknown>; index: number } =>
-        entry.message?.role === "assistant",
-    )
-    .sort(
-      (left, right) =>
-        messageActivityMs(left.message) - messageActivityMs(right.message) ||
-        left.index - right.index,
-    );
-  const latest = assistants.at(-1)?.message;
+  let latest: Record<string, unknown> | undefined;
+  let latestActivity = 0;
+  for (const value of values) {
+    const message = normalizeMessage(value);
+    if (message?.role !== "assistant") continue;
+    const activity = messageActivityMs(message);
+    if (!latest || activity >= latestActivity) {
+      latest = message;
+      latestActivity = activity;
+    }
+  }
   if (!latest) return undefined;
   const sessionID = asString(latest.sessionID);
   if (!sessionID) return undefined;
@@ -130,11 +132,11 @@ export function extractLatestAssistantModel(
     providerID && modelID
       ? { providerID, modelID, ...(variant ? { variant } : {}) }
       : undefined;
-  const activity = messageActivityMs(latest);
   return {
     sessionID,
     model,
-    updatedAt: activity > 0 ? new Date(activity).toISOString() : undefined,
+    updatedAt:
+      latestActivity > 0 ? new Date(latestActivity).toISOString() : undefined,
   };
 }
 
@@ -266,34 +268,31 @@ function collectSessionIDs(
 }
 
 function resolveSyntheticTargetSessionID(
-  state: StatuslineState,
+  index: EventChildIndex,
   synthetic: SyntheticTargetContext,
   explicitCandidates: readonly string[] = [],
 ): string | undefined {
-  const candidates = new Set<string>(explicitCandidates.filter(isSessionID));
-
-  const byMessage = Object.values(state.children).filter(
-    (child) =>
-      child.id.startsWith("ses_") &&
-      child.parentID === synthetic.parentID &&
-      child.messageID &&
-      synthetic.messageID &&
-      child.messageID === synthetic.messageID,
+  return index.resolveSyntheticTarget(
+    { parentID: synthetic.parentID, messageID: synthetic.messageID },
+    explicitCandidates,
   );
-  if (byMessage.length === 1) {
-    candidates.add(byMessage[0].id);
-  }
+}
 
-  const byParent = Object.values(state.children).filter(
-    (child) =>
-      child.id.startsWith("ses_") && child.parentID === synthetic.parentID,
-  );
-  if (byParent.length === 1) {
-    candidates.add(byParent[0].id);
-  }
+function syncIndex(
+  index: EventChildIndex,
+  state: StatuslineState,
+  id: string,
+): void {
+  const child = state.children[id];
+  if (child) index.upsert(child);
+}
 
-  if (candidates.size !== 1) return undefined;
-  return [...candidates][0];
+function syncIndexForIDs(
+  index: EventChildIndex,
+  state: StatuslineState,
+  ids: ReadonlySet<string>,
+): void {
+  for (const id of ids) syncIndex(index, state, id);
 }
 
 function extractPartTargetSessionCandidates(event: EventLike): string[] {
@@ -324,6 +323,7 @@ function parseTaskSessionIDFromOutput(
 
 function backfillSyntheticTargetsForSession(
   state: StatuslineState,
+  index: EventChildIndex,
   session: {
     id: string;
     parentID: string;
@@ -331,24 +331,16 @@ function backfillSyntheticTargetsForSession(
     updatedAt?: string;
   },
 ): boolean {
-  const targetlessSynthetic = Object.values(state.children).filter(
-    (child) =>
-      (child.source === "tool" || child.source === "subtask") &&
-      !child.targetSessionID &&
-      child.parentID === session.parentID,
-  );
+  const targetlessSynthetic = index.targetlessSynthetic(session.parentID);
 
   const messageMatches = session.messageID
     ? targetlessSynthetic.filter(
         (child) => child.messageID === session.messageID,
       )
     : [];
-  const existingSessionSiblings = Object.values(state.children).filter(
-    (child) =>
-      child.id !== session.id &&
-      (child.source === "session" || child.id.startsWith("ses_")) &&
-      child.parentID === session.parentID,
-  );
+  const existingSessionSiblings = index
+    .realSessionSiblings(session.parentID)
+    .filter((child) => child.id !== session.id);
   const candidates =
     messageMatches.length > 0 ? messageMatches : targetlessSynthetic;
   if (candidates.length !== 1) return false;
@@ -358,7 +350,7 @@ function backfillSyntheticTargetsForSession(
 
   const synthetic = candidates[0];
   const targetSessionID = resolveSyntheticTargetSessionID(
-    state,
+    index,
     {
       id: synthetic.id,
       parentID: synthetic.parentID,
@@ -368,10 +360,12 @@ function backfillSyntheticTargetsForSession(
   );
   if (targetSessionID !== session.id) return false;
 
-  return upsertChildDetails(state, synthetic.id, {
+  const updated = upsertChildDetails(state, synthetic.id, {
     targetSessionID,
     updatedAt: session.updatedAt,
   });
+  if (updated) syncIndex(index, state, synthetic.id);
+  return updated;
 }
 
 export function extractTaskToolEvidence(
@@ -418,7 +412,7 @@ export function extractTaskToolEvidence(
 }
 
 function mapTaskToolToSubtaskID(
-  state: StatuslineState,
+  index: EventChildIndex,
   task: {
     parentID: string;
     messageID: string;
@@ -429,12 +423,7 @@ function mapTaskToolToSubtaskID(
     targetSessionID?: string;
   },
 ): string | undefined {
-  const runningSubtasks = Object.values(state.children).filter(
-    (child) =>
-      child.source === "subtask" &&
-      child.status === "running" &&
-      child.parentID === task.parentID,
-  );
+  const runningSubtasks = index.runningSubtasks(task.parentID);
   const primaryCandidates = runningSubtasks.filter(
     (child) => child.messageID === task.messageID,
   );
@@ -836,10 +825,14 @@ export function extractChildDetails(event: EventLike): {
 export function applySubagentEvent(
   state: StatuslineState,
   event: unknown,
+  eventIndex?: EventChildIndex,
 ): boolean {
   const e = (event ?? {}) as EventLike;
   const type = asString(e.type);
   if (!type) return false;
+
+  const index =
+    eventIndex ?? createEventChildIndex(Object.values(state.children));
 
   if (type === "session.created" || type === "session.updated") {
     const child = extractCreatedChild(e);
@@ -850,9 +843,11 @@ export function applySubagentEvent(
         source: "session",
         targetSessionID: child.id,
       });
+      syncIndex(index, state, child.id);
       changed = upsertChildDetails(state, child.id, details) || changed;
+      syncIndex(index, state, child.id);
       changed =
-        backfillSyntheticTargetsForSession(state, {
+        backfillSyntheticTargetsForSession(state, index, {
           id: child.id,
           parentID: child.parentID,
           updatedAt: child.updatedAt,
@@ -882,6 +877,7 @@ export function applySubagentEvent(
         changed =
           markChildStatus(state, child.id, sessionStatusFromUpdate, endedAt) ||
           changed;
+        syncIndex(index, state, child.id);
       }
       return changed;
     }
@@ -904,7 +900,9 @@ export function applySubagentEvent(
         ? "error"
         : "done";
     let changed = markChildStatus(state, childID, status, endedAt);
+    syncIndex(index, state, childID);
     changed = upsertChildDetails(state, childID, details) || changed;
+    syncIndex(index, state, childID);
     return changed;
   }
 
@@ -919,7 +917,9 @@ export function applySubagentEvent(
     ]);
     const details = extractChildDetails(e);
     let changed = markChildStatus(state, childID, "error", endedAt);
+    syncIndex(index, state, childID);
     changed = upsertChildDetails(state, childID, details) || changed;
+    syncIndex(index, state, childID);
     return changed;
   }
 
@@ -947,7 +947,9 @@ export function applySubagentEvent(
       status === "running"
         ? false
         : markChildStatus(state, childID, status, endedAt);
+    if (status !== "running") syncIndex(index, state, childID);
     changed = upsertChildDetails(state, childID, details) || changed;
+    syncIndex(index, state, childID);
     return changed;
   }
 
@@ -957,7 +959,7 @@ export function applySubagentEvent(
     const subtask = extractSubtaskChild(e);
     if (subtask) {
       const targetSessionID = resolveSyntheticTargetSessionID(
-        state,
+        index,
         {
           id: subtask.id,
           parentID: subtask.parentID,
@@ -973,12 +975,13 @@ export function applySubagentEvent(
           startedAt: subtask.startedAt,
           updatedAt: subtask.updatedAt,
         }) || changed;
+      syncIndex(index, state, subtask.id);
     }
 
     const tool = extractToolChild(e);
     if (tool) {
       const targetSessionID = resolveSyntheticTargetSessionID(
-        state,
+        index,
         {
           id: tool.id,
           parentID: tool.parentID,
@@ -994,6 +997,7 @@ export function applySubagentEvent(
         updatedAt: tool.updatedAt,
       });
       changed = childChanged || changed;
+      syncIndex(index, state, tool.id);
       if (tool.status === "done" || tool.status === "error") {
         changed =
           markChildStatus(
@@ -1002,13 +1006,14 @@ export function applySubagentEvent(
             tool.status,
             tool.endedAt ?? tool.updatedAt,
           ) || changed;
+        syncIndex(index, state, tool.id);
 
         if (
           asString(
             (e.properties?.part as Record<string, unknown> | undefined)?.tool,
           ) === "task"
         ) {
-          const subtaskID = mapTaskToolToSubtaskID(state, {
+          const subtaskID = mapTaskToolToSubtaskID(index, {
             parentID: tool.parentID,
             messageID: tool.messageID,
             parentMessageID: extractParentMessageID(e),
@@ -1024,6 +1029,7 @@ export function applySubagentEvent(
                   targetSessionID,
                   updatedAt: tool.updatedAt,
                 }) || changed;
+              syncIndex(index, state, subtaskID);
             }
             changed =
               markChildStatus(
@@ -1032,6 +1038,7 @@ export function applySubagentEvent(
                 tool.status,
                 tool.endedAt ?? tool.updatedAt,
               ) || changed;
+            syncIndex(index, state, subtaskID);
           }
         }
       }
@@ -1048,18 +1055,23 @@ export function applySubagentEvent(
           assistantModel.model,
           assistantModel.updatedAt,
         ) || changed;
+      syncIndexForIDs(index, state, new Set([assistantModel.sessionID]));
     }
     const completed = extractCompletedAssistantMessage(e);
     if (completed) {
-      for (const child of Object.values(state.children)) {
-        if (
-          child.source === "subtask" &&
-          child.status === "running" &&
-          child.parentID === completed.sessionID &&
-          child.messageID === completed.messageID
-        ) {
-          changed = markChildStatus(state, child.id, "done") || changed;
+      const matchingIDs = new Set<string>();
+      for (const child of index.runningSubtasks(completed.sessionID)) {
+        if (child.messageID === completed.messageID) {
+          matchingIDs.add(child.id);
         }
+      }
+      if (matchingIDs.size > 0) {
+        changed =
+          markChildrenStatusByAnyID(state, {
+            childIDs: matchingIDs,
+            status: "done",
+          }) || changed;
+        syncIndexForIDs(index, state, matchingIDs);
       }
     }
   }
@@ -1069,6 +1081,7 @@ export function applySubagentEvent(
     for (const childID of extractDetailTargetIDs(e)) {
       if (state.children[childID]) {
         changed = upsertChildDetails(state, childID, details) || changed;
+        syncIndex(index, state, childID);
       }
     }
   }
