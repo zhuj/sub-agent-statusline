@@ -77,8 +77,10 @@ import {
 import { registerSubagentCommands } from "./tui-commands.js";
 import {
   createHydrationTransactionIndex,
+  createHydrationMerger,
   type HydrationTransactionIndex,
 } from "./tui-hydration-index.js";
+import { createDiscoveryMetadataLoader } from "./tui-discovery-metadata.js";
 import { buildTuiRowMetrics } from "./tui-row-metrics.js";
 import type { SidebarScrollRowLayout } from "./tui-row-metrics.js";
 import { createRunningReconcileSelector, descendantIDsFromChildren } from "./tui-reconcile.js";
@@ -1406,8 +1408,11 @@ export async function hydratePreviousSubagents(
   currentSessionID: string,
   setState: (fn: (prev: StatuslineState) => StatuslineState) => void,
   shouldContinue: () => boolean = () => true,
+  readState?: () => StatuslineState,
 ): Promise<boolean> {
   if (!currentSessionID || !shouldContinue()) return false;
+
+  const baseline = readState ? cloneState(readState()) : undefined;
 
   try {
     const directory = api.state.path.directory;
@@ -1434,7 +1439,7 @@ export async function hydratePreviousSubagents(
     const statusHydrationFailed = !statusResp;
     const parentMessageHydrationFailed = !messagesResp;
     const messages = Array.isArray(messagesResp?.data) ? messagesResp.data : [];
-    const allStatuses = asRecord(statusResp?.data) ?? {};
+    const allStatuses = { ...asRecord(statusResp?.data) };
     const parentMessagesBySession = new Map<string, unknown[]>([
       [currentSessionID, messages],
     ]);
@@ -1460,7 +1465,7 @@ export async function hydratePreviousSubagents(
           model: extractLatestAssistantModel(childMessages),
           fetchFailed,
         };
-    };
+      };
     const childMessageResults: Array<Awaited<ReturnType<typeof fetchChildMessages>>> = [];
     const active: HydratedSession[] = [];
     const remaining: HydratedSession[] = [];
@@ -1469,28 +1474,23 @@ export async function hydratePreviousSubagents(
       group.push(session);
     }
     const hydrationOrder = active.concat(remaining);
-    for (let index = 0; index < hydrationOrder.length; index += 8) {
-      if (!shouldContinue()) return false;
-      const chunk = hydrationOrder.slice(index, index + 8);
-      childMessageResults.push(...await Promise.all(chunk.map(fetchChildMessages)));
-    }
-    const childMessageSummaryByID = new Map(
-      childMessageResults
-        .map((result) => [result.session.id, result]),
-    );
-    const parentTaskEvidenceByChildID = new Map<string, ParentTaskEvidence>();
-    for (const [parentSessionID, parentMessages] of parentMessagesBySession) {
-      for (const [childID, evidence] of collectParentTaskEvidenceByChildSessionID(
-        parentMessages,
-        parentSessionID,
-      )) {
-        parentTaskEvidenceByChildID.set(childID, evidence);
+    const buildDraft = (
+      current: StatuslineState,
+      selectedSessions: HydratedSession[],
+    ): StatuslineState => {
+      const childMessageSummaryByID = new Map(
+        childMessageResults.map((result) => [result.session.id, result]),
+      );
+      const parentTaskEvidenceByChildID = new Map<string, ParentTaskEvidence>();
+      for (const [parentSessionID, parentMessages] of parentMessagesBySession) {
+        for (const [childID, evidence] of collectParentTaskEvidenceByChildSessionID(
+          parentMessages,
+          parentSessionID,
+        )) {
+          parentTaskEvidenceByChildID.set(childID, evidence);
+        }
       }
-    }
 
-    if (!shouldContinue()) return false;
-    snapshotSidebarScrollOffsets();
-    setState((current) => {
       const next = cloneState(current);
       const hydrationIndex = createHydrationTransactionIndex(
         Object.values(next.children),
@@ -1498,7 +1498,7 @@ export async function hydratePreviousSubagents(
       const eventIndex = createEventChildIndex(Object.values(next.children));
       let changed = false;
 
-      for (const hydratedSession of sessionTree.sessions) {
+      for (const hydratedSession of selectedSessions) {
         const session = hydratedSession.info;
         const status = allStatuses[hydratedSession.id];
         const sessionStatus = deriveSessionChildStatus(status);
@@ -1736,7 +1736,42 @@ export async function hydratePreviousSubagents(
       const refreshed = refreshLiveState(next);
       if (!changed && !refreshed) return current;
       return next;
-    });
+    };
+
+    let groups = [hydrationOrder];
+    if (baseline && active.length > 0) {
+      const byID = new Map(sessionTree.sessions.map((session) => [session.id, session]));
+      const requiredIDs = new Set<string>();
+      for (const session of active) {
+        let ancestor: HydratedSession | undefined = session;
+        while (ancestor && !requiredIDs.has(ancestor.id)) {
+          requiredIDs.add(ancestor.id);
+          if (!Object.hasOwn(allStatuses, ancestor.id)) allStatuses[ancestor.id] = { type: "idle" };
+          ancestor = byID.get(ancestor.parentID);
+        }
+      }
+      const deferred = remaining.filter((session) => !requiredIDs.has(session.id));
+      if (deferred.length > 0) {
+        groups = [hydrationOrder.filter((session) => requiredIDs.has(session.id)), deferred];
+      }
+    }
+    const merger = baseline ? createHydrationMerger(baseline) : undefined;
+    const fetchedIDs = new Set<string>();
+    for (const group of groups) {
+      for (let index = 0; index < group.length; index += 8) {
+        if (!shouldContinue()) return false;
+        const chunk = group.slice(index, index + 8);
+        childMessageResults.push(...await Promise.all(chunk.map(fetchChildMessages)));
+        for (const session of chunk) fetchedIDs.add(session.id);
+      }
+      if (!shouldContinue()) return false;
+      const selectedSessions = sessionTree.sessions.filter((session) => fetchedIDs.has(session.id));
+      snapshotSidebarScrollOffsets();
+      setState((current) => {
+        const draft = buildDraft(baseline ?? current, selectedSessions);
+        return merger ? merger.merge(current, draft) : draft;
+      });
+    }
     if (
       topLevelHydrationFailed ||
       sessionTree.descendantFailed ||
@@ -1868,6 +1903,7 @@ export function discoverCachedBusyDescendants(
   rootID: string | undefined,
   statuses: Record<string, unknown>,
   readSession: (id: string) => unknown,
+  completeStatusSnapshot = false,
 ): boolean {
   if (!rootID) return false;
   const connected = new Set([rootID, ...descendantIDsFromChildren(Object.values(state.children), rootID)]);
@@ -1876,14 +1912,24 @@ export function discoverCachedBusyDescendants(
     deriveSessionChildStatus(statuses[id]) === "running",
   );
   const attempted = new Set<string>();
+  const observedStatuses = new Map<string, unknown>();
   for (let cursor = 0; cursor < pending.length; cursor += 1) {
     const id = pending[cursor];
     if (id === undefined || attempted.has(id)) continue;
     attempted.add(id);
-    if (connected.has(id) || state.children[id] || !id.startsWith("ses_")) continue;
-    if (deriveSessionChildStatus(statuses[id]) === undefined) continue;
+    if (connected.has(id) || !id.startsWith("ses_")) continue;
+    const existing = state.children[id];
+    if (existing) {
+      pending.push(existing.parentID);
+      continue;
+    }
+    // SessionStatus.list omits idle entries; failed/cache reads do not prove idle.
+    const status = Object.hasOwn(statuses, id) ? statuses[id]
+      : completeStatusSnapshot ? { type: "idle" } : undefined;
+    if (deriveSessionChildStatus(status) === undefined) continue;
     const info = asRecord(readSession(id));
     if (!info || info.id !== id || typeof info.parentID !== "string") continue;
+    observedStatuses.set(id, status);
     const bucket = buckets.get(info.parentID) ?? [];
     bucket.push(info);
     buckets.set(info.parentID, bucket);
@@ -1904,7 +1950,7 @@ export function discoverCachedBusyDescendants(
       changed = applySubagentEvent(state, { type: "session.created", properties: { info } }, index) || changed;
       changed = applySubagentEvent(state, {
         type: "session.status",
-        properties: { sessionID: id, status: statuses[id] },
+        properties: { sessionID: id, status: observedStatuses.get(id) },
       }, index) || changed;
       if (state.children[id]) {
         created += 1;
@@ -1948,10 +1994,11 @@ export async function probeRunningEvidence(input: {
   candidateAgeMs: number;
   nowMs: number;
   readDirectoryStatus?: () => Promise<{ data?: unknown } | undefined>;
+  statusOverride?: unknown;
 }): Promise<RunningReconcileEvidence> {
   let probeFailed = false;
 
-  const directStatus = safeRead(() =>
+  const directStatus = input.statusOverride ?? safeRead(() =>
     input.api.state.session.status(input.targetSessionID),
   );
   if (directStatus === undefined) probeFailed = true;
@@ -2284,6 +2331,7 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
         sessionID,
         setState,
         () => !disposed,
+        () => state(),
       );
       if (disposed) {
         clearHydrateRetryTimeout(sessionID);
@@ -2338,6 +2386,12 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
   });
 
   const selectRunningCandidates = createRunningReconcileSelector();
+  const loadDiscoveryMetadata = createDiscoveryMetadataLoader(
+    (id) => state().children[id] ?? api.state.session.get(id),
+    async (id) => (await safeReadAsync(() => api.client.session.get({
+      sessionID: id, directory: api.state.path.directory,
+    })))?.data,
+  );
   const reconcileRunningChildren = async (): Promise<void> => {
     if (reconcileInFlight || disposed) return;
     reconcileInFlight = true;
@@ -2366,6 +2420,13 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
         excludedTargetIDs,
         oldCandidateAgeMs: RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS,
       });
+      const hasTerminalSessions = Object.values(snapshot.children).some(
+        (child) => child.id.startsWith("ses_") && child.status !== "running",
+      );
+      const statusSnapshot = hasTerminalSessions || currentSessionID !== undefined || selected.some((candidate) => candidate.targetSessionID !== undefined)
+        ? asRecord((await readDirectoryStatus())?.data)
+        : undefined;
+      if (disposed || pendingEvents.length > 0) return;
 
       const mutations: Array<{
         childID: string;
@@ -2485,6 +2546,9 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
           candidateAgeMs: Math.max(candidate.startedMs, candidate.updatedMs),
           nowMs,
           readDirectoryStatus,
+          statusOverride: statusSnapshot === undefined ? undefined
+            : Object.hasOwn(statusSnapshot, candidate.targetSessionID) ? statusSnapshot[candidate.targetSessionID]
+            : snapshot.children[candidate.targetSessionID] ? { type: "idle" } : undefined,
         });
 
         if (evidence.status === "done" || evidence.status === "error") {
@@ -2535,25 +2599,43 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
         );
       }
 
-      const hasTerminalSessions = Object.values(snapshot.children).some(
-        (child) => child.id.startsWith("ses_") && child.status !== "running",
-      );
-      const statuses = hasTerminalSessions || currentSessionID !== undefined
-        ? asRecord((await readDirectoryStatus())?.data) ?? {}
-        : {};
+      const statuses = statusSnapshot ?? {};
       if (disposed || pendingEvents.length > 0) return;
       if (mutations.length === 0 && Object.keys(statuses).length === 0) return;
+
+      const metadata = currentSessionID === undefined ? new Map<string, Record<string, unknown>>()
+        : await loadDiscoveryMetadata(
+          Object.keys(statuses).filter((id) => deriveSessionChildStatus(statuses[id]) === "running"),
+          new Set([currentSessionID, ...descendantIDsFromChildren(Object.values(snapshot.children), currentSessionID)]),
+          () => !disposed && currentSessionID === resolveRouteSessionID(api),
+        );
+      if (disposed || pendingEvents.length > 0) return;
 
       snapshotSidebarScrollOffsets();
       setState((current: StatuslineState) => {
         const next = cloneState(current);
         let changed = false;
 
+        const isFresh = (id: string): boolean => {
+          const observed = snapshot.children[id];
+          const latest = current.children[id];
+          return !!observed && !!latest && latest.status === observed.status &&
+            latest.updatedAt === observed.updatedAt && latest.endedAt === observed.endedAt &&
+            latest.parentID === observed.parentID && latest.targetSessionID === observed.targetSessionID &&
+            latest.messageID === observed.messageID && latest.startedAt === observed.startedAt &&
+            latest.title === observed.title && latest.summary === observed.summary &&
+            latest.agentName === observed.agentName && latest.source === observed.source &&
+            latest.toolName === observed.toolName &&
+            latest.model?.providerID === observed.model?.providerID &&
+            latest.model?.modelID === observed.model?.modelID &&
+            latest.model?.variant === observed.model?.variant &&
+            latest.tokens?.input === observed.tokens?.input && latest.tokens?.output === observed.tokens?.output &&
+            latest.tokens?.total === observed.tokens?.total && latest.tokens?.contextPercent === observed.tokens?.contextPercent;
+        };
+        let completionIndex: ReturnType<typeof createEventChildIndex> | undefined;
         for (const mutation of mutations) {
-          const observed = snapshot.children[mutation.childID];
-          const latest = current.children[mutation.childID];
-          if (!observed || !latest || latest.status !== "running" ||
-              latest.updatedAt !== observed.updatedAt) continue;
+          if (current.children[mutation.childID]?.status !== "running" || !isFresh(mutation.childID)) continue;
+          completionIndex ??= createEventChildIndex(Object.values(next.children));
           if (
             mutation.reconcileWithoutTargetSessionID &&
             mutation.targetSessionID.startsWith("ses_")
@@ -2563,15 +2645,19 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
                 targetSessionID: mutation.targetSessionID,
                 updatedAt: mutation.endedAt,
               }) || changed;
+            const updated = next.children[mutation.childID];
+            if (updated) completionIndex.upsert(updated);
           }
+          const completionID = mutation.reconcileWithoutTargetSessionID
+            ? mutation.childID : mutation.targetSessionID;
+          const candidateIDs = completionIndex.matchingIDs(completionID).filter(isFresh);
           if (
             markChildStatus(
               next,
-              mutation.reconcileWithoutTargetSessionID
-                ? mutation.childID
-                : mutation.targetSessionID,
+              completionID,
               mutation.status,
               mutation.endedAt,
+              candidateIDs,
             )
           ) {
             changed = true;
@@ -2581,7 +2667,7 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
         changed = resumeKnownBusySessions(next, snapshot, statuses) || changed;
         if (currentSessionID === resolveRouteSessionID(api)) {
           changed = discoverCachedBusyDescendants(
-            next, currentSessionID, statuses, (id) => api.state.session.get(id),
+            next, currentSessionID, statuses, (id) => metadata.get(id), statusSnapshot !== undefined,
           ) || changed;
         }
         const refreshed = refreshLiveState(next);

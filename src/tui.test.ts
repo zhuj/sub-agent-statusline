@@ -1357,6 +1357,147 @@ describe("TUI subagent snapshots", () => {
 });
 
 describe("hydratePreviousSubagents", () => {
+  it.each([false, true])("uses omitted idle ancestors only with a complete server snapshot: %s", (complete) => {
+    const current = stateWith([]);
+    const metadata: Record<string, unknown> = {
+      ses_leaf: { id: "ses_leaf", parentID: "ses_parent", title: "Leaf" },
+      ses_parent: { id: "ses_parent", parentID: "ses_root", title: "Parent" },
+    };
+    expect(discoverCachedBusyDescendants(current, "ses_root", { ses_leaf: { type: "busy" } },
+      (id) => metadata[id], complete)).toBe(complete);
+    if (complete) {
+      expect(current.children.ses_parent?.status).toBe("done");
+      expect(current.children.ses_leaf?.status).toBe("running");
+    } else expect(Object.keys(current.children)).toHaveLength(0);
+  });
+
+  it.each([false, true])("publishes ten nested active leaves before unrelated history settles (explicit idle: %s)", async (explicitIdle) => {
+    const sessions: Array<{ id: string; parentID: string; title: string }> = [];
+    const activeIDs = new Set<string>();
+    for (let branch = 0; branch < 10; branch += 1) {
+      const depth = 2 + branch % 4;
+      for (let level = 0; level < depth; level += 1) {
+        const id = `ses_branch_${branch}_${level}`;
+        sessions.push({ id, parentID: level === 0 ? "ses_root" : `ses_branch_${branch}_${level - 1}`, title: id });
+        if (level === depth - 1) activeIDs.add(id);
+      }
+    }
+    const priorityCount = sessions.length;
+    while (sessions.length < 200) {
+      const id = `ses_history_${sessions.length}`;
+      sessions.push({ id, parentID: "ses_root", title: id });
+    }
+    let release: (() => void) | undefined;
+    let notify: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { notify = resolve; });
+    const requested: string[] = [];
+    let inFlight = 0;
+    let peak = 0;
+    const messages = vi.fn(async ({ sessionID }: { sessionID: string }) => {
+      requested.push(sessionID);
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      if (sessionID === `ses_history_${priorityCount}`) { notify?.(); await gate; }
+      await Promise.resolve();
+      inFlight -= 1;
+      return { data: [] };
+    });
+    const api = {
+      state: { path: { directory: "/repo" } },
+      client: { session: {
+        children: vi.fn(async ({ sessionID }: { sessionID: string }) => ({
+          data: sessions.filter((session) => session.parentID === sessionID),
+        })),
+        messages,
+        status: vi.fn(async () => ({ data: Object.fromEntries(sessions.filter((session) => explicitIdle || activeIDs.has(session.id) || session.id.startsWith("ses_history_")).map((session) =>
+          [session.id, { type: activeIDs.has(session.id) ? "busy" : "idle" }],
+        )) })),
+      } },
+    } as unknown as TuiPluginApi;
+    let current = stateWith([]);
+    const hydration = hydratePreviousSubagents(api, "ses_root", (update) => {
+      current = update(current);
+    }, () => true, () => current);
+    await started;
+    const early = current;
+    current = { ...current, children: { ...current.children,
+      ses_branch_0_1: child({ id: "ses_branch_0_1", parentID: "ses_branch_0_0", status: "done",
+        model: { providerID: "openai", modelID: "live-model" }, tokens: { total: 99 },
+        updatedAt: new Date().toISOString(), endedAt: new Date().toISOString(),
+      }),
+    } };
+    release?.();
+    expect(await hydration).toBe(true);
+    const visible = resolveTuiSubagentSnapshot({ state: early, sessionID: "ses_root" });
+    expect(new Set(visible.visibleChildren.filter((item) => item.status === "running").map((item) => item.id))).toEqual(activeIDs);
+    expect(Object.keys(early.children)).toHaveLength(priorityCount);
+    expect(early.children.ses_branch_0_0?.status).toBe("done");
+    expect(current.children.ses_branch_0_1).toMatchObject({ status: "done", tokens: { total: 99 }, model: { modelID: "live-model" } });
+    expect(Object.keys(current.children)).toHaveLength(200);
+    expect(current.totalExecuted).toBe(200);
+    expect(requested).toHaveLength(201);
+    expect(new Set(requested).size).toBe(201);
+    expect(peak).toBeLessThanOrEqual(8);
+  });
+
+  it("keeps early startup state but stops remaining requests after cancellation", async () => {
+    let allowed = true;
+    let current = stateWith([]);
+    const messages = vi.fn(async () => ({ data: [] }));
+    const api = {
+      state: { path: { directory: "/repo" } },
+      client: { session: {
+        children: vi.fn(async ({ sessionID }: { sessionID: string }) => ({ data: sessionID === "ses_root"
+          ? ["ses_active", "ses_history"].map((id) => ({ id, parentID: "ses_root", title: id })) : [] })),
+        messages,
+        status: vi.fn(async () => ({ data: { ses_active: { type: "busy" }, ses_history: { type: "idle" } } })),
+      } },
+    } as unknown as TuiPluginApi;
+    const publish = vi.fn((update: (state: StatuslineState) => StatuslineState) => {
+      current = update(current);
+      allowed = false;
+    });
+    expect(await hydratePreviousSubagents(api, "ses_root", publish, () => allowed, () => current)).toBe(false);
+    expect(publish).toHaveBeenCalledOnce();
+    expect(messages).toHaveBeenCalledTimes(2);
+    expect(current.children.ses_active?.status).toBe("running");
+    expect(current.children.ses_history).toBeUndefined();
+  });
+
+  it("does not rescan unrelated rows for every hydrated subtask completion", async () => {
+    let unrelatedReads = 0;
+    const unrelated = child({ id: "ses_unrelated", parentID: "ses_other" });
+    Object.defineProperty(unrelated, "id", {
+      enumerable: true,
+      get() { unrelatedReads += 1; return "ses_unrelated"; },
+    });
+    let current = stateWith([unrelated]);
+    unrelatedReads = 0;
+    const parts = Array.from({ length: 100 }, (_, index) => ({
+      id: `part_completed_${index}`, type: "subtask", prompt: `Task ${index}`,
+      sessionID: "ses_root", messageID: "msg_completed",
+      description: `Task ${index}`, agent: "general",
+    }));
+    const api = {
+      state: { path: { directory: "/repo" } },
+      client: { session: {
+        children: vi.fn(async () => ({ data: [] })),
+        status: vi.fn(async () => ({ data: {} })),
+        messages: vi.fn(async () => ({ data: [{
+          info: { id: "msg_completed", role: "assistant", time: { completed: Date.now() } },
+          parts,
+        }] })),
+      } },
+    } as unknown as TuiPluginApi;
+    expect(await hydratePreviousSubagents(api, "ses_root", (update) => {
+      current = update(current);
+    })).toBe(true);
+    expect(unrelatedReads).toBeLessThan(20);
+    expect(parts.every((part) => current.children[`subtask:${part.id}`]?.status === "done")).toBe(true);
+    expect(current.children.ses_unrelated?.status).toBe("running");
+  });
+
   it.each([
     { phase: "before", expectedCalls: 0 },
     { phase: "tree", expectedCalls: 1 },
@@ -1446,6 +1587,106 @@ describe("hydratePreviousSubagents", () => {
     expect(children).toHaveBeenCalledTimes(201);
     expect(Object.keys(current.children)).toHaveLength(200);
     expect(Object.values(current.children).filter((item) => item.status === "running")).toHaveLength(10);
+  });
+
+  it("merges live changes during pending historical requests without retrying", async () => {
+    // Given: a controlled history request that we hold until we mutate live state.
+    let releaseHistory: (() => void) | undefined;
+    const historyGate = new Promise<void>((resolve) => {
+      releaseHistory = resolve;
+    });
+    let markHistoryStarted: (() => void) | undefined;
+    const historyStarted = new Promise<void>((resolve) => {
+      markHistoryStarted = resolve;
+    });
+    const sessions = [
+      { id: "ses_existing", parentID: "ses_root", title: "Existing" },
+      { id: "ses_unrelated", parentID: "ses_root", title: "Unrelated" },
+    ];
+    const messages = vi.fn(async ({ sessionID }: { sessionID: string }) => {
+      if (sessionID === "ses_existing") {
+        markHistoryStarted?.();
+        await historyGate;
+        return { data: [{
+          info: { id: "msg_existing", role: "assistant", time: { completed: Date.now() } },
+          parts: [],
+        }] };
+      }
+      return { data: [] };
+    });
+    const api = {
+      state: { path: { directory: "/repo" } },
+      client: { session: {
+        children: vi.fn(async ({ sessionID }: { sessionID: string }) => ({
+          data: sessionID === "ses_root" ? sessions : [],
+        })),
+        messages,
+        status: vi.fn(async () => ({ data: {
+          ses_existing: { type: "idle" },
+          ses_unrelated: { type: "idle" },
+        } })),
+      } },
+    } as unknown as TuiPluginApi;
+
+    // Pre-existing live row that will be mutated during the pending request.
+    const existingLive = child({
+      id: "ses_existing",
+      parentID: "ses_root",
+      status: "running",
+      title: "Existing",
+      tokens: { total: 1 },
+      model: { providerID: "openai", modelID: "old-model" },
+      updatedAt: "2026-09-05T10:00:00.000Z",
+    });
+    let current = stateWith([existingLive]);
+
+    const publish = vi.fn((update: (state: StatuslineState) => StatuslineState) => {
+      current = update(current);
+    });
+
+    const hydrationPromise = hydratePreviousSubagents(
+      api,
+      "ses_root",
+      publish,
+      () => true,
+      () => current,
+    );
+
+    await historyStarted;
+    expect(publish).not.toHaveBeenCalled();
+
+    // When: live state mutates the existing row while history is pending.
+    current = {
+      ...current,
+      children: {
+        ...current.children,
+        ses_existing: {
+          ...existingLive,
+          status: "running",
+          tokens: { total: 99 },
+          model: { providerID: "openai", modelID: "new-model" },
+          updatedAt: "2026-09-05T11:00:00.000Z",
+        },
+      },
+    };
+
+    // Then: release the held history request.
+    releaseHistory?.();
+
+    // And: hydration completes successfully without retrying.
+    expect(await hydrationPromise).toBe(true);
+    expect(messages).toHaveBeenCalledTimes(3);
+
+    // The live mutation survives: newest model/tokens preserved.
+    expect(current.children.ses_existing?.model).toEqual({
+      providerID: "openai",
+      modelID: "new-model",
+    });
+    expect(current.children.ses_existing?.tokens).toEqual({ total: 99 });
+    expect(current.children.ses_existing?.status).toBe("running");
+
+    // The unrelated historical row is merged in.
+    expect(current.children.ses_unrelated?.id).toBe("ses_unrelated");
   });
 
   const hydratedChild = {
@@ -2035,16 +2276,17 @@ describe("probeRunningEvidence", () => {
 });
 
 describe("persisted parent-message reconciliation", () => {
-  it("discovers a cached busy child through polling without remote histories", async () => {
+  it.each(["cached", "remote", "remote-ancestry"])("discovers a busy child using %s metadata without remote histories", async (source) => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-30T12:30:00Z"));
     let dispose: (() => void) | undefined;
     const handlers = new Map<string, (event: unknown) => void>();
+    let serverBusy = true;
     const api = {
       state: {
         path: { directory: "/repo" }, provider: [],
         session: {
-          get: vi.fn((id: string) => id === "ses_new" ? { id, parentID: "ses_parent", title: "New child" } : undefined),
+          get: vi.fn((id: string) => source === "cached" && id === "ses_new" ? { id, parentID: "ses_parent", title: "New child" } : undefined),
           status: vi.fn(() => ({ type: "busy" })),
           messages: vi.fn((_sessionID: string) => []),
         },
@@ -2055,7 +2297,11 @@ describe("persisted parent-message reconciliation", () => {
       client: { session: {
         children: vi.fn(async () => ({ data: [] })),
         messages: vi.fn(async () => ({ data: [] })),
-        status: vi.fn(async () => ({ data: { ses_new: { type: "busy" } } })),
+        status: vi.fn(async () => ({ data: serverBusy ? { ses_new: { type: "busy" } } : {} })),
+        get: vi.fn(async ({ sessionID }: { sessionID: string }) => ({ data:
+          sessionID === "ses_new" ? { id: sessionID, parentID: "ses_parent", title: "New child" }
+          : sessionID === "ses_parent" ? { id: sessionID, parentID: "ses_root", title: "Parent" } : undefined,
+        })),
       } },
       event: { on: vi.fn((name: string, handler: (event: unknown) => void) => {
         handlers.set(name, handler); return vi.fn();
@@ -2069,20 +2315,34 @@ describe("persisted parent-message reconciliation", () => {
       await vi.advanceTimersByTimeAsync(0);
       const statusBaseline = api.client.session.status.mock.calls.length;
       const historiesBaseline = api.client.session.messages.mock.calls.length;
-      handlers.get("session.created")?.({ type: "session.created", properties: {
-        info: { id: "ses_parent", parentID: "ses_root", title: "Parent" },
-      } });
-      handlers.get("session.idle")?.({ type: "session.idle", properties: { sessionID: "ses_parent" } });
+      if (source !== "remote-ancestry") {
+        handlers.get("session.created")?.({ type: "session.created", properties: {
+          info: { id: "ses_parent", parentID: "ses_root", title: "Parent" },
+        } });
+        handlers.get("session.idle")?.({ type: "session.idle", properties: { sessionID: "ses_parent" } });
+      }
       await vi.advanceTimersByTimeAsync(10_000);
-      expect(api.state.session.get).toHaveBeenCalledExactlyOnceWith("ses_new");
+      const metadataCount = source === "remote-ancestry" ? 2 : 1;
+      expect(api.state.session.get).toHaveBeenCalledWith("ses_new");
+      expect(api.state.session.get).toHaveBeenCalledTimes(metadataCount);
       expect(api.client.session.status).toHaveBeenCalledTimes(statusBaseline + 1);
+      if (source === "remote-ancestry") await vi.advanceTimersByTimeAsync(10_000);
       api.state.session.messages.mockClear();
       await vi.advanceTimersByTimeAsync(10_000);
-      expect(api.client.session.status).toHaveBeenCalledTimes(statusBaseline + 2);
+      expect(api.client.session.status).toHaveBeenCalledTimes(statusBaseline + (source === "remote-ancestry" ? 3 : 2));
       expect(api.state.session.messages).toHaveBeenCalledWith("ses_new");
       expect(api.state.session.messages).not.toHaveBeenCalledWith("ses_parent");
-      expect(api.state.session.get).toHaveBeenCalledExactlyOnceWith("ses_new");
+      expect(api.state.session.get).toHaveBeenCalledTimes(metadataCount);
+      expect(api.client.session.get).toHaveBeenCalledTimes(source === "cached" ? 0 : metadataCount);
       expect(api.client.session.messages).toHaveBeenCalledTimes(historiesBaseline);
+      serverBusy = false;
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(api.client.session.messages).toHaveBeenCalledTimes(historiesBaseline + 1);
+      await vi.advanceTimersByTimeAsync(10_000);
+      api.state.session.messages.mockClear();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(api.state.session.messages).not.toHaveBeenCalledWith("ses_new");
+      expect(api.client.session.messages).toHaveBeenCalledTimes(historiesBaseline + 1);
     } finally {
       dispose?.();
       vi.clearAllTimers();
