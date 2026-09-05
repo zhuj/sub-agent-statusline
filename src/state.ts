@@ -267,7 +267,25 @@ function sameTokens(
   left: ChildTokenState | undefined,
   right: ChildTokenState | undefined,
 ): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  if (!left || !right) return left === right;
+  return (
+    left.input === right.input &&
+    left.output === right.output &&
+    left.total === right.total &&
+    left.contextPercent === right.contextPercent
+  );
+}
+
+function sameModel(
+  left: ChildModelState | undefined,
+  right: ChildModelState | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  return (
+    left.providerID === right.providerID &&
+    left.modelID === right.modelID &&
+    left.variant === right.variant
+  );
 }
 
 function normalizeComparableText(value: string): string {
@@ -372,6 +390,36 @@ export function refreshDerivedFields(
       child.targetSessionID,
       id.startsWith("ses_") ? id : undefined,
     );
+    const tokens = sanitizeTokens(child.tokens);
+    const model = sanitizeModel(child.model);
+    const tokensChanged = !sameTokens(child.tokens, tokens);
+    const modelChanged = !sameModel(child.model, model);
+    const color = statusColor(status);
+    const elapsedMs = resolveElapsedMs(
+      {
+        ...child,
+        startedAt,
+        updatedAt,
+        endedAt,
+        status,
+        color,
+      },
+      nowMs,
+    );
+
+    if (
+      child.startedAt === startedAt &&
+      child.updatedAt === updatedAt &&
+      child.endedAt === endedAt &&
+      child.status === status &&
+      child.targetSessionID === targetSessionID &&
+      child.color === color &&
+      !tokensChanged &&
+      !modelChanged &&
+      child.elapsedMs === elapsedMs
+    ) {
+      continue;
+    }
 
     state.children[id] = {
       ...child,
@@ -380,20 +428,10 @@ export function refreshDerivedFields(
       endedAt,
       status,
       targetSessionID,
-      color: statusColor(status),
-      tokens: sanitizeTokens(child.tokens),
-      model: sanitizeModel(child.model),
-      elapsedMs: resolveElapsedMs(
-        {
-          ...child,
-          startedAt,
-          updatedAt,
-          endedAt,
-          status,
-          color: statusColor(status),
-        },
-        nowMs,
-      ),
+      color,
+      tokens: tokensChanged ? tokens : child.tokens,
+      model: modelChanged ? model : child.model,
+      elapsedMs,
     };
   }
 
@@ -489,7 +527,7 @@ export function upsertRunningChild(
     next.startedAt === existing.startedAt &&
     next.endedAt === existing.endedAt &&
     sameTokens(next.tokens, existing.tokens) &&
-    JSON.stringify(next.model) === JSON.stringify(existing.model)
+    sameModel(next.model, existing.model)
   ) {
     return counted;
   }
@@ -499,26 +537,37 @@ export function upsertRunningChild(
   return true;
 }
 
-export function markChildStatus(
+export type MarkChildrenStatusInput = {
+  readonly childIDs: ReadonlySet<string>;
+  readonly status: Exclude<ChildStatus, "running">;
+  readonly endedAt?: string;
+};
+
+export function markChildrenStatusByAnyID(
   state: StatuslineState,
-  childID: string,
-  status: Exclude<ChildStatus, "running">,
-  endedAt?: string,
+  input: MarkChildrenStatusInput,
 ): boolean {
-  const now = new Date().toISOString();
+  const nowDate = new Date();
+  const nowISO = nowDate.toISOString();
+  const nowMs = nowDate.getTime();
   let changed = false;
   let stateUpdatedAt = state.updatedAt;
 
   for (const child of Object.values(state.children)) {
-    if (child.id !== childID && child.targetSessionID !== childID) continue;
+    if (
+      !input.childIDs.has(child.id) &&
+      !(child.targetSessionID && input.childIDs.has(child.targetSessionID))
+    ) {
+      continue;
+    }
 
-    const observedEndedAt = endedAt
-      ? safeTimestamp(endedAt, now)
-      : (child.endedAt ?? now);
+    const observedEndedAt = input.endedAt
+      ? safeTimestamp(input.endedAt, nowISO)
+      : (child.endedAt ?? nowISO);
 
     if (
-      child.status === status &&
-      child.color === statusColor(status) &&
+      child.status === input.status &&
+      child.color === statusColor(input.status) &&
       child.updatedAt === observedEndedAt &&
       child.endedAt === observedEndedAt
     ) {
@@ -527,14 +576,14 @@ export function markChildStatus(
 
     const nextChild: ChildSessionState = {
       ...child,
-      status,
-      color: statusColor(status),
+      status: input.status,
+      color: statusColor(input.status),
       updatedAt: observedEndedAt,
       endedAt: observedEndedAt,
     };
     state.children[child.id] = {
       ...nextChild,
-      elapsedMs: resolveElapsedMs(nextChild, Date.now()),
+      elapsedMs: resolveElapsedMs(nextChild, nowMs),
     };
     stateUpdatedAt = observedEndedAt;
     changed = true;
@@ -544,6 +593,19 @@ export function markChildStatus(
     state.updatedAt = stateUpdatedAt;
   }
   return changed;
+}
+
+export function markChildStatus(
+  state: StatuslineState,
+  childID: string,
+  status: Exclude<ChildStatus, "running">,
+  endedAt?: string,
+): boolean {
+  return markChildrenStatusByAnyID(state, {
+    childIDs: new Set([childID]),
+    status,
+    endedAt,
+  });
 }
 
 export function upsertChildDetails(
@@ -616,7 +678,7 @@ export function setChildModel(
   const observedUpdatedAt = safeTimestamp(updatedAt, new Date().toISOString());
   for (const child of matches) {
     const sanitized = sanitizeModel(model);
-    if (JSON.stringify(child.model) === JSON.stringify(sanitized)) continue;
+    if (sameModel(child.model, sanitized)) continue;
     state.children[child.id] = { ...child, model: sanitized };
     changed = true;
   }

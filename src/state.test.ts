@@ -6,6 +6,7 @@ import {
   getCounts,
   isVisibleSubagentCounterEligible,
   markChildStatus,
+  markChildrenStatusByAnyID,
   pruneTerminalChildren,
   refreshDerivedFields,
   upsertChildDetails,
@@ -393,6 +394,68 @@ describe("state", () => {
     });
   });
 
+  it("retains normalized rows and replaces only rows with derived changes", () => {
+    const state = createEmptyState();
+    const unchanged = child({
+      id: "ses_unchanged",
+      targetSessionID: "ses_unchanged",
+      status: "done",
+      color: "green",
+      updatedAt: "2026-04-30T10:01:00.000Z",
+      endedAt: "2026-04-30T10:01:00.000Z",
+      elapsedMs: 60_000,
+      tokens: { total: 1 },
+    });
+    const changed = child({
+      id: "ses_changed",
+      targetSessionID: "ses_changed",
+      color: "red",
+      elapsedMs: 0,
+    });
+    state.children = { ses_unchanged: unchanged, ses_changed: changed };
+
+    refreshDerivedFields(state, new Date("2026-04-30T10:05:00.000Z"));
+
+    expect(state.children.ses_unchanged).toBe(unchanged);
+    expect(state.children.ses_changed).not.toBe(changed);
+    expect(state.children.ses_changed).toMatchObject({
+      color: "yellow",
+      elapsedMs: 300_000,
+    });
+    expect(changed).toMatchObject({ color: "red", elapsedMs: 0 });
+  });
+
+  it("reuses normalized rows and replaces only changed derived rows", () => {
+    const state = createEmptyState();
+    const unchanged = child({
+      id: "ses_unchanged",
+      targetSessionID: "ses_unchanged",
+      status: "done",
+      color: "green",
+      updatedAt: "2026-04-30T10:01:00.000Z",
+      endedAt: "2026-04-30T10:01:00.000Z",
+      elapsedMs: 60_000,
+      tokens: { total: 1 },
+    });
+    const changed = child({
+      id: "ses_changed",
+      targetSessionID: "ses_changed",
+      color: "red",
+      elapsedMs: 0,
+    });
+    state.children = { ses_unchanged: unchanged, ses_changed: changed };
+
+    refreshDerivedFields(state, new Date("2026-04-30T10:05:00.000Z"));
+
+    expect(state.children.ses_unchanged).toBe(unchanged);
+    expect(state.children.ses_changed).not.toBe(changed);
+    expect(state.children.ses_changed).toMatchObject({
+      color: "yellow",
+      elapsedMs: 300_000,
+    });
+    expect(changed).toMatchObject({ color: "red", elapsedMs: 0 });
+  });
+
   it("prunes old terminal children without losing running children", () => {
     const state = createEmptyState();
     state.children.running = child({ id: "running" });
@@ -433,5 +496,55 @@ describe("state", () => {
       "recentError",
       "running",
     ]);
+  });
+
+  it("marks every id and target alias at one completion instant", () => {
+    useFrozenTime("2026-04-30T10:05:00.000Z");
+    const state = createEmptyState();
+    state.children["ses_child"] = child({
+      id: "ses_child",
+      targetSessionID: "ses_child",
+    });
+    state.children["tool:one"] = child({
+      id: "tool:one",
+      source: "tool",
+      targetSessionID: "ses_child",
+    });
+    state.children["subtask:one"] = child({
+      id: "subtask:one",
+      source: "subtask",
+      targetSessionID: "ses_child",
+    });
+    state.children["ses_other"] = child({
+      id: "ses_other",
+      targetSessionID: "ses_other",
+    });
+    const otherRef = state.children["ses_other"];
+
+    expect(
+      markChildrenStatusByAnyID(state, {
+        childIDs: new Set(["ses_child"]),
+        status: "done",
+      }),
+    ).toBe(true);
+
+    const frozenInstant = "2026-04-30T10:05:00.000Z";
+    for (const childID of ["ses_child", "tool:one", "subtask:one"]) {
+      expect(state.children[childID]).toMatchObject({
+        status: "done",
+        color: "green",
+        updatedAt: frozenInstant,
+        endedAt: frozenInstant,
+        elapsedMs: 300000,
+      });
+    }
+    expect(state.updatedAt).toBe(frozenInstant);
+    expect(state.children["ses_other"]).toBe(otherRef);
+    expect(state.children["ses_other"]).toMatchObject({
+      status: "running",
+      color: "yellow",
+      targetSessionID: "ses_other",
+      updatedAt: "2026-04-30T10:00:00.000Z",
+    });
   });
 });
