@@ -30,6 +30,20 @@ export interface CorrelatedSubagentExecution<
   proxies: T[];
 }
 
+export type CorrelationCandidate = {
+  readonly executionID: string;
+  readonly ambiguous: boolean;
+};
+
+export type CorrelationIndex<T extends SubagentClassifiableWorkItem> = {
+  readonly firstRealByExecutionID: ReadonlyMap<string, T>;
+  readonly byParentAndMessage: ReadonlyMap<
+    string,
+    ReadonlyMap<string, CorrelationCandidate>
+  >;
+  readonly byParent: ReadonlyMap<string, CorrelationCandidate>;
+};
+
 export function isRealSessionID(value: string | undefined): value is string {
   return typeof value === "string" && value.startsWith("ses_");
 }
@@ -80,17 +94,86 @@ export function classifySubagentWorkItem(
   return { kind: "invocation-wrapper" };
 }
 
-function uniqueExecutionID<T extends SubagentClassifiableWorkItem>(
-  candidates: readonly T[],
-): string | undefined {
-  const executionIDs = new Set(candidates.map((item) => realExecutionID(item)));
-  return executionIDs.size === 1 ? [...executionIDs][0] : undefined;
-}
-
 function realExecutions<T extends SubagentClassifiableWorkItem>(
   items: readonly T[],
 ): T[] {
   return items.filter((item) => classifySubagentWorkItem(item).kind === "real-execution");
+}
+
+function addCorrelationCandidate(
+  candidates: Map<string, CorrelationCandidate>,
+  key: string,
+  executionID: string,
+): void {
+  const existing = candidates.get(key);
+  if (!existing) {
+    candidates.set(key, { executionID, ambiguous: false });
+    return;
+  }
+  if (existing.executionID !== executionID && !existing.ambiguous) {
+    candidates.set(key, { executionID: existing.executionID, ambiguous: true });
+  }
+}
+
+function resolvedCandidate(
+  candidate: CorrelationCandidate | undefined,
+): string | undefined {
+  return candidate && !candidate.ambiguous ? candidate.executionID : undefined;
+}
+
+export function buildCorrelationIndex<T extends SubagentClassifiableWorkItem>(
+  realItems: readonly T[],
+): CorrelationIndex<T> {
+  const firstRealByExecutionID = new Map<string, T>();
+  const byParentAndMessage = new Map<
+    string,
+    Map<string, CorrelationCandidate>
+  >();
+  const byParent = new Map<string, CorrelationCandidate>();
+
+  for (const realItem of realItems) {
+    const executionID = realExecutionID(realItem);
+    if (!firstRealByExecutionID.has(executionID)) {
+      firstRealByExecutionID.set(executionID, realItem);
+    }
+    addCorrelationCandidate(byParent, realItem.parentID, executionID);
+
+    if (realItem.messageID) {
+      let byMessage = byParentAndMessage.get(realItem.parentID);
+      if (!byMessage) {
+        byMessage = new Map<string, CorrelationCandidate>();
+        byParentAndMessage.set(realItem.parentID, byMessage);
+      }
+      addCorrelationCandidate(byMessage, realItem.messageID, executionID);
+    }
+  }
+
+  return { firstRealByExecutionID, byParentAndMessage, byParent };
+}
+
+export function resolveCorrelatedExecutionIDFromIndex<
+  T extends SubagentClassifiableWorkItem,
+>(
+  item: SubagentClassifiableWorkItem,
+  index: CorrelationIndex<T>,
+): string | undefined {
+  const targetSessionID = trustedTargetSessionID(item);
+  if (targetSessionID) {
+    return index.firstRealByExecutionID.has(targetSessionID)
+      ? targetSessionID
+      : undefined;
+  }
+
+  if (item.messageID) {
+    const sharedMessageCandidate = index.byParentAndMessage
+      .get(item.parentID)
+      ?.get(item.messageID);
+    if (sharedMessageCandidate) {
+      return resolvedCandidate(sharedMessageCandidate);
+    }
+  }
+
+  return resolvedCandidate(index.byParent.get(item.parentID));
 }
 
 export function resolveTrustedTargetExecutionID<
@@ -99,8 +182,8 @@ export function resolveTrustedTargetExecutionID<
   const targetSessionID = trustedTargetSessionID(item);
   if (!targetSessionID) return undefined;
 
-  return realExecutions(realItems).some(
-    (realItem) => realExecutionID(realItem) === targetSessionID,
+  return buildCorrelationIndex(realExecutions(realItems)).firstRealByExecutionID.has(
+    targetSessionID,
   )
     ? targetSessionID
     : undefined;
@@ -111,35 +194,26 @@ export function resolveSharedMessageExecutionID<
 >(item: SubagentClassifiableWorkItem, realItems: readonly T[]): string | undefined {
   if (!item.messageID) return undefined;
 
-  return uniqueExecutionID(
-    realExecutions(realItems).filter(
-      (realItem) =>
-        realItem.parentID === item.parentID &&
-        realItem.messageID === item.messageID,
-    ),
+  const index = buildCorrelationIndex(realExecutions(realItems));
+  return resolvedCandidate(
+    index.byParentAndMessage.get(item.parentID)?.get(item.messageID),
   );
 }
 
 export function resolveUniqueSameParentExecutionID<
   T extends SubagentClassifiableWorkItem,
 >(item: SubagentClassifiableWorkItem, realItems: readonly T[]): string | undefined {
-  return uniqueExecutionID(
-    realExecutions(realItems).filter(
-      (realItem) => realItem.parentID === item.parentID,
-    ),
+  return resolvedCandidate(
+    buildCorrelationIndex(realExecutions(realItems)).byParent.get(item.parentID),
   );
 }
 
 export function resolveCorrelatedExecutionID<
   T extends SubagentClassifiableWorkItem,
 >(item: SubagentClassifiableWorkItem, realItems: readonly T[]): string | undefined {
-  if (trustedTargetSessionID(item)) {
-    return resolveTrustedTargetExecutionID(item, realItems);
-  }
-
-  return (
-    resolveSharedMessageExecutionID(item, realItems) ??
-    resolveUniqueSameParentExecutionID(item, realItems)
+  return resolveCorrelatedExecutionIDFromIndex(
+    item,
+    buildCorrelationIndex(realExecutions(realItems)),
   );
 }
 
@@ -147,19 +221,17 @@ export function correlateSubagentWorkItems<
   T extends SubagentClassifiableWorkItem,
 >(items: readonly T[]): CorrelatedSubagentExecution<T>[] {
   const realItems = realExecutions(items);
+  const index = buildCorrelationIndex(realItems);
   const executions = new Map<string, CorrelatedSubagentExecution<T>>();
 
-  for (const item of realItems) {
-    const executionID = realExecutionID(item);
-    if (!executions.has(executionID)) {
-      executions.set(executionID, { executionID, real: item, proxies: [] });
-    }
+  for (const [executionID, real] of index.firstRealByExecutionID) {
+    executions.set(executionID, { executionID, real, proxies: [] });
   }
 
   for (const item of items) {
     if (classifySubagentWorkItem(item).kind === "real-execution") continue;
 
-    const executionID = resolveCorrelatedExecutionID(item, realItems);
+    const executionID = resolveCorrelatedExecutionIDFromIndex(item, index);
     if (!executionID) continue;
 
     executions.get(executionID)?.proxies.push(item);

@@ -7,6 +7,7 @@ import {
   mergeProxyMetadataWithRealExecution,
   resolveCorrelatedExecutionID,
   trustedTargetSessionID,
+  type CorrelatedSubagentExecution,
   type SubagentClassifiableWorkItem,
 } from "./subagent-classification.js";
 import type { ChildSessionState } from "./state.js";
@@ -29,6 +30,75 @@ function item(
     tokens: { total: 42, contextPercent: 12.5 },
     ...overrides,
   };
+}
+
+function legacyCorrelateForTest<T extends SubagentClassifiableWorkItem>(
+  items: readonly T[],
+): CorrelatedSubagentExecution<T>[] {
+  const realItems = items.filter(
+    (entry) => classifySubagentWorkItem(entry).kind === "real-execution",
+  );
+  const executions = new Map<string, CorrelatedSubagentExecution<T>>();
+
+  for (const real of realItems) {
+    const classification = classifySubagentWorkItem(real);
+    if (
+      classification.kind !== "real-execution" ||
+      executions.has(classification.executionID)
+    ) {
+      continue;
+    }
+    executions.set(classification.executionID, {
+      executionID: classification.executionID,
+      real,
+      proxies: [],
+    });
+  }
+
+  for (const proxy of items) {
+    if (classifySubagentWorkItem(proxy).kind === "real-execution") continue;
+    const executionID = resolveCorrelatedExecutionID(proxy, realItems);
+    if (executionID) executions.get(executionID)?.proxies.push(proxy);
+  }
+
+  return [...executions.values()];
+}
+
+function correlationPropertyReads(size: number): number {
+  let reads = 0;
+  const observe = <T extends SubagentClassifiableWorkItem>(value: T): T =>
+    new Proxy(value, {
+      get(target, key, receiver) {
+        if (typeof key === "string") reads += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+  const values = [
+    ...Array.from({ length: size }, (_, index) =>
+      observe(
+        item({
+          id: `ses_${index}`,
+          targetSessionID: `ses_${index}`,
+          parentID: `parent_${index % 7}`,
+          messageID: `msg_${index}`,
+        }),
+      ),
+    ),
+    ...Array.from({ length: size }, (_, index) =>
+      observe(
+        item({
+          id: `tool:${index}`,
+          source: "tool",
+          targetSessionID: index % 3 === 0 ? undefined : `ses_${index}`,
+          parentID: `parent_${index % 7}`,
+          messageID: `msg_${index}`,
+        }),
+      ),
+    ),
+  ];
+
+  correlateSubagentWorkItems(values);
+  return reads;
 }
 
 describe("subagent classification", () => {
@@ -191,6 +261,94 @@ describe("subagent classification", () => {
     ).toEqual([
       { executionID: "ses_same_parent", real: sameParentReal, proxies: [] },
     ]);
+  });
+
+  it("matches the legacy resolver over a deterministic mixed corpus", () => {
+    const corpus = Array.from({ length: 40 }, (_, index) =>
+      index % 3 === 0
+        ? item({
+            id: `ses_${index}`,
+            targetSessionID: `ses_${index}`,
+            parentID: `parent_${index % 4}`,
+            messageID: `msg_${index % 5}`,
+          })
+        : item({
+            id: `tool:${index}`,
+            source: "tool",
+            targetSessionID:
+              index % 2 === 0 ? `ses_${index - 2}` : undefined,
+            parentID: `parent_${index % 4}`,
+            messageID: index % 5 === 0 ? undefined : `msg_${index % 5}`,
+          }),
+    );
+
+    const correlated = correlateSubagentWorkItems(corpus);
+
+    expect(correlated).toEqual(legacyCorrelateForTest(corpus));
+  });
+
+  it("preserves first-real, proxy order, and both fail-closed ambiguity modes", () => {
+    const first = item({
+      id: "ses_a_first",
+      targetSessionID: "ses_a",
+      messageID: "msg_a",
+    });
+    const duplicate = item({
+      id: "ses_a_second",
+      targetSessionID: "ses_a",
+      messageID: "msg_a",
+    });
+    const other = item({
+      id: "ses_b",
+      targetSessionID: "ses_b",
+      messageID: "msg_a",
+    });
+    const targeted = item({
+      id: "tool:target",
+      source: "tool",
+      targetSessionID: "ses_a",
+    });
+    const sharedAmbiguous = item({
+      id: "tool:shared",
+      source: "tool",
+      targetSessionID: undefined,
+      messageID: "msg_a",
+    });
+    const parentAmbiguous = item({
+      id: "tool:parent",
+      source: "tool",
+      targetSessionID: undefined,
+      messageID: undefined,
+    });
+    const missingTrusted = item({
+      id: "tool:missing",
+      source: "tool",
+      targetSessionID: "ses_missing",
+      messageID: "msg_a",
+    });
+
+    const correlated = correlateSubagentWorkItems([
+      targeted,
+      sharedAmbiguous,
+      first,
+      duplicate,
+      other,
+      parentAmbiguous,
+      missingTrusted,
+    ]);
+
+    expect(correlated).toEqual([
+      { executionID: "ses_a", real: first, proxies: [targeted] },
+      { executionID: "ses_b", real: other, proxies: [] },
+    ]);
+  });
+
+  it("has sub-quadratic property-read growth when real and proxy counts double", () => {
+    const smallReads = correlationPropertyReads(32);
+
+    const largeReads = correlationPropertyReads(64);
+
+    expect(largeReads).toBeLessThan(smallReads * 3);
   });
 
   it("merges safe proxy display metadata without replacing real execution state", () => {
