@@ -1,4 +1,4 @@
-import type { ChildSessionState } from "./state.js";
+import { refreshDerivedFields, type ChildSessionState, type StatuslineState } from "./state.js";
 
 export interface HydrationTransactionIndex {
   upsert(child: ChildSessionState): void;
@@ -138,4 +138,106 @@ export function createHydrationTransactionIndex(
     },
     childrenOf,
   };
+}
+
+function isSyntheticRow(child: ChildSessionState): boolean {
+  return !child.id.startsWith("ses_");
+}
+
+/**
+ * Merge a hydrated draft into the live state without overwriting rows that
+ * changed during the async hydration window.
+ *
+ * - `baseline` is the snapshot taken BEFORE async reads started.
+ * - `current` is the live state at publication time (rows may have been
+ *   mutated by event handlers while hydration was in flight).
+ * - `hydrated` is the draft built from the historical fetch results.
+ *
+ * For every ID in the union of baseline/hydrated:
+ * - If `current.children[id] === baseline.children[id]` (reference equality,
+ *   including both undefined for absent IDs), the hydrated row is applied
+ *   (or removed if absent in hydrated).
+ * - Otherwise the live row wins (preserves running/model/tokens changes
+ *   that happened during hydration, plus new live rows and deleted
+ *   baseline rows).
+ * - Synthetic (non ses_) rows whose parentID/targetSessionID references a
+ *   row that changed since baseline are skipped to avoid stale alias
+ *   insertion/backfill.
+ *
+ * Counters are NEVER copied from hydrated; refreshDerivedFields rebuilds
+ * them from the merged children.
+ */
+export function mergeHydratedState(
+  baseline: StatuslineState,
+  current: StatuslineState,
+  hydrated: StatuslineState,
+): StatuslineState {
+  return mergeHydration(baseline, current, hydrated).state;
+}
+
+export function createHydrationMerger(initial: StatuslineState) {
+  const expected = { ...initial, children: { ...initial.children } };
+  return {
+    merge(current: StatuslineState, hydrated: StatuslineState): StatuslineState {
+      const result = mergeHydration(expected, current, hydrated);
+      for (const id of result.acceptedIDs) {
+        const accepted = result.state.children[id];
+        if (accepted) expected.children[id] = accepted;
+        else delete expected.children[id];
+      }
+      return result.state;
+    },
+  };
+}
+
+function mergeHydration(
+  baseline: StatuslineState,
+  current: StatuslineState,
+  hydrated: StatuslineState,
+): { state: StatuslineState; acceptedIDs: string[] } {
+  const acceptedIDs: string[] = [];
+  const merged: StatuslineState = {
+    updatedAt: current.updatedAt,
+    totalExecuted: current.totalExecuted,
+    countedChildIDs: { ...current.countedChildIDs },
+    children: { ...current.children },
+  };
+
+  const baselineChildren = baseline.children;
+  const hydratedChildren = hydrated.children;
+  const allIDs = new Set<string>([
+    ...Object.keys(baselineChildren),
+    ...Object.keys(hydratedChildren),
+  ]);
+
+  for (const id of allIDs) {
+    const baselineRow = baselineChildren[id];
+    const currentRow = current.children[id];
+    const hydratedRow = hydratedChildren[id];
+
+    if (currentRow !== baselineRow) {
+      continue;
+    }
+
+    const affectedRow = hydratedRow ?? baselineRow;
+    if (affectedRow && isSyntheticRow(affectedRow)) {
+      const parentChanged =
+        current.children[affectedRow.parentID] !==
+        baselineChildren[affectedRow.parentID];
+      const targetChanged =
+        affectedRow.targetSessionID !== undefined &&
+        current.children[affectedRow.targetSessionID] !==
+          baselineChildren[affectedRow.targetSessionID];
+      if (parentChanged || targetChanged) {
+        continue;
+      }
+    }
+
+    if (hydratedRow) merged.children[id] = hydratedRow;
+    else delete merged.children[id];
+    acceptedIDs.push(id);
+  }
+
+  refreshDerivedFields(merged);
+  return { state: merged, acceptedIDs };
 }
