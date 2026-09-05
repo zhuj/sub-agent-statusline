@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
 import { describe, expect, it, vi } from "vitest";
-import {
+
+import tuiPlugin, {
   backfillHydratedTargetSessionIDs,
   formatChildModelLine,
   formatChildRowLine,
@@ -26,6 +27,7 @@ import {
   shouldReleaseSidebarListFocus,
 } from "./tui-focus.js";
 import { registerSubagentCommands } from "./tui-commands.js";
+import { createHydrationTransactionIndex } from "./tui-hydration-index.js";
 import type { ChildSessionState, StatuslineState } from "./state.js";
 
 function child(overrides: Partial<ChildSessionState> = {}): ChildSessionState {
@@ -139,6 +141,23 @@ describe("TUI subagent snapshots", () => {
     expect(lines.every((line) => textColumns(line) <= 8)).toBe(true);
   });
 
+  it("preserves the re-exported terminal formatter ellipsis exactly", () => {
+    // Given: a long terminal label whose last content column is whitespace.
+    const width = 8;
+
+    // When: the re-exported formatter truncates the label.
+    const line = formatTerminalChildRowLine({
+      child: child({ title: "abcdef ghijklmnop", status: "done" }),
+      nowMs: 1,
+      sidebarWidth: 12,
+    });
+
+    // Then: the label preserves the existing trim-before-ellipsis behavior.
+    expect(line.label).toBe("abcdef…");
+    expect(line.label.endsWith("…")).toBe(true);
+    expect(textColumns(line.label)).toBeLessThanOrEqual(width);
+  });
+
   it("matches running row height to rendered secondary-line presence", () => {
     const nowMs = Date.parse("2026-04-30T10:20:00.000Z");
 
@@ -182,6 +201,20 @@ describe("TUI subagent snapshots", () => {
     expect(subagentRowHeight({ child: plain, nowMs })).toBe(2);
     expect(formatChildModelLine(modeled, providers, 20)).toBe("GPT 5.6 · high");
     expect(subagentRowHeight({ child: modeled, nowMs })).toBe(3);
+    const truncatedModel = formatChildModelLine(
+      child({
+        model: {
+          providerID: "missing",
+          modelID: "abcdef",
+          variant: "high",
+        },
+      }),
+      providers,
+      8,
+    );
+    expect(truncatedModel).toBe("abcdef…");
+    expect(truncatedModel?.endsWith("…")).toBe(true);
+    expect(textColumns(truncatedModel ?? "")).toBeLessThanOrEqual(8);
     expect(
       formatChildModelLine(
         child({ model: { providerID: "missing", modelID: "長いモデル識別子", variant: "最大" } }),
@@ -474,6 +507,58 @@ describe("TUI subagent snapshots", () => {
     expect(snapshot.totalExecuted).toBe(0);
   });
 
+  it("uses projected visibility while preserving scoped real-row metadata", () => {
+    // Given: a proxy precedes its running real execution and a recent done row.
+    const nowMs = Date.parse("2026-04-30T10:20:00.000Z");
+    const proxy = child({
+      id: "tool:proxy",
+      source: "tool",
+      targetSessionID: "ses_real",
+      messageID: "msg_1",
+      title: "Preferred",
+      agentName: "preferred-agent",
+      startedAt: "2026-04-30T10:10:00.000Z",
+    });
+    const real = child({
+      id: "ses_real",
+      targetSessionID: "ses_real",
+      messageID: "msg_1",
+      title: "Generated",
+      startedAt: "2026-04-30T10:10:00.000Z",
+    });
+    const done = child({
+      id: "ses_done",
+      targetSessionID: "ses_done",
+      messageID: "msg_1",
+      status: "done",
+      color: "green",
+      endedAt: "2026-04-30T10:19:00.000Z",
+      updatedAt: "2026-04-30T10:19:00.000Z",
+    });
+
+    // When: the parent-scoped snapshot is resolved.
+    const snapshot = resolveTuiSubagentSnapshot({
+      state: stateWith([proxy, real, done]),
+      sessionID: "ses_parent",
+      nowMs,
+    });
+
+    // Then: visibility follows projection while scoped rows retain real metadata.
+    expect(
+      snapshot.visibleChildren.map(({ id, title, agentName }) => ({
+        id,
+        title,
+        agentName,
+      })),
+    ).toEqual([
+      { id: "ses_real", title: "Generated", agentName: undefined },
+      { id: "ses_done", title: "Child work", agentName: undefined },
+    ]);
+    expect(snapshot.visibleCounts).toEqual({ running: 1, done: 1, error: 0 });
+    expect(snapshot.totalExecuted).toBe(2);
+    expect(snapshot.showingOtherSessions).toBe(false);
+  });
+
   it("keeps retained terminal counters separate from default visible rows", () => {
     const nowMs = Date.parse("2026-04-30T10:20:00.000Z");
     const retainedDone = Array.from({ length: 6 }, (_, index) =>
@@ -544,6 +629,28 @@ describe("TUI subagent snapshots", () => {
     );
     expect(historySnapshot.visibleCounts).toEqual(defaultSnapshot.visibleCounts);
     expect(historySnapshot.totalExecuted).toBe(defaultSnapshot.totalExecuted);
+  });
+
+  it("indexes every mounted visible row without imposing the eight-row height limit", () => {
+    const children = Array.from({ length: 12 }, (_, index) =>
+      child({
+        id: `ses_${index}`,
+        targetSessionID: `ses_${index}`,
+        startedAt: `2026-04-30T10:${String(index).padStart(2, "0")}:00.000Z`,
+      }),
+    );
+    const snapshot = resolveTuiSubagentSnapshot({
+      state: stateWith(children),
+      sessionID: "ses_parent",
+    });
+
+    expect(snapshot.visibleChildren).toHaveLength(12);
+    expect(snapshot.visibleChildrenByID.size).toBe(12);
+    expect(
+      snapshot.visibleChildren.map((entry) =>
+        snapshot.visibleChildrenByID.get(entry.id),
+      ),
+    ).toEqual(snapshot.visibleChildren);
   });
 
   it("keeps rows and counters in the current session scope when current history is hidden", () => {
@@ -1024,19 +1131,21 @@ describe("TUI subagent snapshots", () => {
     );
     expect(ambiguous.children["tool:ambiguous"]?.targetSessionID).toBeUndefined();
 
+    const matched = child({
+      id: "tool:matched",
+      source: "tool",
+      toolName: "task",
+      targetSessionID: undefined,
+      messageID: "msg_real",
+    });
+    const untouched = child({
+      id: "ses_first",
+      targetSessionID: "ses_first",
+      messageID: "msg_other",
+    });
     const unique = stateWith([
-      child({
-        id: "tool:matched",
-        source: "tool",
-        toolName: "task",
-        targetSessionID: undefined,
-        messageID: "msg_real",
-      }),
-      child({
-        id: "ses_first",
-        targetSessionID: "ses_first",
-        messageID: "msg_other",
-      }),
+      matched,
+      untouched,
       child({
         id: "ses_second",
         targetSessionID: "ses_second",
@@ -1045,7 +1154,46 @@ describe("TUI subagent snapshots", () => {
     ]);
 
     expect(backfillHydratedTargetSessionIDs(unique, "ses_parent")).toBe(true);
+    expect(unique.children["tool:matched"]).not.toBe(matched);
     expect(unique.children["tool:matched"]?.targetSessionID).toBe("ses_second");
+    expect(matched.targetSessionID).toBeUndefined();
+    expect(unique.children["ses_first"]).toBe(untouched);
+  });
+
+  it("uses the transaction index without rescanning all staged children", () => {
+    // Given: a staged state whose global child enumeration is observable.
+    const synthetic = child({
+      id: "subtask:indexed",
+      source: "subtask",
+      targetSessionID: undefined,
+      messageID: "msg_real",
+    });
+    const real = child({
+      id: "ses_real",
+      targetSessionID: "ses_real",
+      messageID: "msg_real",
+    });
+    const state = stateWith([synthetic, real]);
+    const index = createHydrationTransactionIndex(Object.values(state.children));
+    let globalScans = 0;
+    state.children = new Proxy(state.children, {
+      ownKeys(target) {
+        globalScans += 1;
+        return Reflect.ownKeys(target);
+      },
+    });
+
+    // When: indexed backfill resolves the parent's synthetic rows.
+    const changed = backfillHydratedTargetSessionIDs(
+      state,
+      "ses_parent",
+      index,
+    );
+
+    // Then: the index supplies both iteration and target resolution.
+    expect(changed).toBe(true);
+    expect(state.children[synthetic.id]?.targetSessionID).toBe(real.id);
+    expect(globalScans).toBe(0);
   });
 });
 
@@ -1084,6 +1232,113 @@ describe("hydratePreviousSubagents", () => {
       resolveTuiSubagentSnapshot({ state, sessionID: "ses_parent" })
         .visibleCounts,
     ).toEqual({ running: 1, done: 0, error: 0 });
+  });
+
+  it("replays sessions before parts so synthetic evidence sees staged sessions", async () => {
+    // Given: one real child and a parent subtask part without an explicit target.
+    const state = await hydrateState({
+      children: [{
+        id: "ses_child",
+        parentID: "ses_parent",
+        title: "Child",
+      }],
+      statuses: { ses_child: { type: "busy" } },
+      parentMessages: [{
+        info: { id: "msg", role: "assistant" },
+        parts: [{
+          id: "part",
+          type: "subtask",
+          sessionID: "ses_parent",
+          messageID: "msg",
+          description: "Child",
+        }],
+      }],
+    });
+
+    // When: hydration publishes the completed staged replay.
+    // Then: the later synthetic row resolves against the earlier real insertion.
+    expect(state.children["subtask:part"]?.targetSessionID).toBe("ses_child");
+    expect(state.children.ses_child?.status).toBe("running");
+    expect(state.totalExecuted).toBe(1);
+  });
+
+  it("keeps global replay scans constant as parent part count grows", async () => {
+    // Given: otherwise identical hydration runs with one and twelve parts.
+    const hydrateWithPartCount = async (partCount: number): Promise<number> => {
+      const valuesSpy = vi.spyOn(Object, "values");
+      const callsBefore = valuesSpy.mock.calls.length;
+      await hydrateState({
+        children: [],
+        parentMessages: [{
+          info: { id: "msg_parent", role: "assistant" },
+          parts: Array.from({ length: partCount }, (_, index) => ({
+            id: `part_${index}`,
+            type: "subtask",
+            sessionID: "ses_parent",
+            messageID: "msg_parent",
+            description: `Child ${index}`,
+          })),
+        }],
+      });
+      const calls = valuesSpy.mock.calls.length - callsBefore;
+      valuesSpy.mockRestore();
+      return calls;
+    };
+
+    // When: replay size grows beyond the former viewport-sized batch.
+    const singlePartScans = await hydrateWithPartCount(1);
+    const twelvePartScans = await hydrateWithPartCount(12);
+
+    // Then: transaction-local indexes prevent per-part global scans.
+    expect(twelvePartScans).toBe(singlePartScans);
+  });
+
+  it("does not rematch a terminal replayed subtask as running", async () => {
+    // Given: a completed assistant message with subtask and task-tool evidence.
+    const state = await hydrateState({
+      children: [],
+      parentMessages: [{
+        info: {
+          id: "msg_parent",
+          role: "assistant",
+          time: { completed: "2099-04-30T12:00:00.000Z" },
+        },
+        parts: [
+          {
+            id: "part_subtask",
+            type: "subtask",
+            sessionID: "ses_parent",
+            messageID: "msg_parent",
+            description: "Completed child",
+          },
+          {
+            id: "part_tool",
+            type: "tool",
+            tool: "task",
+            sessionID: "ses_parent",
+            messageID: "msg_parent",
+            state: {
+              status: "completed",
+              input: { description: "Completed child" },
+              metadata: { sessionId: "ses_external" },
+            },
+          },
+        ],
+      }],
+    });
+
+    // Then: the shared index observes the subtask's direct terminal transition.
+    expect(Object.keys(state.children).sort()).toEqual([
+      "subtask:part_subtask",
+      "tool:part_tool",
+    ]);
+    expect(state.children["subtask:part_subtask"]?.status).toBe("done");
+    expect(
+      state.children["subtask:part_subtask"]?.targetSessionID,
+    ).toBeUndefined();
+    expect(state.children["tool:part_tool"]?.targetSessionID).toBe(
+      "ses_external",
+    );
   });
 
   it("hydrates a grandchild session", async () => {
@@ -1526,6 +1781,158 @@ describe("probeRunningEvidence", () => {
     expect(evidence.status).toBe("error");
     expect(api.client.session.status).toHaveBeenCalledOnce();
     expect(api.client.session.messages).not.toHaveBeenCalled();
+  });
+});
+
+describe("persisted parent-message reconciliation", () => {
+  it("fetches and analyzes one parent response for sibling candidates", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime("2026-04-30T12:30:00.000Z");
+    let dispose: (() => void) | undefined;
+
+    try {
+      const handlers = new Map<string, (event: unknown) => void>();
+      let analysisRuns = 0;
+      const storedMessages = [
+        {
+          info: {
+            role: "assistant",
+            parentID: "msg_a",
+            time: { completed: "2026-04-30T12:00:00.000Z" },
+          },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                metadata: { sessionId: "ses_a" },
+              },
+            },
+          ],
+        },
+        {
+          info: {
+            role: "assistant",
+            parentID: "msg_b",
+            time: { completed: "2026-04-30T12:01:00.000Z" },
+          },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "error",
+                metadata: { sessionId: "ses_b" },
+              },
+            },
+          ],
+        },
+      ];
+      const parentMessages = new Proxy(storedMessages, {
+        get(target, property, receiver) {
+          if (property === Symbol.iterator) {
+            return () => {
+              analysisRuns += 1;
+              return target[Symbol.iterator]();
+            };
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const messages = vi.fn(async () => ({ data: parentMessages }));
+      const api = {
+        state: {
+          path: { directory: "/repo" },
+          provider: [],
+          session: {
+            status: vi.fn(),
+            messages: vi.fn(),
+          },
+          part: vi.fn(),
+        },
+        route: { current: { name: "home", params: {} } },
+        kv: {
+          get<Value>(_key: string, fallback: Value): Value {
+            return fallback;
+          },
+          set: vi.fn(),
+        },
+        client: {
+          session: {
+            messages,
+            status: vi.fn(async () => ({ data: {} })),
+          },
+        },
+        event: {
+          on: vi.fn((name: string, handler: (event: unknown) => void) => {
+            handlers.set(name, handler);
+            return vi.fn();
+          }),
+        },
+        lifecycle: {
+          onDispose: vi.fn((callback: () => void) => {
+            dispose = callback;
+          }),
+        },
+        slots: { register: vi.fn() },
+        ui: {
+          dialog: { clear: vi.fn() },
+          toast: vi.fn(),
+          Prompt: vi.fn(),
+          Slot: vi.fn(),
+        },
+      };
+
+      await tuiPlugin.tui(api as never, undefined, {} as never);
+      const applyPart = handlers.get("message.part.updated");
+      expect(applyPart).toBeTypeOf("function");
+      applyPart?.({
+        type: "message.part.updated",
+        properties: {
+          sessionID: "ses_parent",
+          info: {
+            id: "msg_a",
+            role: "assistant",
+            time: { created: "2026-04-30T10:00:00.000Z" },
+          },
+          part: {
+            id: "a",
+            type: "subtask",
+            sessionID: "ses_parent",
+            messageID: "msg_a",
+            description: "A task",
+          },
+        },
+      });
+      applyPart?.({
+        type: "message.part.updated",
+        properties: {
+          sessionID: "ses_parent",
+          info: {
+            id: "msg_b",
+            role: "assistant",
+            time: { created: "2026-04-30T10:01:00.000Z" },
+          },
+          part: {
+            id: "b",
+            type: "subtask",
+            sessionID: "ses_parent",
+            messageID: "msg_b",
+            description: "B task",
+          },
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(2_500);
+
+      expect(messages).toHaveBeenCalledOnce();
+      expect(analysisRuns).toBe(1);
+    } finally {
+      dispose?.();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 });
 

@@ -25,27 +25,32 @@ import {
 import type { Accessor } from "solid-js";
 import {
   applySubagentEvent,
-  extractChildDetails,
   extractLatestAssistantModel,
   extractTaskToolEvidence,
 } from "./events.js";
 import {
-  byPriority,
-  formatDuration,
-  visibleSubagentWorkItems,
-} from "./render.js";
+  createEventChildIndex,
+  type EventChildIndex,
+} from "./event-child-index.js";
 import {
+  byPriority,
+  projectCorrelatedSubagentWorkItems,
+  visibleProjectedSubagentWorkItems,
+} from "./render.js";
+import { correlateSubagentWorkItems } from "./subagent-classification.js";
+import {
+  analyzePersistedParentMessages,
   canSafelyCloseNoTargetPersistedCandidate,
-  capCandidates,
   deriveOpenCodeSessionStatus,
   hasRecentMessageActivity,
   nextBackoffState,
   parseStaleRunningThresholdMs as parseConfiguredStaleRunningThresholdMs,
-  resolvePersistedStaleSubtaskFromParentMessages,
+  resolvePersistedStaleSubtaskFromParentAnalysis,
   resolveSessionStatusWithMessageSummary,
   shouldApplyStaleRunningFallback,
   shouldSkipCandidateForBackoff,
   summarizeSessionMessages,
+  type PersistedParentMessageAnalysis,
   type PersistedStaleSubtaskCandidate,
   type RunningReconcileCacheEntry,
   type RunningReconcileEvidence,
@@ -60,9 +65,6 @@ import {
 } from "./tui-focus.js";
 import {
   createEmptyState,
-  countCountedSubagentExecutions,
-  countHistoricalSubagentExecutions,
-  countRetainedSubagentStatuses,
   markChildStatus,
   refreshDerivedFields,
   setChildModel,
@@ -72,15 +74,30 @@ import {
   type StatusCounts,
   type StatuslineState,
 } from "./state.js";
-import { takeColumns, textColumns, truncateToColumns } from "./text-width.js";
 import { registerSubagentCommands } from "./tui-commands.js";
+import {
+  createHydrationTransactionIndex,
+  type HydrationTransactionIndex,
+} from "./tui-hydration-index.js";
+import { buildTuiRowMetrics } from "./tui-row-metrics.js";
+import type { SidebarScrollRowLayout } from "./tui-row-metrics.js";
+import { selectRunningReconcileCandidates } from "./tui-reconcile.js";
+import { hydrateStateTokensFromTuiState } from "./tui-token-hydration.js";
 import { t } from "./i18n.js";
+
+export {
+  formatChildModelLine,
+  formatChildRowLine,
+  formatTerminalChildRowLine,
+  rowWidthBudget,
+  subagentRowHeight,
+  wrapCompactText,
+} from "./tui-row-metrics.js";
+export type { SidebarScrollRowLayout } from "./tui-row-metrics.js";
 
 const TUI_PLUGIN_ID = "subagent-statusline.tui";
 const ELAPSED_TICK_MS = 1000;
-const FALLBACK_SIDEBAR_WIDTH = 34;
-const MIN_LABEL_WIDTH = 8;
-const MAINTENANCE_TICK_MS = 2500;
+const MAINTENANCE_TICK_MS = 2_000;
 const HYDRATE_RETRY_BASE_DELAY_MS = 1000;
 const HYDRATE_RETRY_MAX_DELAY_MS = 30_000;
 const HYDRATE_RETRY_MAX_ATTEMPTS = 6;
@@ -103,7 +120,6 @@ const SUBAGENTS_RUNNING_ROW_HEIGHT = 3;
 const SUBAGENTS_TERMINAL_ROW_HEIGHT = 2;
 const SUBAGENTS_MODEL_ROW_HEIGHT = 1;
 const SUBAGENTS_ROW_GAP = 0;
-const SUBAGENTS_ROW_MARKER_WIDTH = 4;
 const SUBAGENTS_MAX_LIST_HEIGHT =
   SUBAGENTS_MAX_VISIBLE_ROWS *
     (SUBAGENTS_RUNNING_ROW_HEIGHT + SUBAGENTS_MODEL_ROW_HEIGHT) +
@@ -124,11 +140,6 @@ interface SidebarScrollRegistration {
 export interface SidebarScrollAnchor {
   childIDs: string[];
   intraRowOffset: number;
-}
-
-export interface SidebarScrollRowLayout {
-  id: string;
-  height: number;
 }
 
 interface SidebarListFocusRegistration {
@@ -307,59 +318,13 @@ interface RehydratedTokenCacheEntry {
   tokens?: ChildTokenState;
 }
 
-interface RunningReconcileCandidate {
-  childID: string;
-  targetSessionID?: string;
-  parentID?: string;
-  messageID?: string;
-  source?: ChildSessionState["source"];
-  title?: string;
-  summary?: string;
-  agentName?: string;
-  startedMs: number;
-  updatedMs: number;
-}
-
 function cloneState(state: StatuslineState): StatuslineState {
   return {
     updatedAt: state.updatedAt,
     totalExecuted: state.totalExecuted,
     countedChildIDs: { ...state.countedChildIDs },
-    children: Object.fromEntries(
-      Object.entries(state.children).map(([id, child]) => [
-        id,
-        {
-          ...child,
-          tokens: child.tokens ? { ...child.tokens } : undefined,
-          model: child.model ? { ...child.model } : undefined,
-        },
-      ]),
-    ),
+    children: { ...state.children },
   };
-}
-
-function mergeTokenState(
-  existing: ChildTokenState | undefined,
-  incoming: ChildTokenState | undefined,
-): ChildTokenState | undefined {
-  if (!existing && !incoming) return undefined;
-  return {
-    input: incoming?.input ?? existing?.input,
-    output: incoming?.output ?? existing?.output,
-    total: incoming?.total ?? existing?.total,
-    contextPercent: incoming?.contextPercent ?? existing?.contextPercent,
-  };
-}
-
-function hasTokenTotal(tokens: ChildTokenState | undefined): boolean {
-  return typeof tokens?.total === "number" && Number.isFinite(tokens.total);
-}
-
-function sameTokens(
-  left: ChildTokenState | undefined,
-  right: ChildTokenState | undefined,
-): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -381,84 +346,6 @@ function messageIDOf(message: unknown): string | undefined {
   if (!record) return undefined;
   const id = record.id ?? record.messageID ?? record.messageId;
   return typeof id === "string" && id.length > 0 ? id : undefined;
-}
-
-function pushSessionCandidates(
-  api: TuiPluginApi,
-  sessionID: string | undefined,
-  candidates: unknown[],
-): void {
-  if (!sessionID) return;
-
-  const status = safeRead(() => api.state.session.status(sessionID));
-  if (status) candidates.push(status);
-
-  const messages = safeRead(() => api.state.session.messages(sessionID));
-  if (!messages) return;
-
-  candidates.push(messages);
-  for (const message of messages) {
-    const messageID = messageIDOf(message);
-    if (!messageID) continue;
-    const parts = safeRead(() => api.state.part(messageID));
-    if (parts) candidates.push(parts);
-  }
-}
-
-function hydrateChildTokensFromTuiState(
-  api: TuiPluginApi,
-  child: ChildSessionState,
-): ChildTokenState | undefined {
-  const candidates: unknown[] = [];
-
-  pushSessionCandidates(api, child.id, candidates);
-
-  if (child.messageID) {
-    const parentParts = safeRead(() =>
-      api.state.part(child.messageID as string),
-    );
-    if (parentParts) candidates.push(parentParts);
-
-    const parentMessages = safeRead(() =>
-      api.state.session.messages(child.parentID),
-    );
-    const parentMessage = parentMessages?.find(
-      (message) => messageIDOf(message) === child.messageID,
-    );
-    if (parentMessage) candidates.push(parentMessage);
-  }
-
-  let tokens: ChildTokenState | undefined;
-  for (const candidate of candidates) {
-    tokens = mergeTokenState(
-      tokens,
-      extractChildDetails(
-        candidate as Parameters<typeof extractChildDetails>[0],
-      ).tokens,
-    );
-  }
-
-  return tokens;
-}
-
-function hydrateStateTokensFromTuiState(
-  api: TuiPluginApi,
-  state: StatuslineState,
-): boolean {
-  let changed = false;
-
-  for (const child of Object.values(state.children)) {
-    if (child.status !== "running" && hasTokenTotal(child.tokens)) continue;
-    const hydrated = hydrateChildTokensFromTuiState(api, child);
-    const nextTokens = mergeTokenState(child.tokens, hydrated);
-    if (!sameTokens(child.tokens, nextTokens)) {
-      child.tokens = nextTokens;
-      child.updatedAt = new Date().toISOString();
-      changed = true;
-    }
-  }
-
-  return changed;
 }
 
 function refreshLiveState(state: StatuslineState): boolean {
@@ -516,15 +403,6 @@ export function createTuiMaintenanceTimers(input: {
   };
 }
 
-function elapsedMs(child: ChildSessionState, nowMs: number): number {
-  if (child.status !== "running") {
-    return child.elapsedMs ?? 0;
-  }
-  const started = Date.parse(child.startedAt);
-  if (Number.isNaN(started)) return child.elapsedMs ?? 0;
-  return Math.max(0, nowMs - started);
-}
-
 function taskStatusMarker(status: ChildSessionState["status"]): string {
   if (status === "done") return "[✓]";
   if (status === "error") return "[x]";
@@ -579,50 +457,28 @@ function resolveSyntheticTargetFromHydratedState(
   return undefined;
 }
 
-function resolveSubagentDepth(
-  state: StatuslineState,
-  child: ChildSessionState,
-  ancestorSessionID: string,
-): number {
-  let depth = 0;
-  let parentID = child.parentID;
-  const visited = new Set<string>();
-
-  while (parentID !== ancestorSessionID) {
-    if (depth >= HYDRATE_MAX_DESCENDANT_DEPTH || visited.has(parentID)) {
-      return depth;
-    }
-    visited.add(parentID);
-    const parent = state.children[parentID];
-    if (!parent) return depth;
-    depth += 1;
-    parentID = parent.parentID;
-  }
-
-  return depth;
-}
-
 export function backfillHydratedTargetSessionIDs(
   state: StatuslineState,
   parentSessionID: string,
+  index = createHydrationTransactionIndex(Object.values(state.children)),
 ): boolean {
   let changed = false;
 
-  for (const child of Object.values(state.children)) {
-    if (child.parentID !== parentSessionID) continue;
+  for (const child of index.childrenOf(parentSessionID)) {
     if (resolveChildTargetSessionID(child)) continue;
     if (child.source === "session" || child.id.startsWith("ses_")) {
-      child.targetSessionID = child.id;
+      const replacement = { ...child, targetSessionID: child.id };
+      state.children[child.id] = replacement;
+      index.upsert(replacement);
       changed = true;
       continue;
     }
 
-    const syntheticTarget = resolveSyntheticTargetFromHydratedState(
-      state,
-      child,
-    );
+    const syntheticTarget = index.resolveSyntheticTarget(child);
     if (syntheticTarget) {
-      child.targetSessionID = syntheticTarget;
+      const replacement = { ...child, targetSessionID: syntheticTarget };
+      state.children[child.id] = replacement;
+      index.upsert(replacement);
       changed = true;
     }
   }
@@ -632,6 +488,57 @@ export function backfillHydratedTargetSessionIDs(
   }
 
   return changed;
+}
+
+function syncHydrationChild(
+  state: StatuslineState,
+  index: HydrationTransactionIndex,
+  childID: string,
+): void {
+  const child = state.children[childID];
+  if (child) index.upsert(child);
+  else index.remove(childID);
+}
+
+function syncHydrationAndEventChild(
+  state: StatuslineState,
+  hydrationIndex: HydrationTransactionIndex,
+  eventIndex: EventChildIndex,
+  childID: string,
+): void {
+  syncHydrationChild(state, hydrationIndex, childID);
+  const child = state.children[childID];
+  if (child) eventIndex.upsert(child);
+  else eventIndex.remove(childID);
+}
+
+function syncHydrationParent(
+  state: StatuslineState,
+  index: HydrationTransactionIndex,
+  parentID: string,
+): void {
+  for (const indexedChild of index.childrenOf(parentID)) {
+    if (state.children[indexedChild.id] !== indexedChild) {
+      syncHydrationChild(state, index, indexedChild.id);
+    }
+  }
+}
+
+function resolveHydratedSyntheticTarget(
+  state: StatuslineState,
+  index: HydrationTransactionIndex,
+  childID: string,
+): boolean {
+  const child = state.children[childID];
+  if (!child || child.id.startsWith("ses_")) return false;
+
+  const targetSessionID = index.resolveSyntheticTarget(child);
+  if (!targetSessionID || resolveChildTargetSessionID(child)) return false;
+
+  const replacement = { ...child, targetSessionID };
+  state.children[childID] = replacement;
+  index.upsert(replacement);
+  return true;
 }
 
 function navigateToSessionTarget(
@@ -680,269 +587,9 @@ function resolveSidebarWidth(ctx: unknown): number | undefined {
   );
 }
 
-function ellipsize(value: string, maxColumns: number): string {
-  return truncateToColumns(value, maxColumns);
-}
-
-function splitParentheticalTitle(title: string): {
-  label: string;
-  parenthetical?: string;
-} {
-  const match = title.match(/^(.*?)\s*(\([^)]*\))\s*$/);
-  if (!match) return { label: title };
-
-  const label = match[1]?.trim();
-  const parenthetical = match[2]?.trim();
-  if (!label || !parenthetical) return { label: title };
-
-  return { label, parenthetical };
-}
-
-function childParenthetical(child: ChildSessionState): string | undefined {
-  if (child.agentName?.trim()) return `(${child.agentName.trim()})`;
-
-  const primary = splitParentheticalTitle(childPrimaryText(child));
-  if (primary.parenthetical) return primary.parenthetical;
-
-  return splitParentheticalTitle(child.title).parenthetical;
-}
-
-function formatSecondaryLine(
-  continuation: string | undefined,
-  parenthetical: string | undefined,
-  width: number,
-): string | undefined {
-  if (!continuation) return parenthetical;
-  if (!parenthetical) return continuation;
-
-  const parentheticalWidth = Math.min(textColumns(parenthetical), width);
-  const continuationWidth = width - parentheticalWidth - 1;
-  if (continuationWidth >= MIN_LABEL_WIDTH) {
-    return `${ellipsize(continuation, continuationWidth)} ${ellipsize(parenthetical, parentheticalWidth)}`;
-  }
-
-  return ellipsize(parenthetical, width);
-}
-
-function childPrimaryText(child: ChildSessionState): string {
-  return child.summary?.trim() || child.title;
-}
-
-function resolveTokenTotal(child: ChildSessionState): number | undefined {
-  const total = child.tokens?.total;
-  if (typeof total === "number" && Number.isFinite(total)) {
-    return total;
-  }
-  const input = child.tokens?.input;
-  const output = child.tokens?.output;
-  if (typeof input === "number" || typeof output === "number") {
-    return Math.max(0, (input ?? 0) + (output ?? 0));
-  }
-  return undefined;
-}
-
-function formatCompactTokenCount(total: number): string {
-  const value = Math.max(0, total);
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M ctx`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k ctx`;
-  return `${Math.round(value)} ctx`;
-}
-
-function formatCompactPercent(percent: number): string {
-  return `${Math.max(0, Math.round(percent))}%`;
-}
-
-function contextVariants(child: ChildSessionState): string[] {
-  const total = resolveTokenTotal(child);
-  const percent = child.tokens?.contextPercent;
-  const hasTotal = typeof total === "number" && Number.isFinite(total);
-  const hasPercent = typeof percent === "number" && Number.isFinite(percent);
-
-  if (!hasTotal && !hasPercent) return [""];
-
-  const tokenPart = hasTotal ? formatCompactTokenCount(total) : "";
-  const percentPart = hasPercent ? formatCompactPercent(percent) : "";
-
-  if (tokenPart && percentPart) {
-    return [`${tokenPart} ${percentPart}`, percentPart, tokenPart, ""];
-  }
-
-  return [tokenPart || percentPart, ""];
-}
-
-interface RowWidthBudgetInput {
-  readonly sidebarWidth?: number;
-  readonly indentationWidth?: number;
-  readonly reservedWidth?: number;
-}
-
-export function rowWidthBudget(input: RowWidthBudgetInput): number {
-  const width = input.sidebarWidth ?? FALLBACK_SIDEBAR_WIDTH;
-  const baseWidth = Math.min(width - 4, 52);
-  return Math.max(
-    1,
-    baseWidth -
-      (input.indentationWidth ?? 0) -
-      (input.reservedWidth ?? 0),
-  );
-}
-
-export function wrapCompactText(
-  value: string,
-  width: number,
-  maxLines: number,
-): string[] {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  if (!normalized) return [""];
-
-  const lines: string[] = [];
-  let remaining = normalized;
-
-  while (textColumns(remaining) > width && lines.length < maxLines - 1) {
-    const probe = takeColumns(remaining, width + 1);
-    const breakAt = probe.lastIndexOf(" ");
-    const breakPrefix = breakAt >= 0 ? probe.slice(0, breakAt) : "";
-    const fit = takeColumns(remaining, width);
-    const take =
-      breakAt >= 0 &&
-      textColumns(breakPrefix) >= MIN_LABEL_WIDTH &&
-      textColumns(breakPrefix) <= width
-        ? breakAt
-        : fit.length;
-    if (take <= 0) break;
-
-    lines.push(remaining.slice(0, take).trimEnd());
-    remaining = remaining.slice(take).trimStart();
-  }
-
-  lines.push(
-    lines.length === maxLines - 1
-      ? ellipsize(remaining, Math.max(1, width))
-      : remaining,
-  );
-  return lines;
-}
-
-export function formatChildRowLine(input: {
-  child: ChildSessionState;
-  nowMs: number;
-  sidebarWidth?: number;
-  reservedWidth?: number;
-  indentationWidth?: number;
-}): {
-  labelLines: string[];
-  secondaryLine?: string;
-  elapsed: string;
-  meta: string;
-} {
-  const elapsed = formatDuration(elapsedMs(input.child, input.nowMs));
-  const width = rowWidthBudget(input);
-  const title = splitParentheticalTitle(childPrimaryText(input.child));
-  const parenthetical = childParenthetical(input.child);
-
-  for (const meta of contextVariants(input.child)) {
-    const detailChars =
-      2 + textColumns(elapsed) + (meta ? 3 + textColumns(meta) : 0);
-    const labelBudget = Math.min(
-      width - 2,
-      width - Math.max(0, detailChars - width),
-    );
-    if (labelBudget >= MIN_LABEL_WIDTH || textColumns(meta) === 0) {
-      const labelLines = wrapCompactText(
-        title.label,
-        Math.max(1, labelBudget),
-        2,
-      );
-      return {
-        labelLines,
-        secondaryLine: formatSecondaryLine(
-          labelLines[1],
-          parenthetical,
-          Math.max(1, labelBudget),
-        ),
-        elapsed,
-        meta,
-      };
-    }
-  }
-
-  const labelLines = wrapCompactText(title.label, MIN_LABEL_WIDTH, 2);
-  return {
-    labelLines,
-    secondaryLine: formatSecondaryLine(
-      labelLines[1],
-      parenthetical,
-      MIN_LABEL_WIDTH,
-    ),
-    elapsed,
-    meta: "",
-  };
-}
-
-export function formatTerminalChildRowLine(input: {
-  child: ChildSessionState;
-  nowMs: number;
-  sidebarWidth?: number;
-  reservedWidth?: number;
-  indentationWidth?: number;
-}): {
-  label: string;
-  meta: string;
-} {
-  const elapsed = formatDuration(elapsedMs(input.child, input.nowMs));
-  const width = rowWidthBudget(input);
-  const title = splitParentheticalTitle(childPrimaryText(input.child));
-  const parenthetical = childParenthetical(input.child);
-  const labelSource = parenthetical
-    ? `${title.label} ${parenthetical}`
-    : title.label;
-  const context = contextVariants(input.child).find(
-    (variant) => variant.length > 0,
-  );
-
-  return {
-    label: ellipsize(labelSource, width),
-    meta: context ? `${elapsed} ${context}` : elapsed,
-  };
-}
-
-export function subagentRowHeight(input: {
-  child: ChildSessionState;
-  nowMs: number;
-  sidebarWidth?: number;
-  reservedWidth?: number;
-  indentationWidth?: number;
-}): number {
-  const modelHeight = input.child.model?.variant
-    ? SUBAGENTS_MODEL_ROW_HEIGHT
-    : 0;
-  if (input.child.status !== "running") {
-    return SUBAGENTS_TERMINAL_ROW_HEIGHT + modelHeight;
-  }
-
-  const line = formatChildRowLine(input);
-  return (
-    (line.secondaryLine
-      ? SUBAGENTS_RUNNING_ROW_HEIGHT
-      : SUBAGENTS_RUNNING_ROW_HEIGHT - 1) + modelHeight
-  );
-}
-
-export function formatChildModelLine(
-  child: ChildSessionState,
-  providers: TuiPluginApi["state"]["provider"],
-  width: number,
-): string | undefined {
-  if (!child.model?.variant) return undefined;
-  const provider = providers.find(
-    (candidate) => candidate.id === child.model?.providerID,
-  );
-  const name = provider?.models[child.model.modelID]?.name || child.model.modelID;
-  return ellipsize(`${name} · ${child.model.variant}`, Math.max(1, width));
-}
-
 export interface TuiSubagentSnapshot {
   visibleChildren: ChildSessionState[];
+  visibleChildrenByID: ReadonlyMap<string, ChildSessionState>;
   visibleCounts: StatusCounts;
   totalExecuted: number;
   showingOtherSessions: boolean;
@@ -993,27 +640,34 @@ export function resolveTuiSubagentSnapshot(input: {
   const scopedChildren = input.sessionID
     ? descendantChildren(allChildren, input.sessionID)
     : allChildren;
-  const visibleChildren = visibleSubagentWorkItems(
-    scopedChildren,
+  const executions = correlateSubagentWorkItems(scopedChildren);
+  const projectedChildren = projectCorrelatedSubagentWorkItems(executions);
+  const visibleChildren = visibleProjectedSubagentWorkItems(
+    projectedChildren,
     nowMs,
     options,
   );
+  // Projected rows decide visibility; scoped snapshots retain original metadata.
   const visibleChildIDs = new Set(visibleChildren.map((child) => child.id));
   const ownVisibleChildren = input.sessionID
     ? scopedChildren.filter((child) => visibleChildIDs.has(child.id))
     : visibleChildren.sort(byPriority);
+  const visibleCounts: StatusCounts = { running: 0, done: 0, error: 0 };
+  for (const { real } of executions) {
+    visibleCounts[real.status] += 1;
+  }
   const totalExecuted = input.sessionID
-    ? countCountedSubagentExecutions({
-        children: scopedChildren,
-        countedChildIDs: input.state.countedChildIDs,
-      })
-    : countHistoricalSubagentExecutions({ children: allChildren });
+    ? executions.filter(
+        ({ executionID }) => input.state.countedChildIDs[executionID],
+      ).length
+    : executions.length;
 
   return {
     visibleChildren: ownVisibleChildren,
-    visibleCounts: countRetainedSubagentStatuses({
-      children: scopedChildren,
-    }),
+    visibleChildrenByID: new Map(
+      ownVisibleChildren.map((child) => [child.id, child]),
+    ),
+    visibleCounts,
     totalExecuted,
     showingOtherSessions: false,
   };
@@ -1068,6 +722,17 @@ function SidebarSubagents(props: {
   const visibleChildren = createMemo(() => snapshot().visibleChildren);
   const counts = createMemo(() => snapshot().visibleCounts);
   const totalExecuted = createMemo(() => snapshot().totalExecuted);
+  const rowMetrics = createMemo(() =>
+    buildTuiRowMetrics({
+      children: visibleChildren(),
+      childrenByID: props.state().children,
+      expanded: props.expanded(),
+      nowMs: props.nowMs(),
+      sidebarWidth: props.sidebarWidth?.(),
+      providers: props.api.state.provider,
+      ancestorSessionID: props.sessionID,
+    }),
+  );
 
   const visibleChildIDs = createMemo(() =>
     visibleChildren().map((child) => child.id),
@@ -1082,43 +747,11 @@ function SidebarSubagents(props: {
   const [listFocused, setListFocused] = createSignal(false);
   const [listFocusModeActive, setListFocusModeActive] = createSignal(false);
 
-  const visibleChildLayoutSignature = createMemo(() =>
-    visibleChildren()
-      .map((child) =>
-        JSON.stringify([
-          child.id,
-          child.status,
-          child.title,
-          child.summary ?? "",
-          child.agentName ?? "",
-          child.tokens?.input ?? "",
-          child.tokens?.output ?? "",
-          child.tokens?.total ?? "",
-          child.tokens?.contextPercent ?? "",
-          child.model?.providerID ?? "",
-          child.model?.modelID ?? "",
-          child.model?.variant ?? "",
-        ]),
-      )
-      .join("|"),
-  );
-
   const listHeight = createMemo(() => {
-    const nowMs = props.nowMs();
-    const sidebarWidth = props.sidebarWidth?.();
+    const metrics = [...rowMetrics().values()];
     const contentHeight =
-      visibleChildren().reduce(
-        (height, child) =>
-          height +
-          subagentRowHeight({
-            child,
-            nowMs,
-            sidebarWidth,
-            reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
-          }),
-        0,
-      ) +
-      Math.max(0, visibleChildren().length - 1) * SUBAGENTS_ROW_GAP;
+      metrics.reduce((height, metric) => height + metric.height, 0) +
+      Math.max(0, metrics.length - 1) * SUBAGENTS_ROW_GAP;
 
     return Math.max(1, Math.min(SUBAGENTS_MAX_LIST_HEIGHT, contentHeight));
   });
@@ -1208,36 +841,16 @@ function SidebarSubagents(props: {
 
   const rowTopForIndex = (index: number): number => {
     let top = 0;
-    const nowMs = props.nowMs();
-    const sidebarWidth = props.sidebarWidth?.();
+    const rows = rowLayouts();
     for (let i = 0; i < index; i += 1) {
-      const child = visibleChildren()[i];
-      if (child) {
-        top +=
-          subagentRowHeight({
-            child,
-            nowMs,
-            sidebarWidth,
-            reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
-          }) + SUBAGENTS_ROW_GAP;
-      }
+      const row = rows[i];
+      if (row) top += row.height + SUBAGENTS_ROW_GAP;
     }
     return top;
   };
 
-  const rowLayouts = (): SidebarScrollRowLayout[] => {
-    const nowMs = props.nowMs();
-    const sidebarWidth = props.sidebarWidth?.();
-    return visibleChildren().map((child) => ({
-      id: child.id,
-      height: subagentRowHeight({
-        child,
-        nowMs,
-        sidebarWidth,
-        reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
-      }),
-    }));
-  };
+  const rowLayouts = (): SidebarScrollRowLayout[] =>
+    [...rowMetrics().values()].map((metric) => metric.layout);
 
   const currentSidebarScrollAnchor = (): SidebarScrollAnchor | undefined => {
     if (!scrollbox) return undefined;
@@ -1272,13 +885,7 @@ function SidebarSubagents(props: {
 
     const rowTop = rowTopForIndex(selectedIndex);
     const rowBottom =
-      rowTop +
-      subagentRowHeight({
-        child: selectedChild,
-        nowMs: props.nowMs(),
-        sidebarWidth: props.sidebarWidth?.(),
-        reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
-      });
+      rowTop + (rowMetrics().get(selectedChild.id)?.height ?? 0);
     const viewportTop = scrollbox.scrollTop;
     const viewportBottom = viewportTop + listHeight();
 
@@ -1417,16 +1024,14 @@ function SidebarSubagents(props: {
   createEffect(() => {
     props.expanded();
     visibleChildIDs().join("|");
-    visibleChildLayoutSignature();
-    props.sidebarWidth?.();
+    rowMetrics();
 
     restorePreservedScroll();
   });
 
   const ChildRow = (rowProps: { childID: string }) => {
-    const child = createMemo(() =>
-      visibleChildren().find((candidate) => candidate.id === rowProps.childID),
-    );
+    const metric = createMemo(() => rowMetrics().get(rowProps.childID));
+    const child = createMemo(() => metric()?.child);
     const [hovered, setHovered] = createSignal(false);
     const [focused, setFocused] = createSignal(false);
     const targetSessionID = createMemo(() => {
@@ -1435,13 +1040,9 @@ function SidebarSubagents(props: {
         ? resolveNavigableChildTargetSessionID(currentChild)
         : undefined;
     });
-    const childDepth = createMemo(() => {
-      const currentChild = child();
-      return currentChild
-        ? resolveSubagentDepth(props.state(), currentChild, props.sessionID)
-        : 0;
-    });
-    const indentationWidth = createMemo(() => childDepth() * 2);
+    const indentationWidth = createMemo(
+      () => metric()?.indentationWidth ?? 0,
+    );
     const clickable = createMemo(() => isSessionTarget(targetSessionID()));
     const selected = createMemo(
       () => listFocused() && selectedChildID() === rowProps.childID,
@@ -1459,53 +1060,21 @@ function SidebarSubagents(props: {
       status() === "running" ? 1 : INACTIVE_SUBAGENT_OPACITY,
     );
     const line = createMemo(() => {
-      const currentChild = child();
-      if (!currentChild) {
-        return { labelLines: [""], elapsed: "00:00", meta: "" };
-      }
-      return formatChildRowLine({
-        child: currentChild,
-        nowMs: props.nowMs(),
-        sidebarWidth: props.sidebarWidth?.(),
-        reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
-        indentationWidth: indentationWidth(),
-      });
+      const currentMetric = metric();
+      return currentMetric?.kind === "running"
+        ? currentMetric.line
+        : { labelLines: [""], elapsed: "00:00", meta: "" };
     });
     const terminalLine = createMemo(() => {
-      const currentChild = child();
-      if (!currentChild) return { label: "", meta: "00:00" };
-      return formatTerminalChildRowLine({
-        child: currentChild,
-        nowMs: props.nowMs(),
-        sidebarWidth: props.sidebarWidth?.(),
-        reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
-        indentationWidth: indentationWidth(),
-      });
+      const currentMetric = metric();
+      return currentMetric?.kind === "terminal"
+        ? currentMetric.line
+        : { label: "", meta: "00:00" };
     });
-    const rowHeight = createMemo(() => {
-      const currentChild = child();
-      if (!currentChild) return SUBAGENTS_TERMINAL_ROW_HEIGHT;
-      return subagentRowHeight({
-        child: currentChild,
-        nowMs: props.nowMs(),
-        sidebarWidth: props.sidebarWidth?.(),
-        reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
-        indentationWidth: indentationWidth(),
-      });
-    });
-    const modelLine = createMemo(() => {
-      const currentChild = child();
-      if (!currentChild) return undefined;
-      return formatChildModelLine(
-        currentChild,
-        props.api.state.provider,
-        rowWidthBudget({
-          sidebarWidth: props.sidebarWidth?.(),
-          reservedWidth: SUBAGENTS_ROW_MARKER_WIDTH,
-          indentationWidth: indentationWidth(),
-        }),
-      );
-    });
+    const rowHeight = createMemo(
+      () => metric()?.height ?? SUBAGENTS_TERMINAL_ROW_HEIGHT,
+    );
+    const modelLine = createMemo(() => metric()?.modelLine);
     const activate = () => {
       const currentChild = child();
       const target = targetSessionID();
@@ -1905,6 +1474,10 @@ export async function hydratePreviousSubagents(
     snapshotSidebarScrollOffsets();
     setState((current) => {
       const next = cloneState(current);
+      const hydrationIndex = createHydrationTransactionIndex(
+        Object.values(next.children),
+      );
+      const eventIndex = createEventChildIndex(Object.values(next.children));
       let changed = false;
 
       for (const hydratedSession of sessionTree.sessions) {
@@ -1946,6 +1519,8 @@ export async function hydratePreviousSubagents(
             existing.status === "running"
           ) {
             delete next.children[hydratedSession.id];
+            hydrationIndex.remove(hydratedSession.id);
+            eventIndex.remove(hydratedSession.id);
             changed = true;
           }
           continue;
@@ -1958,15 +1533,27 @@ export async function hydratePreviousSubagents(
             info: session,
           },
         };
-        if (applySubagentEvent(next, fakeEvent)) changed = true;
+        if (applySubagentEvent(next, fakeEvent, eventIndex)) {
+          syncHydrationChild(next, hydrationIndex, hydratedSession.id);
+          changed = true;
+        }
         if (childSummary?.model) {
-          changed =
+          if (
             setChildModel(
               next,
               hydratedSession.id,
               childSummary.model.model,
               childSummary.model.updatedAt,
-            ) || changed;
+            )
+          ) {
+            syncHydrationAndEventChild(
+              next,
+              hydrationIndex,
+              eventIndex,
+              hydratedSession.id,
+            );
+            changed = true;
+          }
         }
 
         const resolvedStatus = resolveSessionStatusWithMessageSummary({
@@ -1987,8 +1574,15 @@ export async function hydratePreviousSubagents(
                 parentTaskEvidence?.endedAt ??
                 statusEndedAt,
             )
-          )
+          ) {
+            syncHydrationAndEventChild(
+              next,
+              hydrationIndex,
+              eventIndex,
+              hydratedSession.id,
+            );
             changed = true;
+          }
           continue;
         }
 
@@ -2005,67 +1599,107 @@ export async function hydratePreviousSubagents(
               childStatus,
               fallbackEndedAt,
             )
-          )
+          ) {
+            syncHydrationAndEventChild(
+              next,
+              hydrationIndex,
+              eventIndex,
+              hydratedSession.id,
+            );
             changed = true;
+          }
         }
       }
 
       for (const [parentSessionID, parentMessages] of parentMessagesBySession) {
         for (const rawMessage of parentMessages) {
-        const message = asRecord(rawMessage);
-        const info = asRecord(message?.info);
-        const parts = Array.isArray(message?.parts) ? message.parts : [];
-        const parentMessageID = messageIDOf(message);
-        const isAssistant = info?.role === "assistant";
-        const time = asRecord(info?.time);
-        const eventInfo = {
-          id: typeof info?.id === "string" ? info.id : undefined,
-          role: typeof info?.role === "string" ? info.role : undefined,
-          parentID:
-            typeof info?.parentID === "string" ? info.parentID : undefined,
-          time,
-        };
-        const completedAt = timestampFromUnknown(time?.completed);
-        const isCompleted = typeof completedAt === "string";
-        const hasError = !!info?.error;
+          const message = asRecord(rawMessage);
+          const info = asRecord(message?.info);
+          const parts = Array.isArray(message?.parts) ? message.parts : [];
+          const parentMessageID = messageIDOf(message);
+          const isAssistant = info?.role === "assistant";
+          const time = asRecord(info?.time);
+          const eventInfo = {
+            id: typeof info?.id === "string" ? info.id : undefined,
+            role: typeof info?.role === "string" ? info.role : undefined,
+            parentID:
+              typeof info?.parentID === "string" ? info.parentID : undefined,
+            time,
+          };
+          const completedAt = timestampFromUnknown(time?.completed);
+          const isCompleted = typeof completedAt === "string";
+          const hasError = !!info?.error;
 
-        for (const rawPart of parts) {
-          const part = asRecord(rawPart);
-          if (!part) continue;
-          const partWithMessageID =
-            typeof part.messageID === "string" && part.messageID.length > 0
-              ? part
-              : parentMessageID
-                ? { ...part, messageID: parentMessageID }
-                : part;
-          if (
-            part.type === "subtask" ||
-            (part.type === "tool" &&
-              (part.tool === "delegate" || part.tool === "task"))
-          ) {
-            const fakeEvent = {
-              type: "message.part.updated",
-              properties: {
-                sessionID: parentSessionID,
-                info: eventInfo,
-                part: partWithMessageID,
-              },
-            };
-            if (applySubagentEvent(next, fakeEvent)) changed = true;
-
-            if (part.type === "subtask" && isAssistant && isCompleted) {
-              const childID = `subtask:${part.id}`;
-              const status = hasError ? "error" : "done";
-              if (markChildStatus(next, childID, status, completedAt))
+          for (const rawPart of parts) {
+            const part = asRecord(rawPart);
+            if (!part) continue;
+            const partWithMessageID =
+              typeof part.messageID === "string" && part.messageID.length > 0
+                ? part
+                : parentMessageID
+                  ? { ...part, messageID: parentMessageID }
+                  : part;
+            if (
+              part.type === "subtask" ||
+              (part.type === "tool" &&
+                (part.tool === "delegate" || part.tool === "task"))
+            ) {
+              const fakeEvent = {
+                type: "message.part.updated",
+                properties: {
+                  sessionID: parentSessionID,
+                  info: eventInfo,
+                  part: partWithMessageID,
+                },
+              };
+              if (applySubagentEvent(next, fakeEvent, eventIndex)) {
+                const partID =
+                  typeof part.id === "string" ? part.id : undefined;
+                if (partID) {
+                  const replayedChildID = `${part.type}:${partID}`;
+                  syncHydrationChild(
+                    next,
+                    hydrationIndex,
+                    replayedChildID,
+                  );
+                  resolveHydratedSyntheticTarget(
+                    next,
+                    hydrationIndex,
+                    replayedChildID,
+                  );
+                  const replayedChild = next.children[replayedChildID];
+                  if (replayedChild) eventIndex.upsert(replayedChild);
+                }
                 changed = true;
+              }
+
+              if (part.type === "subtask" && isAssistant && isCompleted) {
+                const childID = `subtask:${part.id}`;
+                const status = hasError ? "error" : "done";
+                if (markChildStatus(next, childID, status, completedAt)) {
+                  syncHydrationAndEventChild(
+                    next,
+                    hydrationIndex,
+                    eventIndex,
+                    childID,
+                  );
+                  changed = true;
+                }
+              }
             }
           }
         }
       }
-      }
 
       for (const parentSessionID of parentMessagesBySession.keys()) {
-        if (backfillHydratedTargetSessionIDs(next, parentSessionID)) {
+        syncHydrationParent(next, hydrationIndex, parentSessionID);
+        if (
+          backfillHydratedTargetSessionIDs(
+            next,
+            parentSessionID,
+            hydrationIndex,
+          )
+        ) {
           changed = true;
         }
       }
@@ -2198,102 +1832,6 @@ function resolveRouteSessionID(api: TuiPluginApi): string | undefined {
     typeof api.route.current.params?.sessionID === "string"
     ? api.route.current.params.sessionID
     : undefined;
-}
-
-function resolveRunningChildAgeMillis(
-  child: ChildSessionState,
-  nowMs: number,
-): {
-  startedMs: number;
-  updatedMs: number;
-} {
-  const startedMs = Date.parse(child.startedAt);
-  const updatedMs = Date.parse(child.updatedAt);
-  return {
-    startedMs: Number.isNaN(startedMs) ? 0 : Math.max(0, nowMs - startedMs),
-    updatedMs: Number.isNaN(updatedMs) ? 0 : Math.max(0, nowMs - updatedMs),
-  };
-}
-
-function resolveReconcileTargetSessionID(
-  state: StatuslineState,
-  child: ChildSessionState,
-): string | undefined {
-  return (
-    resolveChildTargetSessionID(child) ??
-    resolveSyntheticTargetFromHydratedState(state, child)
-  );
-}
-
-function selectRunningReconcileCandidates(input: {
-  state: StatuslineState;
-  currentSessionID?: string;
-  nowMs: number;
-  maxCandidates: number;
-}): RunningReconcileCandidate[] {
-  const runningChildren = Object.values(input.state.children).filter(
-    (child) => child.status === "running",
-  );
-  if (runningChildren.length === 0) return [];
-
-  const prioritized = visibleSubagentWorkItems(
-    runningChildren,
-    input.nowMs,
-  ).sort(byPriority);
-  const prioritizedForSession = prioritized.filter((child) =>
-    input.currentSessionID ? child.parentID === input.currentSessionID : true,
-  );
-
-  const veryOldIDs = new Set(
-    runningChildren
-      .filter((child) => {
-        const age = resolveRunningChildAgeMillis(child, input.nowMs);
-        return (
-          age.startedMs >= RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS ||
-          age.updatedMs >= RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS
-        );
-      })
-      .map((child) => child.id),
-  );
-
-  const ordered = [
-    ...prioritizedForSession,
-    ...runningChildren.filter((child) => veryOldIDs.has(child.id)),
-  ];
-
-  const selected: RunningReconcileCandidate[] = [];
-  const seen = new Set<string>();
-  for (const child of ordered) {
-    if (seen.has(child.id)) continue;
-    seen.add(child.id);
-    const age = resolveRunningChildAgeMillis(child, input.nowMs);
-    const targetSessionID = resolveReconcileTargetSessionID(input.state, child);
-    const canProbePersistedSubtask =
-      child.source === "subtask" &&
-      !targetSessionID &&
-      typeof child.parentID === "string" &&
-      child.parentID.length > 0 &&
-      typeof child.messageID === "string" &&
-      child.messageID.length > 0 &&
-      (age.startedMs >= RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS ||
-        age.updatedMs >= RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS);
-    if (!targetSessionID && !canProbePersistedSubtask) continue;
-    selected.push({
-      childID: child.id,
-      targetSessionID,
-      parentID: child.parentID,
-      messageID: child.messageID,
-      source: child.source,
-      title: child.title,
-      summary: child.summary,
-      agentName: child.agentName,
-      startedMs: age.startedMs,
-      updatedMs: age.updatedMs,
-    });
-    if (selected.length >= input.maxCandidates) break;
-  }
-
-  return capCandidates(selected, input.maxCandidates);
 }
 
 export async function probeRunningEvidence(input: {
@@ -2700,10 +2238,11 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
       const directory = api.state.path.directory;
 
       const selected = selectRunningReconcileCandidates({
-        state: snapshot,
+        children: Object.values(snapshot.children),
         currentSessionID,
         nowMs,
         maxCandidates: RUNNING_RECONCILE_MAX_CANDIDATES,
+        oldCandidateAgeMs: RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS,
       });
 
       const mutations: Array<{
@@ -2714,7 +2253,10 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
         reconcileWithoutTargetSessionID?: boolean;
       }> = [];
 
-      const parentMessagesCache = new Map<string, unknown[] | null>();
+      const parentAnalysisCache = new Map<
+        string,
+        PersistedParentMessageAnalysis | null
+      >();
 
       for (const candidate of selected) {
         const key = candidate.targetSessionID ?? candidate.childID;
@@ -2722,29 +2264,29 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
         if (shouldSkipCandidateForBackoff(cache, nowMs)) continue;
 
         if (!candidate.targetSessionID) {
-          const isPersistedSubtaskCandidate =
-            candidate.source === "subtask" &&
-            typeof candidate.parentID === "string" &&
-            candidate.parentID.length > 0 &&
-            typeof candidate.messageID === "string" &&
-            candidate.messageID.length > 0;
-          if (!isPersistedSubtaskCandidate) continue;
+          if (
+            candidate.source !== "subtask" ||
+            candidate.parentID.length === 0 ||
+            !candidate.messageID
+          ) {
+            continue;
+          }
 
-          const parentSessionID = candidate.parentID as string;
-          let parentMessages = parentMessagesCache.get(parentSessionID);
-          if (parentMessages === undefined) {
+          const parentSessionID = candidate.parentID;
+          let parentAnalysis = parentAnalysisCache.get(parentSessionID);
+          if (parentAnalysis === undefined) {
             const parentMessagesResp = await safeReadAsync(() =>
               api.client.session.messages({
                 sessionID: parentSessionID,
                 directory,
               }),
             );
-            parentMessages = Array.isArray(parentMessagesResp?.data)
-              ? parentMessagesResp.data
+            parentAnalysis = Array.isArray(parentMessagesResp?.data)
+              ? analyzePersistedParentMessages(parentMessagesResp.data)
               : null;
-            parentMessagesCache.set(parentSessionID, parentMessages);
+            parentAnalysisCache.set(parentSessionID, parentAnalysis);
           }
-          if (parentMessages === null) {
+          if (parentAnalysis === null) {
             runningReconcileBackoff.set(
               key,
               nextBackoffState({
@@ -2757,19 +2299,18 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
             continue;
           }
 
-          const evidence = resolvePersistedStaleSubtaskFromParentMessages({
+          const evidence = resolvePersistedStaleSubtaskFromParentAnalysis({
             candidate: {
               childID: candidate.childID,
-              parentID: candidate.parentID as string,
-              messageID: candidate.messageID as string,
+              parentID: candidate.parentID,
+              messageID: candidate.messageID,
               title: candidate.title,
               summary: candidate.summary,
               agentName: candidate.agentName,
             } satisfies PersistedStaleSubtaskCandidate,
-            messages: parentMessages,
+            analysis: parentAnalysis,
           });
           if (!evidence) {
-            const parentSummary = summarizeSessionMessages(parentMessages);
             const canSafelyFallbackByParentInactivity =
               canSafelyCloseNoTargetPersistedCandidate({
                 nowMs,
@@ -2777,7 +2318,7 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
                 startedMs: candidate.startedMs,
                 updatedMs: candidate.updatedMs,
                 latestMessageActivityAtMs:
-                  parentSummary.latestMessageActivityAtMs,
+                  parentAnalysis.summary.latestMessageActivityAtMs,
               });
             if (canSafelyFallbackByParentInactivity) {
               mutations.push({
@@ -2785,7 +2326,7 @@ function initializeTui(api: TuiPluginApi, disposeRoot: () => void): void {
                 targetSessionID: candidate.childID,
                 status: "done",
                 endedAt:
-                  parentSummary.latestMessageActivityAt ??
+                  parentAnalysis.summary.latestMessageActivityAt ??
                   new Date(nowMs - candidate.updatedMs).toISOString(),
                 reconcileWithoutTargetSessionID: true,
               });
